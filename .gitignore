@@ -4,3 +4,6 @@
 # Exported builds
 build/
 export_presets.cfg
+
+# Rust build output
+rust/target/

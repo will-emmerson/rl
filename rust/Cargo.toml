@@ -1,0 +1,34 @@
+[package]
+name = "rl_sim"
+version = "0.1.0"
+edition = "2021"
+description = "Hand-rolled, deterministic Rocket League style physics simulation"
+license = "MIT"
+
+# Deliberately zero dependencies: the simulation core must be reproducible
+# from the standard library alone, with nothing that could vary per platform.
+[dependencies]
+
+[lib]
+name = "rl_sim"
+path = "src/lib.rs"
+
+[[bin]]
+name = "play"
+path = "src/bin/play.rs"
+
+[workspace]
+# `rl_sim` stays dependency-free so the simulation core stays portable and
+# reproducible; the Bevy viewer is a separate crate that only reads it.
+members = ["view"]
+
+[profile.release]
+opt-level = 3
+
+# Bevy is unusably slow unoptimised, but optimising all of it makes every
+# incremental build painful. This is the standard middle ground.
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

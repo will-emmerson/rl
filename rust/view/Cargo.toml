@@ -1,0 +1,30 @@
+[package]
+name = "rl_view"
+version = "0.1.0"
+edition = "2021"
+description = "Bevy 3D viewer for the rl_sim simulation"
+
+[dependencies]
+rl_sim = { path = ".." }
+
+# Feature set is spelled out rather than using bevy's convenient `3d`/`ui`
+# meta-features, because those pull in `default_platform`, which includes
+# `bevy_gilrs` (needs libudev) and `bevy_audio` (needs alsa). Neither is
+# installed here and the viewer needs neither, so this keeps the build
+# self-contained with no system packages to install.
+[dependencies.bevy]
+version = "0.19"
+default-features = false
+features = [
+    "3d_bevy_render",  # pbr, meshes, materials, lights, core pipeline
+    "ui_bevy_render",  # renders the HUD text
+    "ui_api",          # Text / Node / TextUiWriter
+    "default_app",     # asset server, log, state, async executor
+    "bevy_winit",      # window + event loop
+    "x11",
+    "wayland",
+    "default_font",    # so Text works without shipping a font file
+    "multi_threaded",
+    "std",
+    "png",             # --screenshot
+]
