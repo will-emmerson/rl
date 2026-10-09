@@ -1,7 +1,7 @@
-//! Bevy 3D viewer for `rl_sim`.
+//! Bevy 3D viewer for `rl`.
 //!
 //! The simulation is untouched and engine-free: this crate owns the render
-//! scene, feeds input into `rl_sim::World`, and copies the resulting state onto
+//! scene, feeds input into `rl::World`, and copies the resulting state onto
 //! transforms. Nothing here can affect the physics, so the determinism
 //! guarantees in `docs/PHYSICS.md` still hold with the viewer attached.
 //!
@@ -17,11 +17,11 @@ use bevy::input::gamepad::{RawGamepadAxisChangedEvent, RawGamepadButtonChangedEv
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
-use rl_sim::ball::BALL_RADIUS;
-use rl_sim::car::{CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH};
-use rl_sim::{Input as SimInput, World as SimWorld};
+use rl::ball::BALL_RADIUS;
+use rl::car::{CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH};
+use rl::{Input as SimInput, World as SimWorld};
 
-/// Arena dimensions, matching `rl_sim::Arena::default()`.
+/// Arena dimensions, matching `rl::Arena::default()`.
 const ARENA_HALF_X: f32 = 40.0;
 const ARENA_HALF_Z: f32 = 25.0;
 const ARENA_HEIGHT: f32 = 12.0;
@@ -101,7 +101,7 @@ fn main() {
         .insert_resource(Sim(SimWorld::new()))
         .insert_resource(mode)
         .insert_resource(GamepadDebug(gamepad_debug))
-        .insert_resource(Time::<Fixed>::from_hz(rl_sim::TICK_HZ as f64))
+        .insert_resource(Time::<Fixed>::from_hz(rl::TICK_HZ as f64))
         .add_systems(Startup, setup_scene)
         .add_systems(FixedUpdate, step_simulation)
         .add_systems(

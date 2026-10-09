@@ -1,4 +1,4 @@
-# rl_sim
+# rl
 
 A hand-rolled, deterministic Rocket League style physics simulation with two
 front ends: a dependency-free terminal demo, and a Bevy 3D viewer.
@@ -102,8 +102,8 @@ cargo run --release -p rl_view -- --screenshot shot.png 250
 ## Play it in the terminal
 
 ```sh
-cargo run --release -p rl_sim --bin play
-cargo run --release -p rl_sim --bin play -- --interactive   # WASD drive, space boost, z drift, j jump
+cargo run --release -p rl --bin play
+cargo run --release -p rl --bin play -- --interactive   # WASD drive, space boost, z drift, j jump
 ```
 
 The terminal build is worth keeping around: it is the same `World::step`, with
@@ -111,7 +111,7 @@ no engine or GPU in the way, so it is what the determinism tests drive.
 
 ## What this proves
 
-- **The simulation is engine-free.** `rl_sim` has zero dependencies and no
+- **The simulation is engine-free.** `rl` has zero dependencies and no
   rendering code. The Bevy viewer is a separate crate that reads state and
   writes transforms; nothing in the draw path can feed back into the physics.
 - **Determinism is unaffected by the viewer.** `cargo test` still asserts
@@ -122,7 +122,7 @@ no engine or GPU in the way, so it is what the determinism tests drive.
 ## Layout
 
 ```
-Cargo.toml        workspace; `rl_sim` is the root package
+Cargo.toml        workspace; `rl` is the root package
 src/              the simulation (no dependencies)
   math.rs         Vec3, hashing, deterministic sin/cos for rotation
   arena.rs        the six planes that make up the arena

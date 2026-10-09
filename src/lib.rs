@@ -1,4 +1,4 @@
-//! `rl_sim` — a hand-rolled, deterministic Rocket League style simulation.
+//! `rl` — a hand-rolled, deterministic Rocket League style simulation.
 //!
 //! The whole thing is deliberately dependency-free and free of transcendental
 //! maths, so that a given input stream produces a bit-identical state stream
@@ -7,7 +7,7 @@
 //! you here.
 //!
 //! ```no_run
-//! use rl_sim::{Input, World};
+//! use rl::{Input, World};
 //!
 //! let mut world = World::new();
 //! let input = Input::new(1.0, 0.0, false, false, false); // full throttle

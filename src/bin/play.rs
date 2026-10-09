@@ -1,4 +1,4 @@
-//! Terminal front end for `rl_sim`.
+//! Terminal front end for `rl`.
 //!
 //! Two modes:
 //!   * scripted (default) — deterministic input, so the state hash printed at
@@ -13,8 +13,8 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rl_sim::car::CAR_HALF_LENGTH;
-use rl_sim::{Input, World, DT, TICK_HZ};
+use rl::car::CAR_HALF_LENGTH;
+use rl::{Input, World, DT, TICK_HZ};
 
 const COLS: usize = 40;
 const ROWS: usize = 18;
@@ -68,7 +68,7 @@ fn parse_args() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 println!(
-                    "rl_sim\n\n  --interactive      drive with WASD (needs a TTY)\n  \
+                    "rl\n\n  --interactive      drive with WASD (needs a TTY)\n  \
                      --ticks N          scripted run length in ticks (default 1200)\n  \
                      --render-every N   draw every N ticks in scripted mode (default 8)\n  \
                      --fast             don't pace the scripted mode to real time\n  \
@@ -321,7 +321,7 @@ fn render(world: &World, subtitle: &str) -> String {
     set_cell_if_free(&mut grid, nx, ny, '+');
 
     let mut lines: Vec<String> = Vec::new();
-    lines.push(format!("rl_sim  {subtitle}"));
+    lines.push(format!("rl  {subtitle}"));
     lines.push(format!(
         "tick {:>6} {:>5.1}s   car {:>5.1} m/s y{:>4.2}  boost {:>5.1}   ball {:>5.1} m/s  height {:>5.2} m",
         world.tick,

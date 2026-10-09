@@ -3,7 +3,7 @@
 //! These tests are the executable form of the claim that a given input stream
 //! produces a bit-identical state stream.
 
-use rl_sim::{Input, World, TICK_HZ};
+use rl::{Input, World, TICK_HZ};
 
 /// A fixed, non-trivial input stream. Pure function of the tick.
 fn scripted(tick: u32) -> Input {
@@ -86,5 +86,5 @@ fn step_has_no_hidden_history_dependence() {
 fn tick_rate_is_fixed() {
     // The simulation contract: 120 Hz, and DT is exactly its reciprocal.
     assert_eq!(TICK_HZ, 120);
-    assert_eq!(rl_sim::DT, 1.0 / 120.0);
+    assert_eq!(rl::DT, 1.0 / 120.0);
 }

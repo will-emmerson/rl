@@ -8,9 +8,9 @@ rule changes.
 A Rocket League-style prototype. The active code is a hand-rolled,
 dependency-free simulation with a Bevy viewer:
 
-- `src/` — `rl_sim`: the deterministic simulation (arena + ball + car). No game
+- `src/` — `rl`: the deterministic simulation (arena + ball + car). No game
   engine, no dependencies.
-- `view/` — `rl_view`: a Bevy 3D viewer that reads `rl_sim` and draws it.
+- `view/` — `rl_view`: a Bevy 3D viewer that reads `rl` and draws it.
 - `tests/` — physics behaviour and determinism tests.
 
 An earlier Godot 4 prototype was removed once the Rust implementation became the
@@ -22,7 +22,7 @@ Start with `docs/PHYSICS.md` (why hand-rolled, and its honest caveats) and
 
 ## Determinism is the point — don't break it
 
-`rl_sim` must produce a bit-identical state stream for a given input stream, so
+`rl` must produce a bit-identical state stream for a given input stream, so
 client-side prediction and replays can work. Inside the simulation step:
 
 - **No transcendentals.** `sin`/`cos`/`tan`/`powf`/`exp`/`ln` call platform libm
@@ -35,7 +35,7 @@ client-side prediction and replays can work. Inside the simulation step:
   `Ball::hash_into`, and make sure `Clone` copies them, or divergence goes
   undetected.
 - **`-0.0` is canonicalised** in the hash — keep it that way.
-- `rl_sim` has **zero dependencies** by design. New crates go at most into
+- `rl` has **zero dependencies** by design. New crates go at most into
   `view/`.
 
 The viewer must never feed back into the simulation: it reads `World` and writes

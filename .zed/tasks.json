@@ -37,7 +37,7 @@
   },
   {
     "label": "RL: play terminal (scripted demo)",
-    "command": "cargo run -p rl_sim --bin play",
+    "command": "cargo run -p rl --bin play",
     "cwd": "$ZED_WORKTREE_ROOT",
     "save": "all",
     "use_new_terminal": true,
@@ -46,7 +46,7 @@
   },
   {
     "label": "RL: play terminal (WASD)",
-    "command": "cargo run -p rl_sim --bin play -- --interactive",
+    "command": "cargo run -p rl --bin play -- --interactive",
     "cwd": "$ZED_WORKTREE_ROOT",
     "save": "all",
     "use_new_terminal": true,
@@ -91,7 +91,7 @@
   },
   {
     "label": "RL: physics throughput bench",
-    "command": "cargo run --release -p rl_sim --bin play -- --bench 2000000",
+    "command": "cargo run --release -p rl --bin play -- --bench 2000000",
     "cwd": "$ZED_WORKTREE_ROOT",
     "save": "all",
     "use_new_terminal": false,

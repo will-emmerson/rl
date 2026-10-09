@@ -2,10 +2,10 @@
 name = "rl_view"
 version = "0.1.0"
 edition = "2021"
-description = "Bevy 3D viewer for the rl_sim simulation"
+description = "Bevy 3D viewer for the rl simulation"
 
 [dependencies]
-rl_sim = { path = ".." }
+rl = { path = ".." }
 
 # Feature set is spelled out rather than using bevy's convenient `3d`/`ui`
 # meta-features, because those pull in `default_platform`, which includes

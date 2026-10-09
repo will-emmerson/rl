@@ -1,5 +1,5 @@
 [package]
-name = "rl_sim"
+name = "rl"
 version = "0.1.0"
 edition = "2021"
 description = "Hand-rolled, deterministic Rocket League style physics simulation"
@@ -10,7 +10,7 @@ license = "MIT"
 [dependencies]
 
 [lib]
-name = "rl_sim"
+name = "rl"
 path = "src/lib.rs"
 
 [[bin]]
@@ -18,7 +18,7 @@ name = "play"
 path = "src/bin/play.rs"
 
 [workspace]
-# `rl_sim` stays dependency-free so the simulation core stays portable and
+# `rl` stays dependency-free so the simulation core stays portable and
 # reproducible; the Bevy viewer is a separate crate that only reads it.
 members = ["view"]
 

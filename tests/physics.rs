@@ -3,11 +3,11 @@
 //! This is what a hand-rolled engine buys you: no window, no render loop, no
 //! editor — just `cargo test` and exact numbers.
 
-use rl_sim::arena::Arena;
-use rl_sim::ball::BALL_RADIUS;
-use rl_sim::car::{CAR_HALF_HEIGHT, CAR_MAX_YAW_RATE, CAR_STEER_ENGAGE_SPEED};
-use rl_sim::math::Vec3;
-use rl_sim::{Ball, Car, Input, World, DT, GRAVITY};
+use rl::arena::Arena;
+use rl::ball::BALL_RADIUS;
+use rl::car::{CAR_HALF_HEIGHT, CAR_MAX_YAW_RATE, CAR_STEER_ENGAGE_SPEED};
+use rl::math::Vec3;
+use rl::{Ball, Car, Input, World, DT, GRAVITY};
 
 /// Deterministic pseudo-random stream, owned by the test not the simulation.
 struct Lcg(u64);
@@ -212,7 +212,7 @@ fn car_never_leaves_the_arena() {
 
 #[test]
 fn head_on_shot_launches_the_ball_faster_than_the_car() {
-    let (impact, ball_speed) = rl_sim::head_on_shot();
+    let (impact, ball_speed) = rl::head_on_shot();
     assert!(
         impact > 10.0,
         "car should be moving at impact, was {impact}"
