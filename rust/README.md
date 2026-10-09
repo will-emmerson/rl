@@ -21,13 +21,18 @@ cargo run --release -p rl_view   # smoother, but the first run rebuilds Bevy
 The dev profile is set up to be playable (this crate at `opt-level = 1`, all
 dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 
-| Key                       | Action             |
-| ------------------------- | ------------------ |
-| `W` `A` `S` `D` or arrows | drive              |
-| `space`                   | boost              |
-| `shift`                   | drift (handbrake)  |
-| `R`                       | reset car and ball |
-| `esc`                     | quit               |
+| Key                       | Gamepad    | Action             |
+| ------------------------- | ---------- | ------------------ |
+| `W` `A` `S` `D` or arrows | left stick | drive              |
+| `space`                   | `B`        | boost              |
+| `shift`                   | `X`        | drift (handbrake)  |
+| `R`                       | `start`    | reset car and ball |
+| `esc`                     | -          | quit               |
+
+Keyboard and pad are merged per axis, so either works and holding both does not
+cancel out. On the pad the triggers are analogue throttle: pull the right trigger
+to accelerate, the left to reverse. (If your pad reports nothing, see the gamepad
+section under "A note on Bevy's features" below.)
 
 The camera trails the car and leans its aim toward the ball. This needs a GPU
 and a window; it was developed on Vulkan.
@@ -42,6 +47,8 @@ and pick one, or `task: rerun` to repeat the last one.
 | ------------------------------------- | -------------------------------------------------- |
 | `RL: play 3D (Bevy)`                  | the viewer                                         |
 | `RL: play 3D (Bevy, release)`         | same, optimised (first run rebuilds Bevy: minutes) |
+| `RL: play 3D (Bevy, gamepad debug)`   | viewer, plus a log of every pad event              |
+| `RL: gamepad probe (mapping report)`  | how gilrs mapped the connected pad                 |
 | `RL: play terminal (scripted demo)`   | no-input animation, then exits                     |
 | `RL: play terminal (WASD)`            | interactive terminal demo                          |
 | `RL: run tests`                       | `cargo test --workspace`                           |
@@ -113,8 +120,26 @@ docs/             physics write-up and the screenshot above
 
 `view/Cargo.toml` spells out its Bevy features rather than using the `3d`/`ui`
 meta-features, because those pull in `default_platform`, which drags in
-`bevy_gilrs` (needs `libudev`) and `bevy_audio` (needs ALSA). Neither is
-installed on a bare machine and the viewer needs neither, so listing features
-explicitly keeps the build self-contained with nothing to install. If you want
-gamepad support in the viewer later, add `bevy_gilrs` back and install
-`libudev-dev`.
+`bevy_audio` (needs ALSA). Nothing here makes noise, so audio is left out and the
+viewer builds without it.
+
+Gamepad support _is_ included, via the `bevy_gilrs` feature. On Linux, gilrs needs
+`libudev`, so building the viewer requires one system package:
+
+```sh
+sudo apt-get install libudev-dev
+```
+
+A pad is mapped through gilrs' copy of the SDL controller database, keyed by
+device id. Popular pads are in that database; less common ones fall back to a
+built-in default that maps the raw evdev buttons and axes directly. Two tools
+cover the case where a pad is detected but its controls are wrong:
+
+```sh
+cargo run -p rl_view --example gamepad_probe   # what mapping was picked, no input needed
+cargo run -p rl_view -- --gamepad-debug        # log every button/axis change live
+```
+
+One thing the default mapping does that surprises people: it exposes the X-Box
+analogue triggers as the _axes_ `LeftZ`/`RightZ` (evdev ABS_Z/ABS_RZ), not as
+trigger buttons. The viewer reads either, so both mapped and unmapped pads work.
