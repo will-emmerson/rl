@@ -24,6 +24,19 @@ const ARENA_HALF_X: f32 = 40.0;
 const ARENA_HALF_Z: f32 = 25.0;
 const ARENA_HEIGHT: f32 = 12.0;
 
+/// The camera never gets closer to a wall than this.
+const CAMERA_WALL_MARGIN: f32 = 0.8;
+/// Preferred chase position: this far behind, and this far above, the car.
+const CAMERA_DISTANCE: f32 = 5.5;
+const CAMERA_HEIGHT: f32 = 2.6;
+/// Where the camera escapes to when a wall blocks the chase position.
+const CAMERA_SQUEEZE_HEIGHT: f32 = 5.0;
+const CAMERA_SQUEEZE_INSET: f32 = 2.5;
+/// How far the aim point may lean from the car towards the ball, and how high
+/// above the car it sits.
+const CAMERA_AIM_LEAN: f32 = 6.0;
+const CAMERA_AIM_HEIGHT: f32 = 0.6;
+
 // ---------------------------------------------------------------------------
 // Resources / components
 // ---------------------------------------------------------------------------
@@ -313,11 +326,27 @@ fn read_input(keys: &ButtonInput<KeyCode>) -> SimInput {
 fn step_simulation(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, mode: Res<Mode>) {
     let input = match &*mode {
         Mode::Play => read_input(&keys),
-        // Drive straight into the ball, so a capture shows the moment of
-        // impact rather than the kickoff pose.
-        Mode::Capture { .. } => SimInput::new(1.0, 0.0, false, false),
+        // Self-driving, so a capture is reproducible rather than dependent on
+        // the frame rate. See `capture_input` for the schedule.
+        Mode::Capture { .. } => capture_input(sim.0.tick),
     };
     sim.0.step(&input);
+}
+
+/// The self-driving script used by `--screenshot`, as a function of the tick.
+///
+/// Two interesting moments fall out of it: around tick 250 the car is mid-drive
+/// with the ball in front (the shot in the README), and by tick 1200 it has
+/// driven into one wall and reversed back into the other, which squeezes the
+/// camera against a wall - the case that used to stick it to the car.
+fn capture_input(tick: u64) -> SimInput {
+    if tick < 420 {
+        SimInput::new(1.0, 0.0, false, false)
+    } else if tick < 1000 {
+        SimInput::new(-1.0, 0.0, false, false)
+    } else {
+        SimInput::new(0.0, 0.0, false, false)
+    }
 }
 
 fn reset_on_key(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>) {
@@ -355,6 +384,44 @@ fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis)>) {
     }
 }
 
+/// Keep a point inside the arena, leaving `margin` clearance from every face.
+fn clamp_inside(p: Vec3, margin: f32) -> Vec3 {
+    Vec3::new(
+        p.x.clamp(-ARENA_HALF_X + margin, ARENA_HALF_X - margin),
+        p.y.clamp(margin, ARENA_HEIGHT - margin),
+        p.z.clamp(-ARENA_HALF_Z + margin, ARENA_HALF_Z - margin),
+    )
+}
+
+/// How much of the segment `from -> to` stays inside the arena, as a fraction.
+///
+/// Assumes `from` is already inside, in which case the arena being a box means
+/// this is just clipping against three axis-aligned slabs. The result is where
+/// a camera on a boom from `from` towards `to` would hit a wall.
+fn free_fraction(from: Vec3, to: Vec3, margin: f32) -> f32 {
+    let min = [-ARENA_HALF_X + margin, margin, -ARENA_HALF_Z + margin];
+    let max = [
+        ARENA_HALF_X - margin,
+        ARENA_HEIGHT - margin,
+        ARENA_HALF_Z - margin,
+    ];
+    let p = from.to_array();
+    let d = (to - from).to_array();
+
+    let mut t = 1.0_f32;
+    for axis in 0..3 {
+        if d[axis].abs() > 1e-6 {
+            let limit = if d[axis] > 0.0 {
+                (max[axis] - p[axis]) / d[axis]
+            } else {
+                (min[axis] - p[axis]) / d[axis]
+            };
+            t = t.min(limit);
+        }
+    }
+    t.clamp(0.0, 1.0)
+}
+
 fn chase_camera(sim: Res<Sim>, time: Res<Time>, mut query: Query<&mut Transform, With<ChaseCam>>) {
     let car = sim.0.car.pos;
     let heading = sim.0.car.heading;
@@ -364,28 +431,73 @@ fn chase_camera(sim: Res<Sim>, time: Res<Time>, mut query: Query<&mut Transform,
     let car_pos = Vec3::new(car.x as f32, car.y as f32, car.z as f32);
     let ball_pos = Vec3::new(ball.x as f32, ball.y as f32, ball.z as f32);
 
-    // Behind and above the car, but the aim point leans toward the ball so you
-    // can see what you are about to hit.
-    let desired = car_pos - forward * 5.5 + Vec3::Y * 2.6;
-    let aim = car_pos * 0.65 + ball_pos * 0.35 + Vec3::Y * 0.35;
+    // Pull the camera in along the line of sight rather than clamping it to
+    // the wall plane. A car backed against a wall has *no* room behind it, and
+    // clamping put the camera on top of the car, which is what made it feel
+    // stuck. Clipping a boom from the car finds the farthest position that is
+    // actually clear.
+    let pivot = clamp_inside(car_pos + Vec3::Y * 1.2, CAMERA_WALL_MARGIN);
+    let wanted = car_pos - forward * CAMERA_DISTANCE + Vec3::Y * CAMERA_HEIGHT;
+    let reach = free_fraction(pivot, wanted, CAMERA_WALL_MARGIN);
+    let mut desired = pivot.lerp(wanted, reach);
 
-    // The arena is a box, so keeping the camera inside it is just a clamp.
-    // Without this the camera sails through a wall and you end up looking at
-    // the underside of the floor.
-    const MARGIN: f32 = 0.6;
-    let inside = |p: Vec3| {
-        Vec3::new(
-            p.x.clamp(-ARENA_HALF_X + MARGIN, ARENA_HALF_X - MARGIN),
-            p.y.clamp(0.6, ARENA_HEIGHT - MARGIN),
-            p.z.clamp(-ARENA_HALF_Z + MARGIN, ARENA_HALF_Z - MARGIN),
-        )
-    };
-
-    let weight = 1.0 - (-7.0 * time.delta_secs()).exp();
-    for mut transform in &mut query {
-        transform.translation = inside(transform.translation.lerp(inside(desired), weight));
-        transform.look_at(aim, Vec3::Y);
+    let squeeze = 1.0 - reach;
+    if squeeze > 0.001 {
+        // No room behind the car, so rise and step *sideways* along the wall.
+        // Sideways rather than inwards, because a car backed against a wall is
+        // usually facing the middle — stepping that way puts the car behind the
+        // camera. Sideways rather than straight up because `look_at` then has
+        // no usable up vector.
+        let side = Vec3::new(forward.z, 0.0, -forward.x);
+        let step = if wall_clearance(car_pos + side * CAMERA_SQUEEZE_INSET)
+            >= wall_clearance(car_pos - side * CAMERA_SQUEEZE_INSET)
+        {
+            side
+        } else {
+            -side
+        };
+        let escape = car_pos + Vec3::Y * CAMERA_SQUEEZE_HEIGHT + step * CAMERA_SQUEEZE_INSET;
+        desired = desired.lerp(escape, squeeze);
     }
+
+    // Both the current position and the target are inside a convex box, so the
+    // interpolation can never leave the arena. The clamp is belt and braces.
+    let desired = clamp_inside(desired, CAMERA_WALL_MARGIN);
+
+    // Lean the aim towards the ball normally, but square up on the car when the
+    // camera has been forced overhead.
+    //
+    // This is a clamped offset from the car, not a weighted average of the two
+    // positions. Blending the raw positions lets the aim point drift behind the
+    // camera whenever the ball is, and the camera then stares at the floor with
+    // the car somewhere off screen.
+    let lean_factor = 0.35 * (1.0 - squeeze);
+    let lean = (ball_pos - car_pos)
+        .with_y(0.0)
+        .clamp_length_max(CAMERA_AIM_LEAN)
+        * lean_factor;
+    let aim = car_pos + lean + Vec3::Y * CAMERA_AIM_HEIGHT;
+
+    let weight = 1.0 - (-8.0 * time.delta_secs()).exp();
+    for mut transform in &mut query {
+        transform.translation = transform.translation.lerp(desired, weight);
+        // Directly overhead, world up is parallel to the view direction and
+        // `look_at` has no valid basis. The car's forward is a sane stand-in.
+        let to_aim = aim - transform.translation;
+        let up = if to_aim.with_y(0.0).length() >= 0.5 {
+            Vec3::Y
+        } else if forward.length_squared() > 0.5 {
+            forward
+        } else {
+            Vec3::X
+        };
+        transform.look_at(aim, up);
+    }
+}
+
+/// Shortest distance from a point to any of the four walls.
+fn wall_clearance(p: Vec3) -> f32 {
+    (ARENA_HALF_X - p.x.abs()).min(ARENA_HALF_Z - p.z.abs())
 }
 
 fn update_hud(sim: Res<Sim>, hud: Single<Entity, With<HudText>>, mut writer: TextUiWriter) {
@@ -442,5 +554,42 @@ fn screenshot_driver(
         if *frames_since_capture > 90 {
             exit.write(AppExit::Success);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_inside_leaves_the_wall_margin() {
+        let p = clamp_inside(Vec3::new(100.0, -5.0, -100.0), CAMERA_WALL_MARGIN);
+        assert!((p.x - (ARENA_HALF_X - CAMERA_WALL_MARGIN)).abs() < 1e-6);
+        assert!((p.y - CAMERA_WALL_MARGIN).abs() < 1e-6);
+        assert!((p.z - (-ARENA_HALF_Z + CAMERA_WALL_MARGIN)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn open_ice_gives_the_camera_its_full_boom() {
+        let pivot = clamp_inside(Vec3::new(0.0, 1.2, 0.0), CAMERA_WALL_MARGIN);
+        let wanted = Vec3::new(0.0, 2.6, -CAMERA_DISTANCE);
+        assert!((free_fraction(pivot, wanted, CAMERA_WALL_MARGIN) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_wall_behind_the_car_blocks_the_boom() {
+        // Backed against the -Z wall facing away, so the preferred position is
+        // outside the arena. This is the case that used to pin the camera to
+        // the wall (and therefore onto the car itself).
+        let car = Vec3::new(0.0, 0.18, -(ARENA_HALF_Z - 0.6));
+        let pivot = clamp_inside(car + Vec3::Y * 1.2, CAMERA_WALL_MARGIN);
+        let wanted = car - Vec3::new(0.0, 0.0, 1.0) * CAMERA_DISTANCE + Vec3::Y * CAMERA_HEIGHT;
+
+        let reach = free_fraction(pivot, wanted, CAMERA_WALL_MARGIN);
+        assert!(reach < 0.1, "boom should be blocked, got {reach}");
+
+        // And whatever it does, it must stay inside the arena.
+        let blocked = clamp_inside(pivot.lerp(wanted, reach), CAMERA_WALL_MARGIN);
+        assert!(blocked.z >= -ARENA_HALF_Z + CAMERA_WALL_MARGIN - 1e-6);
     }
 }
