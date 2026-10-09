@@ -8,7 +8,7 @@
 
 use crate::arena::Arena;
 use crate::math::{heading_right, rotate_y, StateHasher, Vec3};
-use crate::world::Input;
+use crate::world::{Input, GRAVITY};
 
 // Roughly the Octane hitbox (118.01 x 84.2 x 36.16 uu -> metres), which is
 // noticeably *smaller* than the ball. That size relationship is genuine: RL's
@@ -53,6 +53,14 @@ pub const CAR_ROLLING_KEEP: f64 = 0.995;
 pub const CAR_BOOST_MAX: f64 = 100.0;
 pub const CAR_BOOST_DRAIN: f64 = 33.3;
 
+/// Upward speed of a jump from the ground, in m/s. Against the shared gravity
+/// this peaks about 1.2 m up and hangs for roughly 1.2 s, the same ballpark as
+/// RL's first jump.
+pub const CAR_JUMP_SPEED: f64 = 4.0;
+
+/// Jumps available between landings: the launch, plus one mid-air double jump.
+pub const CAR_MAX_JUMPS: u8 = 2;
+
 pub const CAR_BALL_RESTITUTION: f64 = 0.62;
 pub const CAR_BALL_FRICTION: f64 = 0.5;
 
@@ -60,12 +68,20 @@ pub const CAR_BALL_FRICTION: f64 = 0.5;
 pub struct Car {
     /// Centre of the hitbox.
     pub pos: Vec3,
-    /// Ground-plane velocity (y is always 0 for the car).
+    /// Velocity. `y` is zero on the ground and carries the jump arc in the air.
     pub velocity: Vec3,
     /// Unit heading in the XZ plane. +Z at spawn, matching the Godot scene.
     pub heading: Vec3,
     pub yaw_rate: f64,
     pub boost: f64,
+    /// True while the car is off the ground, including the whole jump arc.
+    pub airborne: bool,
+    /// Jumps used since last touching down: 0 on the ground, up to
+    /// `CAR_MAX_JUMPS` in the air.
+    pub jumps_used: u8,
+    /// Whether jump was held on the previous tick. Public only for consistency
+    /// with the other fields; it is really an implementation detail.
+    pub jump_held: bool,
 }
 
 impl Default for Car {
@@ -76,6 +92,9 @@ impl Default for Car {
             heading: Vec3::new(0.0, 0.0, 1.0),
             yaw_rate: 0.0,
             boost: CAR_BOOST_MAX,
+            airborne: false,
+            jumps_used: 0,
+            jump_held: false,
         }
     }
 }
@@ -111,6 +130,25 @@ impl Car {
     }
 
     pub fn step(&mut self, dt: f64, input: &Input, arena: &Arena) {
+        // Jump is edge-triggered: `input.jump` is a held level, and holding it
+        // must not re-fire the instant the car touches down again.
+        let jump_pressed = input.jump && !self.jump_held;
+        self.jump_held = input.jump;
+
+        if self.airborne {
+            self.step_airborne(dt, input, jump_pressed);
+        } else {
+            self.step_grounded(dt, input, jump_pressed);
+        }
+
+        self.pos += self.velocity * dt;
+        self.resolve_vertical(arena);
+        self.collide_walls(arena);
+    }
+
+    /// The driving model. Runs only while the car is on the ground, so it is
+    /// unchanged from when the car was a flat 2D vehicle.
+    fn step_grounded(&mut self, dt: f64, input: &Input, jump_pressed: bool) {
         let f = self.heading;
         let r = self.right();
         let mut v_forward = self.velocity.dot(f);
@@ -164,10 +202,63 @@ impl Car {
         };
 
         self.velocity = f * v_forward + r * v_lateral;
-        self.pos += self.velocity * dt;
-        self.pos.y = CAR_HALF_HEIGHT;
 
-        self.collide_walls(arena);
+        if jump_pressed {
+            self.velocity.y = CAR_JUMP_SPEED;
+            self.airborne = true;
+            self.jumps_used = 1;
+        }
+    }
+
+    /// Airborne: gravity, plus whatever momentum the car left the ground with.
+    fn step_airborne(&mut self, dt: f64, input: &Input, jump_pressed: bool) {
+        // The same gravity the ball feels.
+        self.velocity.y += GRAVITY * dt;
+
+        // No traction in the air. The engine and tyres do nothing and there is
+        // no air control yet, so the car keeps its momentum. Boost still works,
+        // as it does in RL, capped at the boosted ground speed.
+        self.yaw_rate = 0.0;
+        if input.boost && self.boost > 0.0 {
+            self.velocity += self.heading * (CAR_BOOST_ACCEL * dt);
+            self.boost = (self.boost - CAR_BOOST_DRAIN * dt).max(0.0);
+            self.clamp_horizontal_speed(CAR_MAX_BOOST_SPEED);
+        }
+
+        // The double jump: one extra launch, available while airborne.
+        if jump_pressed && self.jumps_used < CAR_MAX_JUMPS {
+            self.velocity.y = CAR_JUMP_SPEED;
+            self.jumps_used += 1;
+        }
+    }
+
+    /// Land on the floor, or stop at the ceiling. The box rests on the ground,
+    /// so on the ground its centre sits at `CAR_HALF_HEIGHT`.
+    fn resolve_vertical(&mut self, arena: &Arena) {
+        if self.pos.y <= CAR_HALF_HEIGHT {
+            self.pos.y = CAR_HALF_HEIGHT;
+            self.velocity.y = self.velocity.y.max(0.0);
+            if self.airborne {
+                self.airborne = false;
+                self.jumps_used = 0;
+            }
+        }
+
+        let ceiling = arena.height - CAR_HALF_HEIGHT;
+        if self.pos.y > ceiling {
+            self.pos.y = ceiling;
+            self.velocity.y = self.velocity.y.min(0.0);
+        }
+    }
+
+    fn clamp_horizontal_speed(&mut self, max: f64) {
+        let horizontal = self.velocity.xz();
+        let speed = horizontal.length();
+        if speed > max {
+            let scale = max / speed;
+            self.velocity.x = horizontal.x * scale;
+            self.velocity.z = horizontal.z * scale;
+        }
     }
 
     fn collide_walls(&mut self, arena: &Arena) {
@@ -214,5 +305,8 @@ impl Car {
         self.heading.hash_into(h);
         h.fold(self.yaw_rate);
         h.fold(self.boost);
+        h.fold_u64(self.airborne as u64);
+        h.fold_u64(self.jumps_used as u64);
+        h.fold_u64(self.jump_held as u64);
     }
 }

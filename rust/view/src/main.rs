@@ -293,7 +293,7 @@ fn setup_scene(
     // --- hud ---
     let hint = match &*mode {
         Mode::Play => {
-            "drive WASD / stick+triggers   boost space / B   drift shift / X   reset R / start   quit esc"
+            "drive WASD / stick+triggers   boost space / B   jump ctrl / A   drift shift / X   reset R / start   quit esc"
         }
         Mode::Capture { .. } => "capture mode",
     };
@@ -372,11 +372,12 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
         &[KeyCode::KeyA, KeyCode::ArrowLeft],
         &[KeyCode::KeyD, KeyCode::ArrowRight],
     );
+    let keyboard_jump = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
 
     // Triggers are analogue, so they give proportional throttle rather than the
-    // keyboard's full-on. Button layout matches Rocket League: B boosts and X
-    // is the handbrake.
-    let (pad_throttle, pad_steer, pad_boost, pad_drift) = match gamepad {
+    // keyboard's full-on. Button layout matches Rocket League: A jumps, B boosts
+    // and X is the handbrake.
+    let (pad_throttle, pad_steer, pad_boost, pad_drift, pad_jump) = match gamepad {
         Some(pad) => (
             trigger(pad, GamepadAxis::RightZ, GamepadButton::RightTrigger2)
                 - trigger(pad, GamepadAxis::LeftZ, GamepadButton::LeftTrigger2),
@@ -384,8 +385,9 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
             -pad.get(GamepadAxis::LeftStickX).unwrap_or(0.0) as f64,
             pad.get(GamepadButton::East).unwrap_or(0.0) > 0.5,
             pad.get(GamepadButton::West).unwrap_or(0.0) > 0.5,
+            pad.get(GamepadButton::South).unwrap_or(0.0) > 0.5,
         ),
-        None => (0.0, 0.0, false, false),
+        None => (0.0, 0.0, false, false, false),
     };
 
     SimInput::new(
@@ -393,6 +395,7 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
         strongest(keyboard_steer, pad_steer),
         keys.pressed(KeyCode::Space) || pad_boost,
         keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) || pad_drift,
+        keyboard_jump || pad_jump,
     )
 }
 
@@ -478,11 +481,11 @@ fn report_gamepad_events(
 /// camera against a wall - the case that used to stick it to the car.
 fn capture_input(tick: u64) -> SimInput {
     if tick < 420 {
-        SimInput::new(1.0, 0.0, false, false)
+        SimInput::new(1.0, 0.0, false, false, false)
     } else if tick < 1000 {
-        SimInput::new(-1.0, 0.0, false, false)
+        SimInput::new(-1.0, 0.0, false, false, false)
     } else {
-        SimInput::new(0.0, 0.0, false, false)
+        SimInput::new(0.0, 0.0, false, false, false)
     }
 }
 

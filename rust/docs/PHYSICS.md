@@ -175,12 +175,12 @@ does and doesn't mean:
 
 ## Model summary
 
-| Piece    | Model                                                                                                                                                                                                           |
-| -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Arena    | 6 static planes, sequential resolution, 80 x 50 x 12 m                                                                                                                                                          |
-| Ball     | Sphere, `r = 0.93`, `m = 1.5`. Gravity, quadratic drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin                                                                          |
-| Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.18 x 0.84 x 0.36, `m = 180`. Yaw rate bounded directly, so the turn radius (`v / yaw_rate`) grows with speed; lateral-grip decay for drift; boost meter |
-| Car-ball | Sphere vs OBB closest-point, impulse with relative velocity at contact (car rotation included), equal-and-opposite reaction                                                                                     |
+| Piece    | Model                                                                                                                                                                                                                                                                   |
+| -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Arena    | 6 static planes, sequential resolution, 80 x 50 x 12 m                                                                                                                                                                                                                  |
+| Ball     | Sphere, `r = 0.93`, `m = 1.5`. Gravity, quadratic drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin                                                                                                                                  |
+| Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.18 x 0.84 x 0.36, `m = 180`. Yaw rate bounded directly, so the turn radius (`v / yaw_rate`) grows with speed; lateral-grip decay for drift; boost meter; edge-triggered jump with a single airborne double jump |
+| Car-ball | Sphere vs OBB closest-point, impulse with relative velocity at contact (car rotation included), equal-and-opposite reaction                                                                                                                                             |
 
 Constants are community-sourced Rocket League figures (gravity ~650 uu/s²,
 Octane hitbox, 2200/2300 uu/s speed caps) converted to SI. They are
@@ -189,12 +189,28 @@ _approximations_, and the handling numbers (`CAR_MAX_YAW_RATE`,
 from the game. Matching RL exactly would
 need a parity harness against recorded ticks, which is a separate project.
 
+## Jumping
+
+Small surface area, but the choices are deliberate:
+
+- **Edge-triggered.** `Input.jump` is a held level, like `boost`. The car keeps
+  the previous tick's value and acts only on the press, so holding the button
+  does not re-launch it the instant it lands
+  (`holding_jump_does_not_re_jump_on_landing`).
+- **Shared gravity.** Airborne, the car falls under the same `GRAVITY` as the
+  ball. A 4 m/s launch peaks ~1.2 m up and hangs for ~1.2 s.
+- **One double jump.** A single extra launch while airborne, then nothing until
+  the car touches down again — RL gives you exactly two.
+- **No traction in the air.** The engine and tyres do nothing, so the car keeps
+  its momentum; boost still works. There is no air control or dodge yet, so a
+  jump cannot be turned into a shot.
+
 ## Not implemented yet
 
-Jumping and dodging (fixed-time impulse flips), wall/ceiling driving (a
-signature mechanic, and a real change to the car model), boost pads,
-car-car collisions, demolitions, goals and kickoff, multiple cars, and the
-actual network layer.
+Dodges/flips (the fixed-time impulse that turns a jump into a shot), air control,
+wall/ceiling driving (a signature mechanic, and a real change to the car model),
+boost pads, car-car collisions, demolitions, goals and kickoff, multiple cars,
+and the actual network layer.
 
 The useful next step for the determinism story is a _parity harness_: record
 input streams plus state hashes from a reference build, then assert them in CI.

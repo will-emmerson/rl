@@ -24,15 +24,20 @@ pub struct Input {
     pub steer: f64,
     pub boost: bool,
     pub handbrake: bool,
+    /// Jump, carried as a *held* level rather than an edge. The car detects the
+    /// press itself, so holding the button cannot re-fire the jump the instant
+    /// it lands.
+    pub jump: bool,
 }
 
 impl Input {
-    pub fn new(throttle: f64, steer: f64, boost: bool, handbrake: bool) -> Self {
+    pub fn new(throttle: f64, steer: f64, boost: bool, handbrake: bool, jump: bool) -> Self {
         Self {
             throttle: throttle.clamp(-1.0, 1.0),
             steer: steer.clamp(-1.0, 1.0),
             boost,
             handbrake,
+            jump,
         }
     }
 }

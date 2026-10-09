@@ -9,11 +9,12 @@ use rl_sim::{Input, World, TICK_HZ};
 fn scripted(tick: u32) -> Input {
     let phase = tick % 480;
     match phase {
-        0..=180 => Input::new(1.0, 0.0, false, false),
-        181..=240 => Input::new(1.0, 0.6, true, false),
-        241..=360 => Input::new(1.0, -0.8, false, false),
-        361..=420 => Input::new(-1.0, 0.3, false, true),
-        _ => Input::new(0.5, 0.0, false, false),
+        0..=180 => Input::new(1.0, 0.0, false, false, false),
+        181..=240 => Input::new(1.0, 0.6, true, false, false),
+        // Hold jump through this phase: exercises the airborne path in the hash.
+        241..=360 => Input::new(1.0, -0.8, false, false, true),
+        361..=420 => Input::new(-1.0, 0.3, false, true, false),
+        _ => Input::new(0.5, 0.0, false, false, false),
     }
 }
 
@@ -49,9 +50,11 @@ fn hash_is_sensitive_to_input() {
     let mut b = World::new();
     for tick in 0..600 {
         a.step(&scripted(tick));
-        // One tick of subtly different steering.
+        // One tick of subtly different steering, on a tick where the car is on
+        // the ground (steering does nothing in the air, so a change there
+        // correctly has no effect).
         let mut alt = scripted(tick);
-        if tick == 300 {
+        if tick == 100 {
             alt.steer += 1e-9;
         }
         b.step(&alt);

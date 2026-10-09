@@ -5,7 +5,7 @@
 
 use rl_sim::arena::Arena;
 use rl_sim::ball::BALL_RADIUS;
-use rl_sim::car::{CAR_MAX_YAW_RATE, CAR_STEER_ENGAGE_SPEED};
+use rl_sim::car::{CAR_HALF_HEIGHT, CAR_MAX_YAW_RATE, CAR_STEER_ENGAGE_SPEED};
 use rl_sim::math::Vec3;
 use rl_sim::{Ball, Car, Input, World, DT, GRAVITY};
 
@@ -104,14 +104,14 @@ fn yaw_rate_for_speed(speed: f64) -> f64 {
         velocity: heading * speed,
         ..Default::default()
     };
-    car.step(DT, &Input::new(0.0, 1.0, false, false), &arena);
+    car.step(DT, &Input::new(0.0, 1.0, false, false, false), &arena);
     car.yaw_rate
 }
 
 #[test]
 fn car_accelerates_then_saturates() {
     let mut world = World::new();
-    let drive = Input::new(1.0, 0.0, false, false);
+    let drive = Input::new(1.0, 0.0, false, false, false);
     for _ in 0..120 {
         world.step(&drive);
     }
@@ -166,7 +166,7 @@ fn steering_needs_speed_to_engage() {
 fn sustained_turn_has_a_sane_radius() {
     let mut world = World::new();
     world.car.velocity = world.car.heading * 15.0;
-    let steer = Input::new(1.0, 1.0, false, false);
+    let steer = Input::new(1.0, 1.0, false, false, false);
 
     let mut yaw = 0.0;
     let mut speed = 0.0;
@@ -193,7 +193,13 @@ fn car_never_leaves_the_arena() {
     let mut world = World::new();
     let mut rng = Lcg(12345);
     for _ in 0..4000 {
-        let input = Input::new(rng.signed(), rng.signed(), rng.next_f64() < 0.3, false);
+        let input = Input::new(
+            rng.signed(),
+            rng.signed(),
+            rng.next_f64() < 0.3,
+            false,
+            false,
+        );
         world.step(&input);
     }
     let a = &world.arena;
@@ -231,7 +237,13 @@ fn long_run_stays_finite_and_bounded() {
         // Bias towards charging the walls with the ball in front.
         let aiming = if (tick / 300) % 2 == 0 { 1.0 } else { -1.0 };
         let steer = if tick % 600 < 300 { 0.0 } else { aiming * 0.7 };
-        let input = Input::new(1.0, steer, rng.next_f64() < 0.5, rng.next_f64() < 0.1);
+        let input = Input::new(
+            1.0,
+            steer,
+            rng.next_f64() < 0.5,
+            rng.next_f64() < 0.1,
+            false,
+        );
         world.step(&input);
 
         assert!(world.car.pos.is_finite(), "car NaN at tick {tick}");
@@ -256,4 +268,74 @@ fn long_run_stays_finite_and_bounded() {
     assert!(peak_ball < 150.0, "ball blew up: {peak_ball} m/s");
     assert!(peak_car < 25.0, "car exceeded its cap: {peak_car} m/s");
     eprintln!("fuzz peaks: ball {peak_ball:.1} m/s, car {peak_car:.1} m/s");
+}
+
+#[test]
+fn jump_lifts_the_car_then_it_lands() {
+    let mut world = World::new();
+    // One tick of jump, then release it.
+    world.step(&Input::new(0.0, 0.0, false, false, true));
+    assert!(world.car.airborne, "should be airborne right after jumping");
+    assert!(world.car.velocity.y > 0.0, "should be moving up");
+
+    let mut peak = world.car.pos.y;
+    for _ in 0..600 {
+        world.step(&Input::new(0.0, 0.0, false, false, false));
+        peak = peak.max(world.car.pos.y);
+    }
+
+    assert!(
+        peak > CAR_HALF_HEIGHT + 1.0,
+        "jump peaked at {peak}, barely off the ground"
+    );
+    assert!(!world.car.airborne, "should have come back down");
+    assert!(
+        (world.car.pos.y - CAR_HALF_HEIGHT).abs() < 1e-9,
+        "resting at y={}",
+        world.car.pos.y
+    );
+    assert!(world.car.velocity.y.abs() < 1e-9, "still moving vertically");
+}
+
+#[test]
+fn holding_jump_does_not_re_jump_on_landing() {
+    // Jump is edge-triggered. Level-triggered, a held button would bounce the
+    // car forever; here it must fire exactly once.
+    let mut world = World::new();
+    let hold = Input::new(0.0, 0.0, false, false, true);
+
+    let mut takeoffs = 0;
+    let mut was_airborne = false;
+    for _ in 0..900 {
+        world.step(&hold);
+        if world.car.airborne && !was_airborne {
+            takeoffs += 1;
+        }
+        was_airborne = world.car.airborne;
+    }
+
+    assert_eq!(takeoffs, 1, "held jump re-fired {takeoffs} times");
+    assert!(!world.car.airborne, "should have settled on the ground");
+}
+
+#[test]
+fn double_jump_reaches_higher_than_a_single_jump() {
+    let peak_with = |rejump_at: Option<u32>| {
+        let mut world = World::new();
+        let mut peak = world.car.pos.y;
+        for tick in 0..400 {
+            let jump = tick == 0 || rejump_at == Some(tick);
+            world.step(&Input::new(0.0, 0.0, false, false, jump));
+            peak = peak.max(world.car.pos.y);
+        }
+        peak
+    };
+
+    // Re-jump a quarter of a second in, still on the way up.
+    let single = peak_with(None);
+    let double = peak_with(Some(30));
+    assert!(
+        double > single + 0.3,
+        "double jump peaked at {double}, single at {single}"
+    );
 }

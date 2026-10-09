@@ -24,6 +24,7 @@ dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 | Key                       | Gamepad    | Action             |
 | ------------------------- | ---------- | ------------------ |
 | `W` `A` `S` `D` or arrows | left stick | drive              |
+| `ctrl`                    | `A`        | jump               |
 | `space`                   | `B`        | boost              |
 | `shift`                   | `X`        | drift (handbrake)  |
 | `R`                       | `start`    | reset car and ball |
@@ -31,8 +32,9 @@ dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 
 Keyboard and pad are merged per axis, so either works and holding both does not
 cancel out. On the pad the triggers are analogue throttle: pull the right trigger
-to accelerate, the left to reverse. (If your pad reports nothing, see the gamepad
-section under "A note on Bevy's features" below.)
+to accelerate, the left to reverse. Jump (`ctrl` / `A`) is edge-triggered, and
+pressing it again while airborne gives a double jump. (If your pad reports
+nothing, see the gamepad section under "A note on Bevy's features" below.)
 
 The camera trails the car and leans its aim toward the ball. This needs a GPU
 and a window; it was developed on Vulkan.
@@ -101,7 +103,7 @@ cargo run --release -p rl_view -- --screenshot shot.png 250
 
 ```sh
 cargo run --release -p rl_sim --bin play
-cargo run --release -p rl_sim --bin play -- --interactive   # WASD in-terminal
+cargo run --release -p rl_sim --bin play -- --interactive   # WASD drive, space boost, z drift, j jump
 ```
 
 The terminal build is worth keeping around: it is the same `World::step`, with

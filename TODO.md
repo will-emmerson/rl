@@ -5,7 +5,6 @@
 # TODO
 
 - can I speed up compilation, some setting?
-- get controller working properly with my normal mapping
 - aim for just being able to bounce a ball against a wall
 - I need to break things down into really simple things:
   - get the car moving properly just on flat ground
@@ -21,6 +20,7 @@
 
 # DONE
 
+- get controller working properly with my normal mapping
 - stop rust compile hanging the laptop
 - stop zed doing cargo check
   - `.zed/settings.json`: rust-analyzer `checkOnSave: false` (no auto `cargo

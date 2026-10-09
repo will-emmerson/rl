@@ -10,7 +10,7 @@
 //! use rl_sim::{Input, World};
 //!
 //! let mut world = World::new();
-//! let input = Input::new(1.0, 0.0, false, false); // full throttle
+//! let input = Input::new(1.0, 0.0, false, false, false); // full throttle
 //! for _ in 0..240 {
 //!     world.step(&input);
 //! }
@@ -34,7 +34,7 @@ pub use world::{Input, Snapshot, World, DT, GRAVITY, TICK_HZ};
 /// Returns `(car speed at impact, ball speed shortly after)`.
 pub fn head_on_shot() -> (f64, f64) {
     let mut world = World::new();
-    let drive = Input::new(1.0, 0.0, false, false);
+    let drive = Input::new(1.0, 0.0, false, false, false);
     let mut last_car_speed = 0.0;
     let mut impact = 0.0;
 

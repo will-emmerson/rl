@@ -85,11 +85,11 @@ fn parse_args() -> Result<Options, String> {
 /// The scripted demo input, purely a function of the tick number.
 fn scripted_input(tick: u32) -> Input {
     match tick {
-        0..=250 => Input::new(1.0, 0.0, false, false),
-        251..=315 => Input::new(1.0, 0.0, true, false),
-        316..=700 => Input::new(1.0, 0.75, false, false),
-        701..=820 => Input::new(1.0, -1.0, false, true),
-        _ => Input::new(1.0, 0.4, false, false),
+        0..=250 => Input::new(1.0, 0.0, false, false, false),
+        251..=315 => Input::new(1.0, 0.0, true, false, false),
+        316..=700 => Input::new(1.0, 0.75, false, false, false),
+        701..=820 => Input::new(1.0, -1.0, false, true, false),
+        _ => Input::new(1.0, 0.4, false, false, false),
     }
 }
 
@@ -121,7 +121,7 @@ fn run_bench(ticks: u64) {
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         let a = ((rng >> 11) as f64) / ((1u64 << 53) as f64);
-        Input::new(a, a * 2.0 - 1.0, a < 0.5, false)
+        Input::new(a, a * 2.0 - 1.0, a < 0.5, false, a < 0.2)
     };
 
     // Warm up caches / branch predictors on a small slice first.
@@ -256,6 +256,7 @@ fn run_interactive() {
             axis_pair(&last_seen, b'a', b'd', tick),
             held(&last_seen, b' ', tick),
             held(&last_seen, b'z', tick),
+            held(&last_seen, b'j', tick),
         );
         world.step(&input);
         tick += 1;
@@ -263,7 +264,7 @@ fn run_interactive() {
         write!(
             stdout,
             "\x1b[2J\x1b[H{}",
-            render(&world, "WASD drive  space boost  z drift  q quit")
+            render(&world, "WASD drive  space boost  z drift  j jump  q quit")
         )
         .ok();
         stdout.flush().ok();
@@ -322,10 +323,11 @@ fn render(world: &World, subtitle: &str) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push(format!("rl_sim  {subtitle}"));
     lines.push(format!(
-        "tick {:>6} {:>5.1}s   car {:>5.1} m/s  boost {:>5.1}   ball {:>5.1} m/s  height {:>5.2} m",
+        "tick {:>6} {:>5.1}s   car {:>5.1} m/s y{:>4.2}  boost {:>5.1}   ball {:>5.1} m/s  height {:>5.2} m",
         world.tick,
         world.tick as f64 * DT,
         world.car.speed(),
+        world.car.pos.y,
         world.car.boost,
         world.ball.vel.length(),
         world.ball.pos.y,
