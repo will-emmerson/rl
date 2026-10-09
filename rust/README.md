@@ -52,6 +52,7 @@ and pick one, or `task: rerun` to repeat the last one.
 | `RL: play terminal (scripted demo)`   | no-input animation, then exits                     |
 | `RL: play terminal (WASD)`            | interactive terminal demo                          |
 | `RL: run tests`                       | `cargo test --workspace`                           |
+| `RL: cargo check`                     | type-check the workspace on demand (see below)     |
 | `RL: clippy (workspace, all targets)` | lints                                              |
 | `RL: render screenshot (tick 250)`    | dump a frame to `docs/screenshot.png`              |
 | `RL: physics throughput bench`        | ticks/s                                            |
@@ -71,6 +72,22 @@ To put one on a key, add to your `keymap.json`:
 ```
 
 (Note `reveal_target` belongs in the keybinding, not the task definition.)
+
+### Why rust-analyzer is not allowed to check on save
+
+`.zed/settings.json` sets two rust-analyzer options for this project:
+
+- `checkOnSave: false` — by default rust-analyzer runs
+  `cargo check --workspace --all-targets` on every save. With Bevy in the
+  workspace that re-checks a large dependency tree on each save and pegs the CPU.
+- `cargo.targetDir: true` — rust-analyzer gets its own target directory
+  (`rust/target/rust-analyzer`) instead of sharing `rust/target/`. Cargo holds an
+  exclusive lock on the target directory while building, so without this
+  rust-analyzer's check and a `cargo build`/`cargo run` block each other: whichever
+  started second waits for the other's lock.
+
+Together these stop the auto-check churn and the lock contention. When you do want
+cargo's diagnostics, run the `RL: cargo check` task — its output is clickable.
 
 You can also have it render a single frame and exit, which is handy for CI or
 for eyeballing a change:

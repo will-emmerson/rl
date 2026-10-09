@@ -1,0 +1,36 @@
+// Project settings for Rust editing in Zed.
+//
+// Two problems this solves, both caused by rust-analyzer running `cargo check`
+// against the same `rust/target/` directory that your own `cargo build`/`cargo
+// run` (or the coding agent) uses:
+//
+//   1. By default rust-analyzer runs `cargo check --workspace --all-targets` on
+//      every save. This workspace pulls in Bevy, so each save re-checks a large
+//      dependency tree and pegs the CPU.
+//   2. Cargo takes an exclusive lock on the target directory for the duration of
+//      a build. While rust-analyzer's check holds it, the build you actually
+//      asked for stalls waiting for the lock (and vice versa).
+//
+// `checkOnSave: false` stops the automatic on-save check entirely. To get cargo
+// diagnostics on demand, run the "RL: cargo check" task (cmd-shift-p ->
+// "task: spawn"), whose output is clickable.
+//
+// `cargo.targetDir: true` points rust-analyzer at its own subdirectory,
+// `rust/target/rust-analyzer`, so the cargo invocations it still performs on
+// project load (metadata, build scripts, proc macros) can never lock the
+// `rust/target/` directory your builds use.
+//
+// See https://zed.dev/docs/languages/rust and
+// https://rust-analyzer.github.io/book/configuration.html
+{
+  "lsp": {
+    "rust-analyzer": {
+      "initialization_options": {
+        "checkOnSave": false,
+        "cargo": {
+          "targetDir": true
+        }
+      }
+    }
+  }
+}

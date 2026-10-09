@@ -6,7 +6,7 @@
     "save": "all",
     "use_new_terminal": false,
     "allow_concurrent_runs": true,
-    "reveal": "always"
+    "reveal": "always",
   },
   {
     "label": "RL: play 3D (Bevy, release)",
@@ -15,7 +15,7 @@
     "save": "all",
     "use_new_terminal": false,
     "allow_concurrent_runs": true,
-    "reveal": "always"
+    "reveal": "always",
   },
   {
     "label": "RL: play 3D (Bevy, gamepad debug)",
@@ -24,7 +24,7 @@
     "save": "all",
     "use_new_terminal": true,
     "allow_concurrent_runs": false,
-    "reveal": "always"
+    "reveal": "always",
   },
   {
     "label": "RL: gamepad probe (mapping report)",
@@ -33,7 +33,7 @@
     "save": "all",
     "use_new_terminal": true,
     "allow_concurrent_runs": false,
-    "reveal": "always"
+    "reveal": "always",
   },
   {
     "label": "RL: play terminal (scripted demo)",
@@ -42,7 +42,7 @@
     "save": "all",
     "use_new_terminal": true,
     "allow_concurrent_runs": false,
-    "reveal": "always"
+    "reveal": "always",
   },
   {
     "label": "RL: play terminal (WASD)",
@@ -51,7 +51,7 @@
     "save": "all",
     "use_new_terminal": true,
     "allow_concurrent_runs": false,
-    "reveal": "always"
+    "reveal": "always",
   },
   {
     "label": "RL: run tests",
@@ -60,7 +60,16 @@
     "save": "all",
     "use_new_terminal": false,
     "allow_concurrent_runs": true,
-    "reveal": "always"
+    "reveal": "always",
+  },
+  {
+    "label": "RL: cargo check",
+    "command": "cargo check --workspace --all-targets",
+    "cwd": "$ZED_WORKTREE_ROOT/rust",
+    "save": "all",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always",
   },
   {
     "label": "RL: clippy (workspace, all targets)",
@@ -69,7 +78,7 @@
     "save": "all",
     "use_new_terminal": false,
     "allow_concurrent_runs": true,
-    "reveal": "always"
+    "reveal": "always",
   },
   {
     "label": "RL: render screenshot (tick 250)",
@@ -78,7 +87,7 @@
     "save": "all",
     "use_new_terminal": false,
     "allow_concurrent_runs": false,
-    "reveal": "always"
+    "reveal": "always",
   },
   {
     "label": "RL: physics throughput bench",
@@ -87,6 +96,6 @@
     "save": "all",
     "use_new_terminal": false,
     "allow_concurrent_runs": false,
-    "reveal": "always"
-  }
+    "reveal": "always",
+  },
 ]
