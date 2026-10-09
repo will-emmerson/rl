@@ -1,7 +1,7 @@
 // Project settings for Rust editing in Zed.
 //
 // Two problems this solves, both caused by rust-analyzer running `cargo check`
-// against the same `rust/target/` directory that your own `cargo build`/`cargo
+// against the same `target/` directory that your own `cargo build`/`cargo
 // run` (or the coding agent) uses:
 //
 //   1. By default rust-analyzer runs `cargo check --workspace --all-targets` on
@@ -16,9 +16,9 @@
 // "task: spawn"), whose output is clickable.
 //
 // `cargo.targetDir: true` points rust-analyzer at its own subdirectory,
-// `rust/target/rust-analyzer`, so the cargo invocations it still performs on
+// `target/rust-analyzer`, so the cargo invocations it still performs on
 // project load (metadata, build scripts, proc macros) can never lock the
-// `rust/target/` directory your builds use.
+// `target/` directory your builds use.
 //
 // See https://zed.dev/docs/languages/rust and
 // https://rust-analyzer.github.io/book/configuration.html
@@ -28,9 +28,9 @@
       "initialization_options": {
         "checkOnSave": false,
         "cargo": {
-          "targetDir": true
-        }
-      }
-    }
-  }
+          "targetDir": true,
+        },
+      },
+    },
+  },
 }

@@ -3,16 +3,13 @@
 A hand-rolled, deterministic Rocket League style physics simulation with two
 front ends: a dependency-free terminal demo, and a Bevy 3D viewer.
 
-![rl_view in action](rust/docs/screenshot.png)
+![rl_view in action](docs/screenshot.png)
 
 _The Bevy viewer at tick 251: the car driving into the ball mid-launch._
 
-See **[rust/docs/PHYSICS.md](rust/docs/PHYSICS.md)** for why the physics are
-hand-rolled rather than run on a general engine, plus honest caveats about
-determinism and performance.
-
-The Cargo workspace lives in `rust/`, so **run every command below from that
-directory** (`cd rust`).
+See **[docs/PHYSICS.md](docs/PHYSICS.md)** for why the physics are hand-rolled
+rather than run on a general engine, plus honest caveats about determinism and
+performance.
 
 ## Play it in 3D (Bevy)
 
@@ -59,7 +56,7 @@ and pick one, or `task: rerun` to repeat the last one.
 | `RL: run tests`                       | `cargo test --workspace`                           |
 | `RL: cargo check`                     | type-check the workspace on demand (see below)     |
 | `RL: clippy (workspace, all targets)` | lints                                              |
-| `RL: render screenshot (tick 250)`    | dump a frame to `rust/docs/screenshot.png`         |
+| `RL: render screenshot (tick 250)`    | dump a frame to `docs/screenshot.png`              |
 | `RL: physics throughput bench`        | ticks/s                                            |
 
 To put one on a key, add to your `keymap.json`:
@@ -86,7 +83,7 @@ To put one on a key, add to your `keymap.json`:
   `cargo check --workspace --all-targets` on every save. With Bevy in the
   workspace that re-checks a large dependency tree on each save and pegs the CPU.
 - `cargo.targetDir: true` — rust-analyzer gets its own target directory
-  (`rust/target/rust-analyzer`) instead of sharing `rust/target/`. Cargo holds an
+  (`target/rust-analyzer`) instead of sharing `target/`. Cargo holds an
   exclusive lock on the target directory while building, so without this
   rust-analyzer's check and a `cargo build`/`cargo run` block each other: whichever
   started second waits for the other's lock.
@@ -125,22 +122,22 @@ no engine or GPU in the way, so it is what the determinism tests drive.
 ## Layout
 
 ```
-rust/Cargo.toml   workspace; `rl_sim` is the root package
-rust/src/         the simulation (no dependencies)
+Cargo.toml        workspace; `rl_sim` is the root package
+src/              the simulation (no dependencies)
   math.rs         Vec3, hashing, deterministic sin/cos for rotation
   arena.rs        the six planes that make up the arena
   ball.rs         sphere: gravity, drag, Magnus, contact friction -> spin
   car.rs          bespoke driving model (not a rigid body) + box hitbox
   world.rs        120 Hz fixed step, input, state hash, snapshots
   bin/play.rs     terminal front end (scripted + interactive)
-rust/tests/       physics behaviour + determinism
-rust/view/        Bevy 3D viewer (`rl_view`)
-rust/docs/        physics write-up and the screenshot above
+tests/            physics behaviour + determinism
+view/             Bevy 3D viewer (`rl_view`)
+docs/             physics write-up and the screenshot above
 ```
 
 ## A note on Bevy's features
 
-`rust/view/Cargo.toml` spells out its Bevy features rather than using the `3d`/`ui`
+`view/Cargo.toml` spells out its Bevy features rather than using the `3d`/`ui`
 meta-features, because those pull in `default_platform`, which drags in
 `bevy_audio` (needs ALSA). Nothing here makes noise, so audio is left out and the
 viewer builds without it.

@@ -5,20 +5,20 @@ rule changes.
 
 ## What this is
 
-A Rocket League-style prototype. The active code is the Rust implementation
-under `rust/`:
+A Rocket League-style prototype. The active code is a hand-rolled,
+dependency-free simulation with a Bevy viewer:
 
-- `rust/src/` — `rl_sim`: a hand-rolled, dependency-free, deterministic physics
-  simulation (arena + ball + car). No game engine.
-- `rust/view/` — `rl_view`: a Bevy 3D viewer that reads `rl_sim` and draws it.
-- `rust/tests/` — physics behaviour and determinism tests.
+- `src/` — `rl_sim`: the deterministic simulation (arena + ball + car). No game
+  engine, no dependencies.
+- `view/` — `rl_view`: a Bevy 3D viewer that reads `rl_sim` and draws it.
+- `tests/` — physics behaviour and determinism tests.
 
 An earlier Godot 4 prototype was removed once the Rust implementation became the
-one we are building. `rust/docs/PHYSICS.md` still cites it as the motivation for
+one we are building. `docs/PHYSICS.md` still cites it as the motivation for
 hand-rolling the physics.
 
-Start with `rust/docs/PHYSICS.md` (why hand-rolled, and its honest caveats) and
-the root `README.md` (how to run it).
+Start with `docs/PHYSICS.md` (why hand-rolled, and its honest caveats) and
+`README.md` (how to run it).
 
 ## Determinism is the point — don't break it
 
@@ -36,7 +36,7 @@ client-side prediction and replays can work. Inside the simulation step:
   undetected.
 - **`-0.0` is canonicalised** in the hash — keep it that way.
 - `rl_sim` has **zero dependencies** by design. New crates go at most into
-  `rust/view/`.
+  `view/`.
 
 The viewer must never feed back into the simulation: it reads `World` and writes
 transforms, nothing more.
@@ -44,7 +44,6 @@ transforms, nothing more.
 ## Build / run / validate
 
 ```sh
-cd rust
 cargo run -p rl_view                   # play (dev profile is already playable)
 cargo test --workspace                 # the check that matters
 cargo clippy --workspace --all-targets # kept clean
@@ -55,7 +54,7 @@ cargo clippy --workspace --all-targets # kept clean
   Bevy, which takes minutes.
 - Linux needs **`libudev-dev`** (gamepad via `bevy_gilrs`). Audio/ALSA is
   deliberately excluded; Bevy features are listed explicitly in
-  `rust/view/Cargo.toml`.
+  `view/Cargo.toml`.
 - Project tasks are defined in `.zed/tasks.json`.
 
 ## Bevy is pinned to 0.19.1
@@ -82,6 +81,6 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
 
 - **Chase camera:** don't clamp it to the wall plane (it collapses onto the car),
   and don't aim at a weighted average of car/ball positions (it ends up facing
-  the floor). See the comments in `rust/view/src/main.rs`.
+  the floor). See the comments in `view/src/main.rs`.
 - **Car turning:** never derive yaw rate from a lateral-acceleration budget — it
   rises as `1/v` and pivots the car on the spot. The rate is bounded directly.
