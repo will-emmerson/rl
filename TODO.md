@@ -1,6 +1,11 @@
+# QUESTIONS
+
+- how to do physics tests properly, make parity with actual rocket league a test suite?
+
 # TODO
 
-- get controller working
+- can I speed up compilation, some setting?
+- get controller working properly with my normal mapping
 - aim for just being able to bounce a ball against a wall
 - I need to break things down into really simple things:
   - get the car moving properly just on flat ground
@@ -12,14 +17,15 @@
     - jumping
     - etc
 
-# QUESTIONS
-
-- is it using MCP?
-- how to do physics tests properly, make parity with actual rocket league a test suite?
-- what would it be like in Rust?
-
 # DOING
 
-- initial project setup with basic car and ball in arena
-
 # DONE
+
+- stop rust compile hanging the laptop
+- stop zed doing cargo check
+  - `.zed/settings.json`: rust-analyzer `checkOnSave: false` (no auto `cargo
+check` on every save) and `cargo.targetDir: true` (rust-analyzer uses its own
+    `rust/target/rust-analyzer`, so it never holds the lock a build waits on).
+    Use the `RL: cargo check` task for on-demand diagnostics.
+- get controller working
+- initial project setup with basic car and ball in arena
