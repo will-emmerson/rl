@@ -1,0 +1,74 @@
+[
+  {
+    "label": "RL: play 3D (Bevy)",
+    "command": "cargo run -p rl_view",
+    "cwd": "$ZED_WORKTREE_ROOT/rust",
+    "save": "all",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "RL: play 3D (Bevy, release)",
+    "command": "cargo run --release -p rl_view",
+    "cwd": "$ZED_WORKTREE_ROOT/rust",
+    "save": "all",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "RL: play terminal (scripted demo)",
+    "command": "cargo run -p rl_sim --bin play",
+    "cwd": "$ZED_WORKTREE_ROOT/rust",
+    "save": "all",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "RL: play terminal (WASD)",
+    "command": "cargo run -p rl_sim --bin play -- --interactive",
+    "cwd": "$ZED_WORKTREE_ROOT/rust",
+    "save": "all",
+    "use_new_terminal": true,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "RL: run tests",
+    "command": "cargo test --workspace",
+    "cwd": "$ZED_WORKTREE_ROOT/rust",
+    "save": "all",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "RL: clippy (workspace, all targets)",
+    "command": "cargo clippy --workspace --all-targets",
+    "cwd": "$ZED_WORKTREE_ROOT/rust",
+    "save": "all",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": true,
+    "reveal": "always"
+  },
+  {
+    "label": "RL: render screenshot (tick 250)",
+    "command": "cargo run -p rl_view -- --screenshot docs/screenshot.png 250",
+    "cwd": "$ZED_WORKTREE_ROOT/rust",
+    "save": "all",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  },
+  {
+    "label": "RL: physics throughput bench",
+    "command": "cargo run --release -p rl_sim --bin play -- --bench 2000000",
+    "cwd": "$ZED_WORKTREE_ROOT/rust",
+    "save": "all",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "reveal": "always"
+  }
+]

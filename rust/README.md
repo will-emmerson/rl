@@ -14,8 +14,12 @@ performance.
 ## Play it in 3D (Bevy)
 
 ```sh
-cargo run --release -p rl_view
+cargo run -p rl_view             # already built: starts in about a second
+cargo run --release -p rl_view   # smoother, but the first run rebuilds Bevy
 ```
+
+The dev profile is set up to be playable (this crate at `opt-level = 1`, all
+dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 
 | Key                       | Action             |
 | ------------------------- | ------------------ |
@@ -27,6 +31,39 @@ cargo run --release -p rl_view
 
 The camera trails the car and leans its aim toward the ball. This needs a GPU
 and a window; it was developed on Vulkan.
+
+### From Zed
+
+`.zed/tasks.json` defines all of the commands below as project tasks, so you
+don't have to remember them. Run `task: spawn` (`cmd-shift-p` → "task: spawn")
+and pick one, or `task: rerun` to repeat the last one.
+
+| Task                                  | What it does                                       |
+| ------------------------------------- | -------------------------------------------------- |
+| `RL: play 3D (Bevy)`                  | the viewer                                         |
+| `RL: play 3D (Bevy, release)`         | same, optimised (first run rebuilds Bevy: minutes) |
+| `RL: play terminal (scripted demo)`   | no-input animation, then exits                     |
+| `RL: play terminal (WASD)`            | interactive terminal demo                          |
+| `RL: run tests`                       | `cargo test --workspace`                           |
+| `RL: clippy (workspace, all targets)` | lints                                              |
+| `RL: render screenshot (tick 250)`    | dump a frame to `docs/screenshot.png`              |
+| `RL: physics throughput bench`        | ticks/s                                            |
+
+To put one on a key, add to your `keymap.json`:
+
+```json
+{
+  "context": "Workspace",
+  "bindings": {
+    "alt-r": [
+      "task::Spawn",
+      { "task_name": "RL: play 3D (Bevy)", "reveal_target": "center" }
+    ]
+  }
+}
+```
+
+(Note `reveal_target` belongs in the keybinding, not the task definition.)
 
 You can also have it render a single frame and exit, which is handy for CI or
 for eyeballing a change:
