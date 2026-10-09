@@ -1,6 +1,16 @@
 # TODO
 
 - get controller working
+- aim for just being able to bounce a ball against a wall
+- I need to break things down into really simple things:
+  - get the car moving properly just on flat ground
+  - get the ball moving properly
+- start comparing our physics with the real game by looking at replay files:
+  - I should be able to produce some replay files doing really simpler things like:
+    - driving forward, reversing, to make sure acceleration is correct
+    - turning
+    - jumping
+    - etc
 
 # QUESTIONS
 
