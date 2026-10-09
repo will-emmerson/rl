@@ -9,9 +9,13 @@ rl_sim = { path = ".." }
 
 # Feature set is spelled out rather than using bevy's convenient `3d`/`ui`
 # meta-features, because those pull in `default_platform`, which includes
-# `bevy_gilrs` (needs libudev) and `bevy_audio` (needs alsa). Neither is
-# installed here and the viewer needs neither, so this keeps the build
-# self-contained with no system packages to install.
+# `bevy_audio` (needs alsa). Nothing here makes noise, so dropping it keeps the
+# build free of a system package. `bevy_gilrs` is listed explicitly because it
+# needs libudev-dev, which is the one system package this build does require:
+#
+#     sudo apt-get install libudev-dev
+#
+# Everything else in `default_platform` is either unneeded or pulled in anyway.
 [dependencies.bevy]
 version = "0.19"
 default-features = false
@@ -21,6 +25,7 @@ features = [
     "ui_api",          # Text / Node / TextUiWriter
     "default_app",     # asset server, log, state, async executor
     "bevy_winit",      # window + event loop
+    "bevy_gilrs",      # gamepad input (needs libudev-dev on Linux)
     "x11",
     "wayland",
     "default_font",    # so Text works without shipping a font file
@@ -28,3 +33,8 @@ features = [
     "std",
     "png",             # --screenshot
 ]
+
+[dev-dependencies]
+# Only used by `examples/gamepad_probe.rs`, which reports how gilrs maps a pad.
+# The same version is already pulled in by `bevy_gilrs`, so this adds no build.
+gilrs = "0.11"

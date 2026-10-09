@@ -6,12 +6,14 @@
 //! guarantees in `docs/PHYSICS.md` still hold with the viewer attached.
 //!
 //! Run it:
-//!   cargo run --release -p rl_view              # play
-//!   cargo run --release -p rl_view -- --screenshot shot.png
+//!   cargo run -p rl_view                          # play (dev profile is playable)
+//!   cargo run -p rl_view -- --screenshot shot.png # render one frame, then exit
+//!   cargo run -p rl_view -- --gamepad-debug       # log every raw pad event
 
 use std::f32::consts::PI;
 
 use bevy::app::AppExit;
+use bevy::input::gamepad::{RawGamepadAxisChangedEvent, RawGamepadButtonChangedEvent};
 use bevy::prelude::*;
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
@@ -55,6 +57,14 @@ enum Mode {
     },
 }
 
+/// Set by `--gamepad-debug`: log every raw gamepad event.
+///
+/// Detecting a pad and mapping its controls cannot be exercised from a test, so
+/// this is the escape hatch: run it, press things, and read the log to see which
+/// `GamepadButton` / `GamepadAxis` each physical control produces.
+#[derive(Resource, Default)]
+struct GamepadDebug(bool);
+
 #[derive(Component)]
 enum Vis {
     Car,
@@ -69,6 +79,7 @@ struct HudText;
 
 fn main() {
     let mut mode = Mode::Play;
+    let mut gamepad_debug = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         if arg == "--screenshot" {
@@ -80,6 +91,8 @@ fn main() {
                 path,
                 capture_at_tick,
             };
+        } else if arg == "--gamepad-debug" {
+            gamepad_debug = true;
         }
     }
 
@@ -87,6 +100,7 @@ fn main() {
         .add_plugins(DefaultPlugins)
         .insert_resource(Sim(SimWorld::new()))
         .insert_resource(mode)
+        .insert_resource(GamepadDebug(gamepad_debug))
         .insert_resource(Time::<Fixed>::from_hz(rl_sim::TICK_HZ as f64))
         .add_systems(Startup, setup_scene)
         .add_systems(FixedUpdate, step_simulation)
@@ -94,6 +108,8 @@ fn main() {
             Update,
             (
                 reset_on_key,
+                report_gamepads,
+                report_gamepad_events,
                 sync_visuals,
                 chase_camera,
                 update_hud,
@@ -276,7 +292,9 @@ fn setup_scene(
 
     // --- hud ---
     let hint = match &*mode {
-        Mode::Play => "WASD drive  space boost  shift drift  R reset  esc quit",
+        Mode::Play => {
+            "drive WASD / stick+triggers   boost space / B   drift shift / X   reset R / start   quit esc"
+        }
         Mode::Capture { .. } => "capture mode",
     };
     commands.spawn((
@@ -306,31 +324,150 @@ fn axis(keys: &ButtonInput<KeyCode>, positive: &[KeyCode], negative: &[KeyCode])
     }
 }
 
-fn read_input(keys: &ButtonInput<KeyCode>) -> SimInput {
+/// Whichever of the two is further from zero, so the keyboard and the pad can
+/// be used interchangeably without cancelling each other out.
+fn strongest(a: f64, b: f64) -> f64 {
+    if a.abs() >= b.abs() {
+        a
+    } else {
+        b
+    }
+}
+
+/// Reads one analogue trigger, in `0.0..=1.0`.
+///
+/// gilrs maps a pad through a database entry keyed by its device id. This pad
+/// has no entry (see `examples/gamepad_probe.rs`), so it falls back to gilrs'
+/// built-in default mapping, which exposes the xpad triggers as the *axes*
+/// `LeftZ` / `RightZ` (evdev ABS_Z / ABS_RZ) rather than as trigger buttons.
+/// Those axes run 0..=255 and are normalised to `-1.0..=1.0`, so they rest near
+/// `-1.0` and reach `+1.0` when fully pulled. Pads that *do* have a database
+/// entry report the triggers as buttons instead, so accept either and take the
+/// larger.
+fn trigger(pad: &Gamepad, axis: GamepadAxis, button: GamepadButton) -> f64 {
+    let from_axis = pad
+        .get(axis)
+        .map(|v| ((v as f64 + 1.0) * 0.5).clamp(0.0, 1.0))
+        .unwrap_or(0.0);
+    let from_button = pad.get(button).unwrap_or(0.0) as f64;
+
+    // The axis' resting value only maps to about 0, not exactly 0, so trim the
+    // slack and stop the car creeping at idle.
+    let value = strongest(from_axis, from_button);
+    if value < 0.05 {
+        0.0
+    } else {
+        value
+    }
+}
+
+fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInput {
+    let keyboard_throttle = axis(
+        keys,
+        &[KeyCode::KeyW, KeyCode::ArrowUp],
+        &[KeyCode::KeyS, KeyCode::ArrowDown],
+    );
+    let keyboard_steer = axis(
+        keys,
+        &[KeyCode::KeyA, KeyCode::ArrowLeft],
+        &[KeyCode::KeyD, KeyCode::ArrowRight],
+    );
+
+    // Triggers are analogue, so they give proportional throttle rather than the
+    // keyboard's full-on. Button layout matches Rocket League: B boosts and X
+    // is the handbrake.
+    let (pad_throttle, pad_steer, pad_boost, pad_drift) = match gamepad {
+        Some(pad) => (
+            trigger(pad, GamepadAxis::RightZ, GamepadButton::RightTrigger2)
+                - trigger(pad, GamepadAxis::LeftZ, GamepadButton::LeftTrigger2),
+            // Sticks are positive to the right; `steer` is positive to the left.
+            -pad.get(GamepadAxis::LeftStickX).unwrap_or(0.0) as f64,
+            pad.get(GamepadButton::East).unwrap_or(0.0) > 0.5,
+            pad.get(GamepadButton::West).unwrap_or(0.0) > 0.5,
+        ),
+        None => (0.0, 0.0, false, false),
+    };
+
     SimInput::new(
-        axis(
-            keys,
-            &[KeyCode::KeyW, KeyCode::ArrowUp],
-            &[KeyCode::KeyS, KeyCode::ArrowDown],
-        ),
-        axis(
-            keys,
-            &[KeyCode::KeyA, KeyCode::ArrowLeft],
-            &[KeyCode::KeyD, KeyCode::ArrowRight],
-        ),
-        keys.pressed(KeyCode::Space),
-        keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight),
+        strongest(keyboard_throttle, pad_throttle),
+        strongest(keyboard_steer, pad_steer),
+        keys.pressed(KeyCode::Space) || pad_boost,
+        keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) || pad_drift,
     )
 }
 
-fn step_simulation(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>, mode: Res<Mode>) {
+fn step_simulation(
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut sim: ResMut<Sim>,
+    mode: Res<Mode>,
+) {
     let input = match &*mode {
-        Mode::Play => read_input(&keys),
+        Mode::Play => read_input(&keys, gamepads.iter().next()),
         // Self-driving, so a capture is reproducible rather than dependent on
         // the frame rate. See `capture_input` for the schedule.
         Mode::Capture { .. } => capture_input(sim.0.tick),
     };
     sim.0.step(&input);
+}
+
+/// Logs gamepad connect/disconnect.
+///
+/// Detecting the pad is the one part of controller support that cannot be
+/// tested from code, so it says so loudly on stdout.
+fn report_gamepads(gamepads: Query<Entity, With<Gamepad>>, mut seen: Local<usize>) {
+    let connected = gamepads.iter().count();
+    if connected != *seen {
+        *seen = connected;
+        if connected == 0 {
+            info!("no gamepad detected");
+        } else {
+            info!("gamepad detected ({connected} connected)");
+        }
+    }
+}
+
+/// Stable index for the axes `report_gamepad_events` tracks, so it can throttle
+/// the log without a map. Non-standard axes share the last slot.
+fn axis_slot(axis: GamepadAxis) -> usize {
+    match axis {
+        GamepadAxis::LeftStickX => 0,
+        GamepadAxis::LeftStickY => 1,
+        GamepadAxis::LeftZ => 2,
+        GamepadAxis::RightStickX => 3,
+        GamepadAxis::RightStickY => 4,
+        GamepadAxis::RightZ => 5,
+        GamepadAxis::Other(_) => 6,
+    }
+}
+
+/// Logs raw gamepad events, for `--gamepad-debug`.
+///
+/// Bevy forwards gilrs events almost verbatim, so this is the ground truth for
+/// "what does this physical control send?". The messages are drained every frame
+/// whether or not logging is on, so the queue can never grow, and axis logging is
+/// throttled so a twitchy stick cannot flood the terminal.
+fn report_gamepad_events(
+    debug: Res<GamepadDebug>,
+    mut buttons: MessageReader<RawGamepadButtonChangedEvent>,
+    mut axes: MessageReader<RawGamepadAxisChangedEvent>,
+    mut last: Local<[f32; 7]>,
+) {
+    let verbose = debug.0;
+    for ev in buttons.read() {
+        if verbose {
+            info!("pad button {:?} = {:+.2}", ev.button, ev.value);
+        }
+    }
+    for ev in axes.read() {
+        let slot = axis_slot(ev.axis);
+        if (ev.value - last[slot]).abs() > 0.02 {
+            last[slot] = ev.value;
+            if verbose {
+                info!("pad axis {:?} = {:+.2}", ev.axis, ev.value);
+            }
+        }
+    }
 }
 
 /// The self-driving script used by `--screenshot`, as a function of the tick.
@@ -349,8 +486,11 @@ fn capture_input(tick: u64) -> SimInput {
     }
 }
 
-fn reset_on_key(keys: Res<ButtonInput<KeyCode>>, mut sim: ResMut<Sim>) {
-    if keys.just_pressed(KeyCode::KeyR) {
+fn reset_on_key(keys: Res<ButtonInput<KeyCode>>, gamepads: Query<&Gamepad>, mut sim: ResMut<Sim>) {
+    let pad_reset = gamepads
+        .iter()
+        .any(|pad| pad.just_pressed(GamepadButton::Start));
+    if keys.just_pressed(KeyCode::KeyR) || pad_reset {
         sim.0 = SimWorld::new();
     }
 }
