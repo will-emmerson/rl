@@ -5,7 +5,7 @@
 
 use rl_sim::arena::Arena;
 use rl_sim::ball::BALL_RADIUS;
-use rl_sim::car::{CAR_LATERAL_ACCEL, CAR_MIN_TURN_RADIUS};
+use rl_sim::car::{CAR_MAX_YAW_RATE, CAR_STEER_ENGAGE_SPEED};
 use rl_sim::math::Vec3;
 use rl_sim::{Ball, Car, Input, World, DT, GRAVITY};
 
@@ -127,17 +127,39 @@ fn car_accelerates_then_saturates() {
 }
 
 #[test]
-fn turn_radius_grows_with_speed() {
-    // A Rocket League car cannot corner as tightly at speed as it can crawling.
+fn steering_rate_is_bounded_and_radius_grows_with_speed() {
+    // The rate is capped rather than derived from an acceleration budget, so it
+    // never exceeds the cap and the radius scales with speed.
     let slow = yaw_rate_for_speed(5.0);
     let fast = yaw_rate_for_speed(22.0);
-    assert!(slow > fast, "slow={slow} fast={fast}");
+    for rate in [slow, fast] {
+        assert!(
+            rate.abs() <= CAR_MAX_YAW_RATE + 1e-9,
+            "rate {rate} exceeds the cap"
+        );
+    }
+
+    let radius_slow = 5.0 / slow;
+    let radius_fast = 22.0 / fast;
     assert!(
-        (slow - 5.0 / CAR_MIN_TURN_RADIUS).abs() < 0.05,
-        "slow={slow}"
+        radius_fast > radius_slow * 2.0,
+        "radius should grow with speed: {radius_slow} -> {radius_fast}"
     );
-    let expected_fast = 22.0 / (22.0 * 22.0 / CAR_LATERAL_ACCEL);
-    assert!((fast - expected_fast).abs() < 0.05, "fast={fast}");
+    // A real circle, not a spin in place. This is the regression that made
+    // cornering feel twitchy: the old model pivoted in a 1.2 m circle.
+    assert!(radius_slow > 1.5, "radius at 5 m/s is {radius_slow} m");
+}
+
+#[test]
+fn steering_needs_speed_to_engage() {
+    // Dead stop: no rotation at all, rather than pivoting on the spot.
+    assert!(yaw_rate_for_speed(0.0).abs() < 1e-9);
+    // Half the engagement speed gives half the rate.
+    let half = yaw_rate_for_speed(CAR_STEER_ENGAGE_SPEED * 0.5);
+    assert!(
+        (half - CAR_MAX_YAW_RATE * 0.5).abs() < 1e-9,
+        "expected half rate, got {half}"
+    );
 }
 
 #[test]
@@ -156,6 +178,10 @@ fn sustained_turn_has_a_sane_radius() {
     let avg_speed = speed / 240.0;
     let avg_yaw_rate = yaw / (240.0 * DT);
     let radius = avg_speed / avg_yaw_rate;
+    eprintln!(
+        "sustained turn: ~{avg_speed:.1} m/s, yaw {avg_yaw_rate:.2} rad/s ({:.0} deg/s), radius {radius:.1} m",
+        avg_yaw_rate.to_degrees()
+    );
     assert!(
         (3.0..=30.0).contains(&radius),
         "radius {radius} m (speed {avg_speed}, yaw rate {avg_yaw_rate})"

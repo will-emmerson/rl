@@ -27,11 +27,22 @@ pub const CAR_REVERSE_ACCEL: f64 = 6.0;
 pub const CAR_MAX_REVERSE_SPEED: f64 = 10.0;
 pub const CAR_BRAKE_DECEL: f64 = 18.0;
 
-/// Cornering is limited by a lateral acceleration budget, so the turn radius
-/// is v^2 / a. This is the single knob that decides how the car handles.
-pub const CAR_LATERAL_ACCEL: f64 = 45.0;
-pub const CAR_MIN_TURN_RADIUS: f64 = 1.2;
-pub const CAR_MAX_YAW_RATE: f64 = 6.0;
+/// Yaw rate the car can hold, in rad/s. This is the single knob that decides
+/// how the car handles.
+///
+/// The rate is bounded directly rather than derived from a lateral
+/// acceleration budget. A budget (radius = v^2 / a) makes the rate rise as
+/// 1/v once the radius floor is reached, which is how the car ended up able
+/// to spin on the spot at a crawl.
+///
+/// The consequence of holding the rate is a minimum turn radius of
+/// `CAR_STEER_ENGAGE_SPEED / CAR_MAX_YAW_RATE` (~3.9 m) below the engagement
+/// speed, growing linearly with speed above it: ~7.7 m at 10 m/s and ~17 m at
+/// 22 m/s.
+pub const CAR_MAX_YAW_RATE: f64 = 1.3;
+/// Steering authority ramps in over this speed. Below it the car turns
+/// proportionally less, and at a dead stop it does not turn at all.
+pub const CAR_STEER_ENGAGE_SPEED: f64 = 5.0;
 
 /// Lateral velocity retained per tick. High grip keeps the velocity glued to
 /// the heading; the handbrake keeps more of it, which is what makes a drift.
@@ -106,13 +117,12 @@ impl Car {
         let mut v_lateral = self.velocity.dot(r);
 
         // --- yaw ---
-        if v_forward.abs() > 0.05 {
-            let radius = (v_forward * v_forward / CAR_LATERAL_ACCEL).max(CAR_MIN_TURN_RADIUS);
-            self.yaw_rate =
-                (input.steer * (v_forward / radius)).clamp(-CAR_MAX_YAW_RATE, CAR_MAX_YAW_RATE);
-        } else {
-            self.yaw_rate = 0.0;
-        }
+        // Bounded directly, and scaled in below the engagement speed so the
+        // car cannot pivot on the spot. The sign follows the direction of
+        // travel, so reversing mirrors the turn like a real car.
+        let direction = if v_forward >= 0.0 { 1.0 } else { -1.0 };
+        let engagement = (v_forward.abs() / CAR_STEER_ENGAGE_SPEED).min(1.0);
+        self.yaw_rate = input.steer * CAR_MAX_YAW_RATE * engagement * direction;
         self.heading = rotate_y(f, self.yaw_rate * dt);
         let f = self.heading;
         let r = self.right();
@@ -186,10 +196,16 @@ impl Car {
         }
     }
 
-    /// Nominal turn radius at the current speed (v^2 / lateral acceleration).
+    /// Nominal turn radius at the current speed, which is `v / yaw_rate`.
+    /// Infinite when stopped, because the car cannot turn without rolling.
     pub fn turn_radius(&self) -> f64 {
         let v = self.forward_speed().abs();
-        (v * v / CAR_LATERAL_ACCEL).max(CAR_MIN_TURN_RADIUS)
+        let rate = CAR_MAX_YAW_RATE * (v / CAR_STEER_ENGAGE_SPEED).min(1.0);
+        if rate > 1e-9 {
+            v / rate
+        } else {
+            f64::INFINITY
+        }
     }
 
     pub fn hash_into(&self, h: &mut StateHasher) {
