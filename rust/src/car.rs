@@ -70,7 +70,7 @@ pub struct Car {
     pub pos: Vec3,
     /// Velocity. `y` is zero on the ground and carries the jump arc in the air.
     pub velocity: Vec3,
-    /// Unit heading in the XZ plane. +Z at spawn, matching the Godot scene.
+    /// Unit heading in the XZ plane. +Z at spawn.
     pub heading: Vec3,
     pub yaw_rate: f64,
     pub boost: f64,

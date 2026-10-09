@@ -1,9 +1,2 @@
-# Godot 4 editor/import cache
-.godot/
-
-# Exported builds
-build/
-export_presets.cfg
-
 # Rust build output
 rust/target/

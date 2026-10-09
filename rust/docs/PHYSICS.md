@@ -17,7 +17,7 @@ one sitting.
 
 The cost of using one shows up when the game's behaviour is _specific_ and you
 have to fight the engine to express it. That is exactly what happened building
-the Godot version:
+an earlier Godot prototype (since removed from the repo):
 
 - `VehicleBody3D` rolled the car over in corners, so I had to add a fake
   anti-roll torque — essentially a hand-written physics hack layered on top of

@@ -28,7 +28,7 @@ pub struct Arena {
 
 impl Default for Arena {
     fn default() -> Self {
-        // Roughly 80 m x 50 m x 12 m, matching the Godot scene.
+        // Roughly 80 m x 50 m x 12 m.
         Self {
             half_x: 40.0,
             half_z: 25.0,
