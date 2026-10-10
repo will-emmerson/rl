@@ -38,13 +38,24 @@ const CAMERA_SQUEEZE_INSET: f32 = 2.5;
 /// above the car it sits.
 const CAMERA_AIM_LEAN: f32 = 6.0;
 const CAMERA_AIM_HEIGHT: f32 = 0.6;
-/// How far the look control reaches: yaw swings the camera around the car (in
-/// radians), pitch lifts or drops the point it looks at (in metres).
-const CAMERA_LOOK_YAW: f32 = 2.0;
-const CAMERA_LOOK_PITCH: f32 = 6.0;
-/// Vertical look is inverted: pushing the stick up looks down. Flip this to
-/// `false` for the standard mapping.
+/// How far left/right the look control swivels the camera, in radians.
+const CAMERA_LOOK_YAW: f32 = 1.5;
+/// How far the pitch control orbits the camera up and down around the car, in
+/// radians. Push up raises the camera into a top-down overview; pull down drops
+/// it towards a flat, horizon-skimming view.
+const CAMERA_LOOK_PITCH: f32 = 0.9;
+/// The orbit angle is clamped to this range, in radians above the horizontal:
+/// `0` is level with the car, `PI/2` is straight overhead. This is what keeps
+/// the car in frame - the view can never tip past the car into the ground.
+const CAMERA_PITCH_MIN: f32 = 0.10;
+const CAMERA_PITCH_MAX: f32 = 1.35;
+/// Vertical look is inverted: pushing the stick up looks down (and so raises the
+/// camera into the overview). Flip to `false` for the standard mapping.
 const CAMERA_LOOK_INVERT_Y: bool = true;
+/// How fast the look angle catches up to the swivel target, per second (higher
+/// is snappier). Only the swivel is smoothed: the look-behind click is a hard
+/// 180° flip, both in and out.
+const CAMERA_LOOK_RESPONSE: f32 = 8.0;
 
 // ---------------------------------------------------------------------------
 // Resources / components
@@ -135,7 +146,6 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
-    mode: Res<Mode>,
 ) {
     // --- arena ---
     commands.spawn((
@@ -298,12 +308,7 @@ fn setup_scene(
     ));
 
     // --- hud ---
-    let hint = match &*mode {
-        Mode::Play => {
-            "drive WASD / stick   look IJKL / right stick   jump ctrl / A   boost space / B   drift shift / X   reset R / start   quit esc"
-        }
-        Mode::Capture { .. } => "capture mode",
-    };
+    // Only the readouts; the control bindings live in the README, not on screen.
     commands.spawn((
         Text::default(),
         Node {
@@ -312,7 +317,7 @@ fn setup_scene(
             left: px(12),
             ..default()
         },
-        children![TextSpan::new(""), TextSpan::new(""), TextSpan::new(hint)],
+        children![TextSpan::new(""), TextSpan::new("")],
         HudText,
     ));
 }
@@ -572,11 +577,10 @@ fn free_fraction(from: Vec3, to: Vec3, margin: f32) -> f32 {
     t.clamp(0.0, 1.0)
 }
 
-/// Look input as two scalars, merged from the pad's right stick and the IJKL
-/// keys so either can be used. `x` is positive to the right; `y` is the aim
-/// lift, positive to look up. The vertical axis is inverted
-/// (`CAMERA_LOOK_INVERT_Y`), so pushing the stick *up* looks down and gives a
-/// negative `y`.
+/// Look input as two scalars in `-1..=1`, merged from the pad's right stick and
+/// the keyboard (`I`/`K` pitch, `J`/`L` swivel). `x` is positive to the right;
+/// `y` is the pitch input, positive to look up. The vertical axis is inverted
+/// (`CAMERA_LOOK_INVERT_Y`), so pushing the stick up looks down.
 fn look_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> (f64, f64) {
     let key_x = axis(keys, &[KeyCode::KeyL], &[KeyCode::KeyJ]);
     let key_y = axis(keys, &[KeyCode::KeyI], &[KeyCode::KeyK]);
@@ -592,23 +596,51 @@ fn look_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> (f64, f
     (strongest(key_x, pad_x), y)
 }
 
+/// Whether the look-behind control is held. In Rocket League that is pushing the
+/// right stick in - the "click", R3.
+fn look_behind(gamepad: Option<&Gamepad>) -> bool {
+    gamepad.is_some_and(|pad| pad.pressed(GamepadButton::RightThumb))
+}
+
+/// How far the camera is yawed away from straight-behind, in radians. Left and
+/// right swivel; `behind` turns the camera right around to the front of the car,
+/// which is Rocket League's look-behind.
+fn look_yaw_offset(look_x: f64, behind: bool) -> f32 {
+    if behind {
+        PI
+    } else {
+        -(look_x as f32) * CAMERA_LOOK_YAW
+    }
+}
+
+/// The camera's resting orbit angle: the angle above the horizontal at which
+/// the preferred chase position sits.
+fn resting_pitch() -> f32 {
+    CAMERA_HEIGHT.atan2(CAMERA_DISTANCE)
+}
+
+/// The orbit angle for an (already inverted) vertical look input, clamped to the
+/// safe range. Push up raises the camera towards a top-down view; pull down
+/// lowers it towards a flat one.
+fn pitch_for_look(look_y: f32) -> f32 {
+    (resting_pitch() - look_y * CAMERA_LOOK_PITCH).clamp(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX)
+}
+
 /// The camera's offsets from the car: where it sits (`boom`) and the point it
-/// looks at (`aim`), given the car's horizontal `forward` and the look input in
-/// `-1..=1`.
+/// looks at (`aim`), from a yaw offset (`look_yaw_offset`) and an orbit angle
+/// (`pitch`, in radians above the horizontal).
 ///
-/// With no look input `boom` is exactly `-forward * CAMERA_DISTANCE + Y *
-/// CAMERA_HEIGHT` and `aim` is `Y * CAMERA_AIM_HEIGHT`, so the resting view is
-/// unchanged.
-///
-/// Yaw swings the boom around the car, keeping it a constant distance away.
-/// Pitch moves the *aim point*, not the boom: a boom that is always aimed at the
-/// car can only ever tilt the camera down around it, so "look up" would be
-/// capped at a few degrees above level. The aim has to move for up to mean
-/// anything.
-fn camera_frame(forward: Vec3, look_x: f64, look_y: f64) -> (Vec3, Vec3) {
-    let back = Quat::from_rotation_y(-(look_x as f32) * CAMERA_LOOK_YAW) * -forward;
-    let boom = back * CAMERA_DISTANCE + Vec3::Y * CAMERA_HEIGHT;
-    let aim = Vec3::Y * (CAMERA_AIM_HEIGHT + look_y as f32 * CAMERA_LOOK_PITCH);
+/// At zero yaw and the resting pitch, `boom` is exactly
+/// `-forward * CAMERA_DISTANCE + Y * CAMERA_HEIGHT` and `aim` is
+/// `Y * CAMERA_AIM_HEIGHT`, so the resting view is unchanged. Yaw swings the boom
+/// horizontally around the car; pitch orbits it vertically, so the camera rises
+/// towards a top-down view (or drops flat) while `aim` stays on the car - which
+/// is what keeps the car in frame instead of aiming into the ground.
+fn camera_frame(forward: Vec3, yaw: f32, pitch: f32) -> (Vec3, Vec3) {
+    let back = Quat::from_rotation_y(yaw) * -forward;
+    let radius = (CAMERA_DISTANCE * CAMERA_DISTANCE + CAMERA_HEIGHT * CAMERA_HEIGHT).sqrt();
+    let boom = back * (radius * pitch.cos()) + Vec3::Y * (radius * pitch.sin());
+    let aim = Vec3::Y * CAMERA_AIM_HEIGHT;
     (boom, aim)
 }
 
@@ -618,6 +650,8 @@ fn chase_camera(
     sim: Res<Sim>,
     time: Res<Time>,
     mut query: Query<&mut Transform, With<ChaseCam>>,
+    mut look_yaw: Local<f32>,
+    mut behind_last: Local<bool>,
 ) {
     let car = sim.0.car.pos;
     let heading = sim.0.car.heading;
@@ -627,9 +661,27 @@ fn chase_camera(
     let car_pos = Vec3::new(car.x as f32, car.y as f32, car.z as f32);
     let ball_pos = Vec3::new(ball.x as f32, ball.y as f32, ball.z as f32);
 
-    let (look_x, look_y) = look_input(&keys, gamepads.iter().next());
+    let pad = gamepads.iter().next();
+    let behind = look_behind(pad);
+    let (look_x, look_y) = look_input(&keys, pad);
 
-    let (boom, aim_offset) = camera_frame(forward, look_x, look_y);
+    // Look-behind is a hard 180° flip in Rocket League: it jumps around the
+    // instant the stick is clicked, and jumps back on release. `behind_last`
+    // catches both edges so neither transition swivels. The ordinary swivel, by
+    // contrast, is smoothed so the camera eases around after the stick.
+    let was_behind = *behind_last;
+    *behind_last = behind;
+    let snap = behind != was_behind;
+
+    // Smooth the look *angle*, not the camera position: easing the angle swings
+    // the camera *around* the car rather than cutting through it.
+    let smooth = if snap {
+        1.0
+    } else {
+        1.0 - (-CAMERA_LOOK_RESPONSE * time.delta_secs()).exp()
+    };
+    *look_yaw += (look_yaw_offset(look_x, behind) - *look_yaw) * smooth;
+    let (boom, aim_offset) = camera_frame(forward, *look_yaw, pitch_for_look(look_y as f32));
 
     // Pull the camera in along the line of sight rather than clamping it to
     // the wall plane. A car backed against a wall has *no* room behind it, and
@@ -673,7 +725,12 @@ fn chase_camera(
     // positions. Blending the raw positions lets the aim point drift behind the
     // camera whenever the ball is, and the camera then stares at the floor with
     // the car somewhere off screen.
-    let look_amount = (look_x.abs().max(look_y.abs()) as f32).clamp(0.0, 1.0);
+    // Looking behind always keeps the car centred, whatever the stick is doing.
+    let look_amount = if behind {
+        1.0
+    } else {
+        (look_x.abs().max(look_y.abs()) as f32).clamp(0.0, 1.0)
+    };
     let lean_factor = 0.35 * (1.0 - squeeze) * (1.0 - look_amount);
     let lean = (ball_pos - car_pos)
         .with_y(0.0)
@@ -681,7 +738,13 @@ fn chase_camera(
         * lean_factor;
     let aim = car_pos + lean + aim_offset;
 
-    let weight = 1.0 - (-8.0 * time.delta_secs()).exp();
+    // Ease the camera into place to damp jitter, except on a look-behind flip,
+    // where the whole point is to jump straight to the other side of the car.
+    let weight = if snap {
+        1.0
+    } else {
+        1.0 - (-8.0 * time.delta_secs()).exp()
+    };
     for mut transform in &mut query {
         transform.translation = transform.translation.lerp(desired, weight);
         // Directly overhead, world up is parallel to the view direction and
@@ -798,11 +861,12 @@ mod tests {
 
     #[test]
     fn camera_frame_without_look_is_the_plain_chase_offset() {
-        // The look control must not change the resting view: with no input the
-        // boom is exactly the old `-forward * CAMERA_DISTANCE + Y * CAMERA_HEIGHT`,
-        // and the aim sits CAMERA_AIM_HEIGHT above the car.
+        // The look control must not change the resting view: at zero yaw and the
+        // resting pitch the boom is exactly the old
+        // `-forward * CAMERA_DISTANCE + Y * CAMERA_HEIGHT`, and the aim sits
+        // CAMERA_AIM_HEIGHT above the car.
         let forward = Vec3::new(0.0, 0.0, 1.0);
-        let (boom, aim) = camera_frame(forward, 0.0, 0.0);
+        let (boom, aim) = camera_frame(forward, 0.0, resting_pitch());
         let expected = -forward * CAMERA_DISTANCE + Vec3::Y * CAMERA_HEIGHT;
         assert!((boom - expected).length() < 1e-5, "boom {boom:?}");
         assert!(
@@ -815,10 +879,10 @@ mod tests {
     fn look_yaw_swings_the_camera_around_the_car() {
         let forward = Vec3::new(0.0, 0.0, 1.0);
         let radius = (CAMERA_DISTANCE * CAMERA_DISTANCE + CAMERA_HEIGHT * CAMERA_HEIGHT).sqrt();
-        let (resting, _) = camera_frame(forward, 0.0, 0.0);
+        let (resting, _) = camera_frame(forward, 0.0, resting_pitch());
 
         for look_x in [-1.0, -0.5, 0.5, 1.0] {
-            let (swung, _) = camera_frame(forward, look_x, 0.0);
+            let (swung, _) = camera_frame(forward, look_yaw_offset(look_x, false), resting_pitch());
             assert!(
                 (swung.length() - radius).abs() < 1e-4,
                 "look_x {look_x}: distance {} vs {radius}",
@@ -832,44 +896,68 @@ mod tests {
     }
 
     #[test]
-    fn vertical_look_tilts_the_view_above_and_below_the_car() {
-        // The regression this guards: with the camera always aimed at the car,
-        // pitching the boom could only tilt the view *down* - you could never
-        // look above the car. The aim point has to move for look-up to work.
+    fn look_behind_swings_the_camera_to_the_front_of_the_car() {
         let forward = Vec3::new(0.0, 0.0, 1.0);
-        let view = |look_y: f64| {
-            let (boom, aim) = camera_frame(forward, 0.0, look_y);
-            aim - boom
-        };
+        let (resting, _) = camera_frame(forward, look_yaw_offset(0.0, false), resting_pitch());
         assert!(
-            view(0.0).y < 0.0,
-            "the resting view looks slightly down, got {}",
-            view(0.0).y
+            resting.z < 0.0,
+            "the resting boom sits behind the car: {resting:?}"
         );
 
-        // "Look up" has to mean *up*, not just level: aim for a real angle well
-        // above the horizon. The old boom-only pitch managed 2.8 degrees.
-        let up = view(1.0);
-        let up_angle = up.y.atan2(up.xz().length()).to_degrees();
-        assert!(
-            up_angle > 20.0,
-            "looking up should clear the car, got {up_angle:.1} deg"
-        );
-
-        assert!(
-            view(-1.0).y < view(0.0).y,
-            "looking down must tilt further down"
-        );
+        let (behind, _) = camera_frame(forward, look_yaw_offset(0.0, true), resting_pitch());
+        assert!(behind.z > 0.0, "look-behind must cross the car: {behind:?}");
     }
 
     #[test]
-    fn ijkl_keys_drive_the_look_input() {
+    fn pitch_orbits_the_camera_up_and_over_the_car() {
+        // Push up (look_y is inverted, so negative) raises the camera towards a
+        // top-down view; pull down drops it flatter. Either way the aim stays on
+        // the car, so it can never stare past it into the ground.
+        let forward = Vec3::new(0.0, 0.0, 1.0);
+        let height = |look_y: f32| camera_frame(forward, 0.0, pitch_for_look(look_y)).0.y;
+
+        assert!(
+            height(-1.0) > height(0.0),
+            "pushing up should raise the camera: {} vs {}",
+            height(-1.0),
+            height(0.0)
+        );
+        assert!(
+            height(1.0) < height(0.0),
+            "pulling down should lower the camera: {} vs {}",
+            height(1.0),
+            height(0.0)
+        );
+
+        // The orbit is bounded: a hard push can never take the camera below the
+        // car, which is where "looking into the ground" began.
+        assert!(
+            height(-5.0) > 0.0,
+            "clamped push-up must stay above the car"
+        );
+        assert!((pitch_for_look(-5.0) - CAMERA_PITCH_MAX).abs() < 1e-6);
+        assert!((pitch_for_look(5.0) - CAMERA_PITCH_MIN).abs() < 1e-6);
+
+        // Throughout the range the aim sits just above the car, never down at the
+        // ground.
+        for look_y in [-1.0, -0.5, 0.0, 0.5, 1.0] {
+            let (_, aim) = camera_frame(forward, 0.0, pitch_for_look(look_y));
+            assert!(
+                (aim - Vec3::Y * CAMERA_AIM_HEIGHT).length() < 1e-6,
+                "aim drifted off the car at look_y {look_y}: {aim:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_vertical_axis_is_inverted() {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyL);
         let (x, _) = look_input(&keys, None);
-        assert!(x > 0.5, "L should look right, got {x}");
+        assert!(x > 0.5, "L should swivel right, got {x}");
 
-        // The vertical axis is inverted, so "up" is a negative lift.
+        // Pushing up looks down, so the aim lift comes out negative.
+        let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyI);
         let (_, y) = look_input(&keys, None);
         assert!(y < -0.5, "I should look down (inverted), got {y}");
