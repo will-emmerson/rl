@@ -21,20 +21,23 @@ cargo run --release -p rl_view   # smoother, but the first run rebuilds Bevy
 The dev profile is set up to be playable (this crate at `opt-level = 1`, all
 dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 
-| Key                       | Gamepad    | Action             |
-| ------------------------- | ---------- | ------------------ |
-| `W` `A` `S` `D` or arrows | left stick | drive              |
-| `ctrl`                    | `A`        | jump               |
-| `space`                   | `B`        | boost              |
-| `shift`                   | `X`        | drift (handbrake)  |
-| `R`                       | `start`    | reset car and ball |
-| `esc`                     | -          | quit               |
+| Key                       | Gamepad     | Action             |
+| ------------------------- | ----------- | ------------------ |
+| `W` `A` `S` `D` or arrows | left stick  | drive              |
+| `I` `J` `K` `L`           | right stick | look around        |
+| `ctrl`                    | `A`         | jump               |
+| `space`                   | `B`         | boost              |
+| `shift`                   | `X`         | drift (handbrake)  |
+| `R`                       | `start`     | reset car and ball |
+| `esc`                     | -           | quit               |
 
 Keyboard and pad are merged per axis, so either works and holding both does not
 cancel out. On the pad the triggers are analogue throttle: pull the right trigger
 to accelerate, the left to reverse. Jump (`ctrl` / `A`) is edge-triggered, and
-pressing it again while airborne gives a double jump. (If your pad reports
-nothing, see the gamepad section under "A note on Bevy's features" below.)
+pressing it again while airborne gives a double jump. The right stick (or `IJKL`)
+swivels the camera around the car and springs back to centre when released;
+vertical look is inverted (push up to look down). (If your pad reports nothing,
+see the gamepad section under "A note on Bevy's features" below.)
 
 The camera trails the car and leans its aim toward the ball. This needs a GPU
 and a window; it was developed on Vulkan.

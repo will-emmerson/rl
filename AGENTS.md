@@ -39,7 +39,8 @@ client-side prediction and replays can work. Inside the simulation step:
   `view/`.
 
 The viewer must never feed back into the simulation: it reads `World` and writes
-transforms, nothing more.
+transforms, nothing more. (The `sin`/`cos` ban is about the simulation step — the
+viewer is free to use trigonometry.)
 
 ## Build / run / validate
 
