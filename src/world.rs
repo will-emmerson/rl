@@ -96,6 +96,8 @@ pub struct World {
     pub arena: Arena,
     pub ball: Ball,
     pub car: Car,
+    /// The Soccar boost pads, in a fixed order (see `boost_pad::soccar`).
+    pub boost_pads: Vec<crate::boost_pad::BoostPad>,
     pub tick: u64,
 }
 
@@ -111,6 +113,7 @@ impl World {
             arena: Arena::default(),
             ball: Ball::default(),
             car: Car::default(),
+            boost_pads: crate::boost_pad::soccar(),
             tick: 0,
         }
     }
@@ -121,12 +124,32 @@ impl World {
         self.car.step(DT, input, &self.arena);
         self.ball.step(DT, GRAVITY, &self.arena);
         self.resolve_car_ball();
+        self.update_boost_pads();
         // Rocket League clamps both bodies at the end of the tick, *after*
         // collisions and the extra ball impulse (RocketSim's
         // `_FinishPhysicsTick`), so a collision cannot leave a body overspeed.
         self.car.clamp_limits();
         self.ball.clamp_speeds();
         self.tick += 1;
+    }
+
+    /// Tick every pad's cooldown and hand out boost for any the car is over.
+    fn update_boost_pads(&mut self) {
+        let car_pos = self.car.pos;
+        // Rocket League does not take a pad while the tank is full, so it stays
+        // available for the next pass.
+        let can_take = self.car.boost < crate::car::CAR_BOOST_MAX;
+        let mut gained = 0.0;
+        for pad in &mut self.boost_pads {
+            pad.tick(DT);
+            if can_take && pad.available() && pad.covers(car_pos) {
+                gained += pad.amount;
+                pad.cooldown = pad.cooldown_duration;
+            }
+        }
+        if gained > 0.0 {
+            self.car.boost = (self.car.boost + gained).min(crate::car::CAR_BOOST_MAX);
+        }
     }
 
     pub fn step_n(&mut self, input: &Input, ticks: u32) {
@@ -217,6 +240,9 @@ impl World {
         h.fold_u64(self.tick);
         self.car.hash_into(&mut h);
         self.ball.hash_into(&mut h);
+        for pad in &self.boost_pads {
+            pad.hash_into(&mut h);
+        }
         h.0
     }
 

@@ -8,7 +8,7 @@ rule changes.
 A Rocket League-style prototype. The active code is a hand-rolled,
 dependency-free simulation with a Bevy viewer:
 
-- `src/` — `rl`: the deterministic simulation (arena + ball + car). No game
+- `src/` — `rl`: the deterministic simulation (arena + ball + car + boost pads). No game
   engine, no dependencies.
 - `view/` — `rl_view`: a Bevy 3D viewer that reads `rl` and draws it.
 - `tests/` — physics behaviour and determinism tests.

@@ -182,6 +182,7 @@ does and doesn't mean:
 | Arena    | 6 static planes, sequential resolution, 81.92 x 102.40 x 20.48 m (RocketSim `ARENA_EXTENT_X/Y`, `ARENA_HEIGHT`); a box, not RL's collision mesh                                                                                                                                                                                                                                                                                                |
 | Ball     | Sphere, `r = 0.9125`, `m = 30`. Gravity, Bullet-style linear drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin. Speed and spin are hard-capped at 60 m/s and 6 rad/s                                                                                                                                                                                                                                        |
 | Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.205 x 0.867 x 0.387 (real Octane, per RocketSim), `m = 180`. Steering from RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model (`omega = v * tan(steer) / wheelbase`); analog powerslide; boost meter; jump = immediate impulse + held force, then a double jump _or_ a flip; full 3D air attitude with air control; total speed clamped to 23 m/s, angular speed to 5.5 rad/s |
+| Boost    | 34 pads (6 big, 28 small) at RL's positions; big gives 100 boost / 10 s cooldown, small 12 / 4 s. Taken by driving over a pad near the floor                                                                                                                                                                                                                                                                                                   |
 | Car-ball | Sphere vs OBB closest-point, inelastic impulse (`e = 0`) with relative velocity at contact (car rotation included), plus Rocket League's extra hit impulse, equal-and-opposite reaction                                                                                                                                                                                                                                                        |
 
 Constants are community-sourced Rocket League figures converted to SI, now
@@ -226,6 +227,12 @@ What that changed:
   a flip within `DOUBLEJUMP_MAX_DELAY = 1.25 s`. Air control is RL's pitch/yaw/roll
   torque (`CAR_AIR_CONTROL_TORQUE`) with its damping, and a flip applies the
   dodge impulse (`FLIP_INITIAL_VEL_SCALE`) plus the fixed-time flip torque.
+- **Boost pads.** The 34 Soccar pads sit at RL's `LOCS_BIG_SOCCAR` /
+  `LOCS_SMALL_SOCCAR` positions: the 6 big pads give the full 100 boost with a
+  10 s cooldown (`COOLDOWN_BIG`) and the 28 small give 12 with 4 s. Boost is
+  taken when the car drives over a pad near the floor; the pickup is a simple
+  horizontal radius (`CYL_RAD_BIG` / `CYL_RAD_SMALL`) rather than RL's
+  cylinder/box triggers.
 - **Car-ball.** Restitution dropped to `0.0` and friction raised to `2.0`, and
   the collision is now followed by Rocket League's **extra impulse**
   (`Ball::_OnHit`): a velocity kick along the car->ball direction, scaled by the
@@ -290,8 +297,8 @@ Small surface area, but the choices are deliberate:
 ## Not implemented yet
 
 Wall/ceiling driving (a signature mechanic, and a real change to the car model),
-boost pads, car-car collisions, demolitions, goals and kickoff, multiple cars,
-and the actual network layer.
+car-car collisions, demolitions, goals and kickoff, multiple cars, and the actual
+network layer.
 
 The useful next step for the determinism story is a _parity harness_: record
 input streams plus state hashes from a reference build, then assert them in CI.

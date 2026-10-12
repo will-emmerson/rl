@@ -35,7 +35,10 @@ dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 
 Keyboard and pad are merged per axis, so either works and holding both does not
 cancel out. On the pad the triggers are analogue throttle: pull the right trigger
-to accelerate, the left to reverse. Jump (`ctrl` / `A`) is edge-triggered, and
+to accelerate, the left to reverse. Boost (`space` / `B`) is replenished by the
+boost pads on the pitch — six big pads (full tank, shown as translucent orbs)
+and 28 small ones (flat discs). They cannot be taken at a full tank, and vanish
+while on cooldown. Jump (`ctrl` / `A`) is edge-triggered, and
 pressing it again while airborne gives a double jump — or, with the stick held
 off centre, a **flip**. The drive stick doubles as air control: stick up is a
 frontflip, stick left yaws left, and `Q`/`E` (or `X`/`B`-style drift + stick)

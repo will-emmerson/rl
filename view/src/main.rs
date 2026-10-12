@@ -87,6 +87,8 @@ struct GamepadDebug(bool);
 enum Vis {
     Car,
     Ball,
+    /// A boost pad, indexed into `World::boost_pads`.
+    BoostPad(usize),
 }
 
 #[derive(Component)]
@@ -146,6 +148,7 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    sim: Res<Sim>,
 ) {
     // --- arena ---
     commands.spawn((
@@ -235,6 +238,39 @@ fn setup_scene(
         Transform::default(),
         Vis::Ball,
     ));
+
+    // --- boost pads ---
+    // The six big pads are Rocket League-style translucent orbs; the 28 small
+    // ones are flat discs on the floor. Both are hidden while on cooldown (see
+    // `sync_visuals`).
+    let pad_big_mesh = meshes.add(Sphere::new(0.8).mesh().uv(24, 18));
+    let pad_small_mesh = meshes.add(Cylinder::new(0.55, 0.08));
+    let pad_big_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(1.0, 0.72, 0.15, 0.55),
+        emissive: LinearRgba::rgb(0.35, 0.20, 0.0),
+        alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+    let pad_small_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.85, 0.25),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+    for (i, pad) in sim.0.boost_pads.iter().enumerate() {
+        let (mesh, material, y) = if pad.is_big {
+            (pad_big_mesh.clone(), pad_big_mat.clone(), pad.pos.y as f32)
+        } else {
+            // Disc sits on the floor (half its height above y = 0).
+            (pad_small_mesh.clone(), pad_small_mat.clone(), 0.04)
+        };
+        commands.spawn((
+            Mesh3d(mesh),
+            MeshMaterial3d(material),
+            Transform::from_xyz(pad.pos.x as f32, y, pad.pos.z as f32),
+            Vis::BoostPad(i),
+        ));
+    }
 
     // --- car ---
     // Local axes are (+Z forward, +Y up, +X right), matching the simulation.
@@ -540,8 +576,8 @@ fn reset_on_key(keys: Res<ButtonInput<KeyCode>>, gamepads: Query<&Gamepad>, mut 
 // Presentation
 // ---------------------------------------------------------------------------
 
-fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis)>) {
-    for (mut transform, vis) in &mut query {
+fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis, &mut Visibility)>) {
+    for (mut transform, vis, mut visibility) in &mut query {
         match vis {
             Vis::Car => {
                 let car = &sim.0.car;
@@ -566,6 +602,15 @@ fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis)>) {
                 transform.rotate(Quat::from_scaled_axis(
                     Vec3::new(spin.x as f32, spin.y as f32, spin.z as f32) * (1.0 / 60.0),
                 ));
+            }
+            Vis::BoostPad(index) => {
+                let pad = &sim.0.boost_pads[*index];
+                // Hidden while on cooldown, so a taken pad leaves nothing behind.
+                *visibility = if pad.available() {
+                    Visibility::Inherited
+                } else {
+                    Visibility::Hidden
+                };
             }
         }
     }

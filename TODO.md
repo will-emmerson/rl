@@ -32,6 +32,8 @@
 
 # DONE
 
+- boost pads: the 34 Soccar pads (6 big / 28 small) at RocketSim's positions,
+  with RL's amounts and cooldowns; the car takes one by driving over it.
 - ported flips and air control from RocketSim (`_UpdateAirTorque` /
   `_UpdateDoubleJumpOrFlip`): a full 3D car attitude in the air, pitch/yaw/roll
   air-control torque with damping, and dodges (initial impulse + fixed-time flip

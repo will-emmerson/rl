@@ -19,12 +19,14 @@
 
 pub mod arena;
 pub mod ball;
+pub mod boost_pad;
 pub mod car;
 pub mod math;
 pub mod world;
 
 pub use arena::Arena;
 pub use ball::Ball;
+pub use boost_pad::BoostPad;
 pub use car::Car;
 pub use math::{heading_forward, heading_right, Vec3};
 pub use world::{Input, Snapshot, World, DT, GRAVITY, TICK_HZ};

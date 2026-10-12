@@ -416,6 +416,79 @@ fn flip_needs_directional_input() {
     assert!(!world.car.has_flipped, "...not a flip");
 }
 
+// --- Boost pads ---
+
+#[test]
+fn big_boost_pad_refills_and_then_cools_down() {
+    let mut world = World::new();
+    let pad = *world.boost_pads.iter().find(|p| p.is_big).unwrap();
+    world.car.pos = Vec3::new(pad.pos.x, CAR_HALF_HEIGHT, pad.pos.z);
+    world.car.velocity = Vec3::ZERO;
+    world.car.boost = 0.0;
+
+    world.step(&Input::default());
+    assert!(
+        (world.car.boost - 100.0).abs() < 1e-9,
+        "boost {}",
+        world.car.boost
+    );
+    assert!(
+        !world
+            .boost_pads
+            .iter()
+            .find(|p| p.is_big)
+            .unwrap()
+            .available(),
+        "the pad should be on cooldown"
+    );
+
+    // Sitting on the cooling pad does not refill again.
+    world.car.boost = 0.0;
+    world.step(&Input::default());
+    assert!(
+        world.car.boost < 1.0,
+        "a cooling pad refilled the car: {}",
+        world.car.boost
+    );
+}
+
+#[test]
+fn small_boost_pad_gives_twelve() {
+    let mut world = World::new();
+    let pad = *world.boost_pads.iter().find(|p| !p.is_big).unwrap();
+    world.car.pos = Vec3::new(pad.pos.x, CAR_HALF_HEIGHT, pad.pos.z);
+    world.car.velocity = Vec3::ZERO;
+    world.car.boost = 0.0;
+
+    world.step(&Input::default());
+    assert!(
+        (world.car.boost - 12.0).abs() < 1e-9,
+        "boost {}",
+        world.car.boost
+    );
+}
+
+#[test]
+fn a_full_tank_does_not_consume_a_pad() {
+    let mut world = World::new();
+    let pad = *world.boost_pads.iter().find(|p| p.is_big).unwrap();
+    world.car.pos = Vec3::new(pad.pos.x, CAR_HALF_HEIGHT, pad.pos.z);
+    world.car.velocity = Vec3::ZERO;
+    world.car.boost = 100.0;
+
+    world.step(&Input::default());
+    assert!(
+        world
+            .boost_pads
+            .iter()
+            .find(|p| p.is_big)
+            .unwrap()
+            .available(),
+        "a full tank consumed the pad"
+    );
+    assert!((world.car.boost - 100.0).abs() < 1e-9);
+}
+
 // --- Parity checks against RocketSim's `RLConst.h` ---
 
 #[test]
