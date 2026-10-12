@@ -21,10 +21,15 @@ pub const GRAVITY: f64 = -6.5;
 /// One tick of player intent, already normalised to [-1, 1].
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Input {
-    /// -1 brake/reverse .. +1 accelerate.
+    /// -1 brake/reverse .. +1 accelerate. Also the air *throttle*.
     pub throttle: f64,
     /// -1 right .. +1 left.
     pub steer: f64,
+    /// Air orientation control, following Rocket League's `CarControls`: pitch
+    /// (-1 nose down / frontflip), yaw, roll. Ignored on the ground.
+    pub pitch: f64,
+    pub yaw: f64,
+    pub roll: f64,
     pub boost: bool,
     pub handbrake: bool,
     /// Jump, carried as a *held* level rather than an edge. The car detects the
@@ -34,10 +39,39 @@ pub struct Input {
 }
 
 impl Input {
+    /// Driving/meta constructor. The air-orientation axes default to centred;
+    /// set `pitch`/`yaw`/`roll` on the returned value to fly the car.
     pub fn new(throttle: f64, steer: f64, boost: bool, handbrake: bool, jump: bool) -> Self {
         Self {
             throttle: throttle.clamp(-1.0, 1.0),
             steer: steer.clamp(-1.0, 1.0),
+            pitch: 0.0,
+            yaw: 0.0,
+            roll: 0.0,
+            boost,
+            handbrake,
+            jump,
+        }
+    }
+
+    /// Full constructor including the air-orientation axes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_air(
+        throttle: f64,
+        steer: f64,
+        pitch: f64,
+        yaw: f64,
+        roll: f64,
+        boost: bool,
+        handbrake: bool,
+        jump: bool,
+    ) -> Self {
+        Self {
+            throttle: throttle.clamp(-1.0, 1.0),
+            steer: steer.clamp(-1.0, 1.0),
+            pitch: pitch.clamp(-1.0, 1.0),
+            yaw: yaw.clamp(-1.0, 1.0),
+            roll: roll.clamp(-1.0, 1.0),
             boost,
             handbrake,
             jump,
@@ -90,7 +124,7 @@ impl World {
         // Rocket League clamps both bodies at the end of the tick, *after*
         // collisions and the extra ball impulse (RocketSim's
         // `_FinishPhysicsTick`), so a collision cannot leave a body overspeed.
-        self.car.clamp_speed();
+        self.car.clamp_limits();
         self.ball.clamp_speeds();
         self.tick += 1;
     }
@@ -165,7 +199,7 @@ impl World {
         let delta = ball_pos - car_pos;
         let flattened = Vec3::new(delta.x, delta.y * BALL_CAR_EXTRA_IMPULSE_Z_SCALE, delta.z);
         let mut hit_dir = flattened.normalized();
-        let car_forward = self.car.heading.normalized();
+        let car_forward = self.car.forward;
         hit_dir = (hit_dir
             - car_forward
                 * (hit_dir.dot(car_forward) * (1.0 - BALL_CAR_EXTRA_IMPULSE_FORWARD_SCALE)))
@@ -191,7 +225,7 @@ impl World {
             tick: self.tick,
             car_pos: self.car.pos,
             car_velocity: self.car.velocity,
-            car_heading: self.car.heading,
+            car_heading: self.car.heading(),
             car_boost: self.car.boost,
             ball_pos: self.ball.pos,
             ball_velocity: self.ball.vel,

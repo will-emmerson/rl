@@ -328,7 +328,7 @@ fn render(world: &World, subtitle: &str) -> String {
     );
     set_cell(&mut grid, cx, cy, '@');
 
-    let nose = world.car.pos + world.car.heading * (CAR_HALF_LENGTH + 0.7);
+    let nose = world.car.pos + world.car.heading() * (CAR_HALF_LENGTH + 0.7);
     let (nx, ny) = cell_of(nose.x, nose.z, world.arena.half_x, world.arena.half_z);
     set_cell_if_free(&mut grid, nx, ny, '+');
 

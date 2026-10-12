@@ -51,13 +51,15 @@ community lore. Unreal units are centimetres, so the sim's SI values are the
 RocketSim number / 100. When you add or change one, cite the RocketSim name in
 its doc comment, as `arena.rs` / `ball.rs` / `car.rs` already do.
 
-The car's _handling_ is now partly ported from RocketSim too: steering uses
-RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model
-(`omega = v * tan(steer) / wheelbase`), the analog powerslide, and the jump is
-RL's immediate-impulse-plus-held-force model. What is _not_ reverse-engineered
-is the tyre grip (`CAR_GRIP_KEEP` / `CAR_DRIFT_KEEP`) and the engine/brake
-forces (`CAR_ENGINE_ACCEL`, `CAR_BRAKE_DECEL`); suspension, tyre slip, flips
-and air control are not modelled at all.
+The car's _handling_ is now largely ported from RocketSim: steering uses RL's
+`STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model
+(`omega = v * tan(steer) / wheelbase`), the analog powerslide, the jump
+(`JUMP_IMMEDIATE_FORCE` + held `JUMP_ACCEL`), the mid-air air-control torque
+(`CAR_AIR_CONTROL_TORQUE`), and flips/dodges (`_UpdateDoubleJumpOrFlip`). What is
+_not_ reverse-engineered is the tyre grip (`CAR_GRIP_KEEP` / `CAR_DRIFT_KEEP`) and
+the engine/brake forces (`CAR_ENGINE_ACCEL`, `CAR_BRAKE_DECEL`); suspension, tyre
+slip and auto-roll are not modelled at all (a flipped car is snapped upright on
+landing, so wall driving does not work yet).
 
 ## Build / run / validate
 
@@ -105,3 +107,12 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
   steer-angle curve as `omega = v * tan(steer) / wheelbase`, which is
   proportional to `v`, so a standstill cannot pivot (`math::tan_small` keeps it
   libm-free).
+- **Air control / flips: the world frame is left-handed.** The car's body frame
+  is `(forward, right, up)` with `right = forward x up`, which is left-handed,
+  whereas Rocket League's is right-handed. So RL's torque cross-products cannot
+  be copied verbatim — the `apply_air_control` / `start_flip` axes were derived
+  so the _behaviour_ matches (stick up = frontflip, stick left = yaw left, roll
+  right = roll right). The magnitudes and timings are still RL's constants.
+- **Attitude:** the car carries `forward` and `up` (orthonormal), integrated from
+  `ang_vel` and re-orthonormalised every step. If you touch that, keep it
+  orthonormal and hash every new field, or divergence hides.

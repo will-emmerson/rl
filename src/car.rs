@@ -2,18 +2,15 @@
 //!
 //! Deliberately *not* a rigid body with wheels. Rocket League's cars are not
 //! wheel-driven in the ordinary sense — they are a bespoke driving model with a
-//! speed-dependent steering curve, an analog powerslide, and a box hitbox.
-//! Modelling it directly is both simpler and closer to the real thing than
-//! bolting four springs onto a box and hoping.
+//! speed-dependent steering curve, an analog powerslide, a box hitbox, and a
+//! full 3D attitude once airborne (air control and flips).
 //!
-//! The steering and jump models here are ported from RocketSim
-//! (`RLConst.h` + `Car::_UpdateWheels` / `_UpdateJump` /
+//! The steering, jump, air-control and flip models are ported from RocketSim
+//! (`RLConst.h` + `Car::_UpdateWheels` / `_UpdateJump` / `_UpdateAirTorque` /
 //! `_UpdateDoubleJumpOrFlip`); the engine/brake numbers are still tuned for feel.
 
 use crate::arena::Arena;
-use crate::math::{
-    heading_right, piecewise_linear, rotate_y, tan_small, StateHasher, Vec3,
-};
+use crate::math::{piecewise_linear, rotate_y, tan_small, StateHasher, Vec3};
 use crate::world::{Input, GRAVITY};
 
 // RocketSim's internal Octane hitbox (`CAR_CONFIG_OCTANE`), in uu converted to
@@ -38,9 +35,11 @@ pub const CAR_WHEELBASE: f64 = 0.85;
 /// acceleration. This stays a tuned-for-feel value.
 pub const CAR_ENGINE_ACCEL: f64 = 8.0;
 /// `CAR_MAX_SPEED = 2300 uu/s`. Rocket League clamps the car's *total* speed to
-/// this every tick, so it is a hard ceiling (see `Car::clamp_speed`). The
+/// this every tick, so it is a hard ceiling (see `Car::clamp_limits`). The
 /// supersonic threshold `SUPERSONIC_START_SPEED` is 2200 uu/s.
 pub const CAR_MAX_SPEED: f64 = 23.0;
+/// `CAR_MAX_ANG_SPEED = 5.5 rad/s`: the car can never spin faster than this.
+pub const CAR_MAX_ANG_SPEED: f64 = 5.5;
 /// `BOOST_ACCEL_GROUND = 2975/3 uu/s^2`.
 pub const CAR_BOOST_ACCEL_GROUND: f64 = 9.916_666_666_666_666;
 /// `BOOST_ACCEL_AIR = 3175/3 uu/s^2`. Boost pulls slightly harder in the air.
@@ -84,12 +83,53 @@ pub const CAR_JUMP_MIN_TIME: f64 = 0.025;
 pub const CAR_JUMP_MAX_TIME: f64 = 0.2;
 /// `JUMP_RESET_TIME_PAD = 1/40 s`: a small grace before the jump is re-armed.
 pub const CAR_JUMP_RESET_TIME_PAD: f64 = 0.025;
-/// `DOUBLEJUMP_MAX_DELAY = 1.25 s`: the double jump must happen within this of
-/// the first jump finishing.
+/// `DOUBLEJUMP_MAX_DELAY = 1.25 s`: the double jump or flip must happen within
+/// this of the first jump finishing.
 pub const CAR_DOUBLEJUMP_MAX_DELAY: f64 = 1.25;
 /// `JUMP_PRE_MIN_ACCEL_SCALE = 0.62`: the held force is reduced for the first
 /// `CAR_JUMP_MIN_TIME`.
 const CAR_JUMP_PRE_MIN_ACCEL_SCALE: f64 = 0.62;
+
+// Air orientation control (RocketSim `_UpdateAirTorque` / `RLConst.h`).
+
+/// `CAR_TORQUE_SCALE = 2*pi/(2^16)*1000`; the angular-acceleration scale the
+/// air-control torque values are expressed in.
+const CAR_TORQUE_SCALE: f64 = 0.095_873_799_242_852_57;
+/// `CAR_AIR_CONTROL_TORQUE = (pitch, yaw, roll)`, in Rocket League's units.
+const CAR_AIR_CONTROL_TORQUE: Vec3 = Vec3::new(130.0, 95.0, 400.0);
+/// `CAR_AIR_CONTROL_DAMPING = (pitch, yaw, roll)`.
+const CAR_AIR_CONTROL_DAMPING: Vec3 = Vec3::new(30.0, 20.0, 50.0);
+/// `THROTTLE_AIR_ACCEL = 200/3 uu/s^2`: throttle still nudges the car forward
+/// in the air.
+const CAR_THROTTLE_AIR_ACCEL: f64 = 0.666_666_666_666_666_7;
+
+// Flips / dodges (RocketSim `_UpdateDoubleJumpOrFlip`).
+
+/// `(|pitch| + |yaw| + |roll|)` must reach this to flip rather than double jump.
+const CAR_DODGE_DEADZONE: f64 = 0.5;
+/// `FLIP_INITIAL_VEL_SCALE = 500 uu/s`: the base dodge velocity.
+const CAR_FLIP_INITIAL_VEL: f64 = 5.0;
+/// `FLIP_TORQUE_X` / `FLIP_TORQUE_Y`: the flip torque about the body forward and
+/// right axes. Big enough to saturate `CAR_MAX_ANG_SPEED` almost immediately.
+const CAR_FLIP_TORQUE_X: f64 = 260.0;
+const CAR_FLIP_TORQUE_Y: f64 = 224.0;
+/// `FLIP_TORQUE_TIME = 0.65 s`: how long the flip torque is applied.
+const CAR_FLIP_TORQUE_TIME: f64 = 0.65;
+/// `FLIP_PITCHLOCK_EXTRA_TIME = 0.3 s`: pitch air control stays locked for this
+/// long after the flip torque ends.
+const CAR_FLIP_PITCHLOCK_EXTRA_TIME: f64 = 0.3;
+/// `FLIP_Z_DAMP_START` / `FLIP_Z_DAMP_END` / `FLIP_Z_DAMP_120`: between these
+/// times the flip bleeds off downward speed (`pow(1-0.35, 1)` per 120 Hz tick).
+const CAR_FLIP_Z_DAMP_START: f64 = 0.15;
+const CAR_FLIP_Z_DAMP_END: f64 = 0.21;
+const CAR_FLIP_Z_DAMP_KEEP: f64 = 0.65;
+/// `FLIP_FORWARD/SIDE/BACKWARD_IMPULSE_MAX_SPEED_SCALE` and
+/// `FLIP_BACKWARD_IMPULSE_SCALE_X`: how the dodge velocity scales with the
+/// car's forward speed.
+const CAR_FLIP_FORWARD_IMPULSE_MAX_SPEED_SCALE: f64 = 1.0;
+const CAR_FLIP_SIDE_IMPULSE_MAX_SPEED_SCALE: f64 = 1.9;
+const CAR_FLIP_BACKWARD_IMPULSE_MAX_SPEED_SCALE: f64 = 2.5;
+const CAR_FLIP_BACKWARD_IMPULSE_SCALE_X: f64 = 16.0 / 15.0;
 
 /// `CARBALL_COLLISION_RESTITUTION = 0.0`. A car-to-ball hit is *inelastic*:
 /// the ball leaves at the relative contact speed, not twice it. Rocket League
@@ -118,8 +158,13 @@ pub struct Car {
     pub pos: Vec3,
     /// Velocity. `y` is zero on the ground and carries the jump arc in the air.
     pub velocity: Vec3,
-    /// Unit heading in the XZ plane. +Z at spawn.
-    pub heading: Vec3,
+    /// Body forward axis, world space. Unit and, on the ground, horizontal.
+    pub forward: Vec3,
+    /// Body up axis, world space. Unit. `forward x up` is the body right.
+    pub up: Vec3,
+    /// Angular velocity in world space (rad/s). Ground steering sets its `y`.
+    pub ang_vel: Vec3,
+    /// The ground steering rate (rad/s); also mirrored into `ang_vel.y`.
     pub yaw_rate: f64,
     pub boost: f64,
     /// True while the car is off the ground, including the whole jump arc.
@@ -132,8 +177,17 @@ pub struct Car {
     pub jump_time: f64,
     /// True once the mid-air double jump has been used this airtime.
     pub has_double_jumped: bool,
+    /// True once a flip has been used this airtime.
+    pub has_flipped: bool,
+    /// True while the flip torque is still being applied (< `CAR_FLIP_TORQUE_TIME`).
+    pub is_flipping: bool,
+    /// Body-frame dodge direction `(forward, right, 0)`, unit or zero. `x > 0`
+    /// is a frontflip, `y > 0` a sideflip to the car's right.
+    pub flip_dir: Vec3,
+    /// Seconds since the flip started.
+    pub flip_time: f64,
     /// Seconds of airtime since the jump *finished*, which gates the double
-    /// jump (`CAR_DOUBLEJUMP_MAX_DELAY`).
+    /// jump / flip (`CAR_DOUBLEJUMP_MAX_DELAY`).
     pub air_time_since_jump: f64,
     /// Analog powerslide amount, 0..1.
     pub handbrake_val: f64,
@@ -152,7 +206,9 @@ impl Default for Car {
         Self {
             pos: Vec3::new(0.0, CAR_HALF_HEIGHT, -14.0),
             velocity: Vec3::ZERO,
-            heading: Vec3::new(0.0, 0.0, 1.0),
+            forward: Vec3::new(0.0, 0.0, 1.0),
+            up: Vec3::UP,
+            ang_vel: Vec3::ZERO,
             yaw_rate: 0.0,
             boost: CAR_BOOST_MAX,
             airborne: false,
@@ -160,6 +216,10 @@ impl Default for Car {
             is_jumping: false,
             jump_time: 0.0,
             has_double_jumped: false,
+            has_flipped: false,
+            is_flipping: false,
+            flip_dir: Vec3::ZERO,
+            flip_time: 0.0,
             air_time_since_jump: 0.0,
             handbrake_val: 0.0,
             jump_held: false,
@@ -169,33 +229,39 @@ impl Default for Car {
 }
 
 impl Car {
-    /// Local axes of the hitbox: forward, up, right.
+    /// Local axes of the hitbox: forward, up, right. Full 3D, so a flipping car
+    /// presents its hitbox at an angle.
     pub fn axes(&self) -> [Vec3; 3] {
-        let f = self.heading.normalized();
-        [f, Vec3::UP, heading_right(f)]
+        [self.forward, self.up, self.right()]
     }
 
     pub fn half_extents(&self) -> Vec3 {
         Vec3::new(CAR_HALF_LENGTH, CAR_HALF_HEIGHT, CAR_HALF_WIDTH)
     }
 
+    /// Body right axis (`forward x up`).
     pub fn right(&self) -> Vec3 {
-        heading_right(self.heading)
+        self.forward.cross(self.up)
+    }
+
+    /// Horizontal facing direction, for the ground-plane maths and the viewers.
+    pub fn heading(&self) -> Vec3 {
+        self.forward.xz().normalized()
     }
 
     /// Angular velocity vector, used so the car can flick the ball while
-    /// rotating.
+    /// rotating (in the air, this includes pitch and roll).
     pub fn angular_velocity(&self) -> Vec3 {
-        Vec3::new(0.0, self.yaw_rate, 0.0)
+        self.ang_vel
     }
 
     pub fn speed(&self) -> f64 {
         self.velocity.length()
     }
 
-    /// Signed speed along the heading.
+    /// Signed speed along the body forward axis.
     pub fn forward_speed(&self) -> f64 {
-        self.velocity.dot(self.heading)
+        self.velocity.dot(self.forward)
     }
 
     pub fn step(&mut self, dt: f64, input: &Input, arena: &Arena) {
@@ -228,9 +294,10 @@ impl Car {
         self.collide_walls(arena);
     }
 
-    /// The driving model. Runs only while the car is on the ground.
+    /// The driving model. Runs only while the car is on the ground, where the
+    /// attitude is held upright and yaw-only.
     fn step_grounded(&mut self, dt: f64, input: &Input) {
-        let f = self.heading;
+        let f = self.forward;
         let r = self.right();
         let mut v_forward = self.velocity.dot(f);
         let mut v_lateral = self.velocity.dot(r);
@@ -250,8 +317,10 @@ impl Car {
         }
         steer_angle *= input.steer;
         self.yaw_rate = v_forward * tan_small(steer_angle) / CAR_WHEELBASE;
-        self.heading = rotate_y(f, self.yaw_rate * dt);
-        let f = self.heading;
+        self.forward = rotate_y(f, self.yaw_rate * dt);
+        self.up = Vec3::UP;
+        self.ang_vel = Vec3::new(0.0, self.yaw_rate, 0.0);
+        let f = self.forward;
         let r = self.right();
 
         // --- longitudinal ---
@@ -291,27 +360,111 @@ impl Car {
         self.velocity = f * v_forward + r * v_lateral;
     }
 
-    /// Airborne: gravity, plus whatever momentum the car left the ground with.
+    /// Airborne: gravity, air control / flips, boost, and whatever momentum the
+    /// car left the ground with.
     fn step_airborne(&mut self, dt: f64, input: &Input) {
         // The same gravity the ball feels.
         self.velocity.y += GRAVITY * dt;
 
-        // No traction in the air. The engine and tyres do nothing and there is
-        // no air control yet, so the car keeps its momentum. Boost still works,
-        // as it does in RL, capped at the top speed.
+        // Air-orientation control and any in-progress flip both drive the
+        // angular velocity (RocketSim `_UpdateAirTorque`).
+        self.apply_air_control(dt, input);
+
+        // No wheel traction in the air, so the ground yaw rate is zero; boost
+        // and the air throttle still push along the (possibly tilted) forward.
         self.yaw_rate = 0.0;
         if input.boost && self.boost > 0.0 {
-            self.velocity += self.heading * (CAR_BOOST_ACCEL_AIR * dt);
+            self.velocity += self.forward * (CAR_BOOST_ACCEL_AIR * dt);
             self.boost = (self.boost - CAR_BOOST_DRAIN * dt).max(0.0);
-            self.clamp_horizontal_speed(CAR_MAX_BOOST_SPEED);
         }
+        if input.throttle != 0.0 {
+            self.velocity += self.forward * (input.throttle * CAR_THROTTLE_AIR_ACCEL * dt);
+        }
+
+        // Advance the attitude from the angular velocity. Done here (not in
+        // `step`) so the grounded tick that *starts* a jump does not rotate the
+        // heading twice.
+        self.integrate_orientation(dt);
     }
 
-    /// Rocket League's jump model (RocketSim `_UpdateJump` +
-    /// `_UpdateDoubleJumpOrFlip`), minus flips and air control: an immediate
-    /// upward impulse on press, a held force for up to `CAR_JUMP_MAX_TIME`, and
-    /// a single mid-air double jump within `CAR_DOUBLEJUMP_MAX_DELAY` of the
-    /// first jump finishing. A tap is a low hop; a hold is much higher.
+    /// Rocket League's air control and in-flight flip torque
+    /// (RocketSim `_UpdateAirTorque`).
+    ///
+    /// Input signs: `pitch` is +1 nose-up / -1 nose-down, `yaw` +1 turns (and
+    /// sideflips) to the car's right, `roll` +1 rolls right. These are chosen so
+    /// the behaviour matches Rocket League; the sim's world is left-handed, so
+    /// the torque *axes* differ from RocketSim's cross products even though the
+    /// magnitudes (`CAR_AIR_CONTROL_TORQUE`) and timing are RL's.
+    fn apply_air_control(&mut self, dt: f64, input: &Input) {
+        // The flip torque only runs for `CAR_FLIP_TORQUE_TIME`.
+        if self.is_flipping {
+            self.is_flipping = self.has_flipped && self.flip_time < CAR_FLIP_TORQUE_TIME;
+        }
+
+        let mut do_air_control = false;
+
+        if self.is_flipping {
+            let dodge = self.flip_dir;
+            if dodge.length_squared() > 0.0 {
+                let mut pitch_scale = 1.0;
+                if dodge.x != 0.0 && input.pitch != 0.0 && same_sign(dodge.x, input.pitch) {
+                    // Flip cancel: pitching against the flip eases its pitch
+                    // and lets air control back in.
+                    pitch_scale = 1.0 - input.pitch.abs().min(1.0);
+                    do_air_control = true;
+                }
+                // A forward dodge flips the nose down; a rightward dodge rolls
+                // the car to its right.
+                let pitch_axis = -self.right();
+                let roll_axis = self.forward;
+                self.ang_vel += pitch_axis * (dodge.x * CAR_FLIP_TORQUE_Y * pitch_scale) * dt
+                    + roll_axis * (dodge.y * CAR_FLIP_TORQUE_X) * dt;
+            } else {
+                do_air_control = true; // the flip has stalled
+            }
+        } else {
+            do_air_control = true;
+        }
+
+        if !do_air_control {
+            return;
+        }
+
+        let dir_pitch = self.right();
+        let dir_yaw = -self.up;
+        let dir_roll = self.forward;
+
+        // Pitch air control is locked during a flip and briefly afterwards.
+        let pitch_scale = if self.is_flipping
+            || (self.has_flipped
+                && self.flip_time < CAR_FLIP_TORQUE_TIME + CAR_FLIP_PITCHLOCK_EXTRA_TIME)
+        {
+            0.0
+        } else {
+            1.0
+        };
+
+        let torque = dir_pitch * (input.pitch * pitch_scale * CAR_AIR_CONTROL_TORQUE.x)
+            + dir_yaw * (input.yaw * CAR_AIR_CONTROL_TORQUE.y)
+            + dir_roll * (input.roll * CAR_AIR_CONTROL_TORQUE.z);
+
+        // Damping always opposes existing rotation on each axis, so it is
+        // independent of the axis orientation above.
+        let damp_pitch = dir_pitch.dot(self.ang_vel)
+            * CAR_AIR_CONTROL_DAMPING.x
+            * (1.0 - (input.pitch * pitch_scale).abs());
+        let damp_yaw =
+            dir_yaw.dot(self.ang_vel) * CAR_AIR_CONTROL_DAMPING.y * (1.0 - input.yaw.abs());
+        let damp_roll = dir_roll.dot(self.ang_vel) * CAR_AIR_CONTROL_DAMPING.z;
+        let damping = dir_yaw * damp_yaw + dir_pitch * damp_pitch + dir_roll * damp_roll;
+
+        self.ang_vel += (torque - damping) * (CAR_TORQUE_SCALE * dt);
+    }
+
+    /// Rocket League's jump, double jump and flip (RocketSim `_UpdateJump` +
+    /// `_UpdateDoubleJumpOrFlip`): an immediate upward impulse on press, a held
+    /// force for up to `CAR_JUMP_MAX_TIME`, and then either a double jump or a
+    /// flip within `CAR_DOUBLEJUMP_MAX_DELAY` of the first jump finishing.
     fn update_jump(&mut self, dt: f64, input: &Input, jump_pressed: bool) {
         let on_ground = !self.airborne;
 
@@ -348,10 +501,13 @@ impl Car {
             self.velocity.y += CAR_JUMP_ACCEL * scale * dt;
         }
 
-        // The double jump (no flips yet: the sim has no pitch/roll input).
+        // The double jump / flip.
         if on_ground {
             self.has_double_jumped = false;
             self.air_time_since_jump = 0.0;
+            self.has_flipped = false;
+            self.is_flipping = false;
+            self.flip_time = 0.0;
         } else {
             if self.has_jumped && !self.is_jumping {
                 self.air_time_since_jump += dt;
@@ -360,16 +516,113 @@ impl Car {
             }
             if jump_pressed
                 && !self.has_double_jumped
+                && !self.has_flipped
                 && self.air_time_since_jump < CAR_DOUBLEJUMP_MAX_DELAY
             {
-                self.velocity.y += CAR_JUMP_IMMEDIATE_SPEED;
-                self.has_double_jumped = true;
+                let magnitude = input.pitch.abs() + input.yaw.abs() + input.roll.abs();
+                if magnitude >= CAR_DODGE_DEADZONE {
+                    self.start_flip(input);
+                } else {
+                    self.velocity.y += CAR_JUMP_IMMEDIATE_SPEED;
+                    self.has_double_jumped = true;
+                }
             }
         }
 
         if self.is_jumping || self.has_jumped {
             self.jump_time += dt;
         }
+
+        // Flip timing, plus the downward-speed damping that makes a flip read
+        // as a dodge rather than a launch.
+        if self.is_flipping {
+            self.flip_time += dt;
+            if self.flip_time <= CAR_FLIP_TORQUE_TIME
+                && self.flip_time >= CAR_FLIP_Z_DAMP_START
+                && (self.velocity.y < 0.0 || self.flip_time < CAR_FLIP_Z_DAMP_END)
+            {
+                self.velocity.y *= CAR_FLIP_Z_DAMP_KEEP;
+            }
+        } else if self.has_flipped {
+            self.flip_time += dt;
+        }
+    }
+
+    /// Begin a flip/dodge (RocketSim `_UpdateDoubleJumpOrFlip`): an impulse in
+    /// the dodge direction, plus the body-frame torque stored for
+    /// `apply_air_control` to apply over the next few ticks.
+    fn start_flip(&mut self, input: &Input) {
+        // `(forward, right)` components of the stick, per RocketSim.
+        let mut dodge = Vec3::new(-input.pitch, input.yaw + input.roll, 0.0);
+        if dodge.x.abs() < 0.1 && dodge.y.abs() < 0.1 {
+            dodge = Vec3::ZERO;
+        } else {
+            dodge = dodge.normalized();
+        }
+
+        self.flip_dir = dodge;
+        self.flip_time = 0.0;
+        self.has_flipped = true;
+        self.is_flipping = true;
+
+        // Tiny components are dropped before the direction becomes velocity.
+        let dir_x = if dodge.x.abs() < 0.1 { 0.0 } else { dodge.x };
+        let dir_y = if dodge.y.abs() < 0.1 { 0.0 } else { dodge.y };
+        if dir_x == 0.0 && dir_y == 0.0 {
+            return; // pure roll: the car spins but does not dodge
+        }
+
+        let forward_speed = self.forward_speed();
+        let abs_forward = forward_speed.abs();
+        let forward_ratio = abs_forward / CAR_MAX_SPEED;
+
+        let should_dodge_backwards = if abs_forward < 1.0 {
+            dir_x < 0.0
+        } else {
+            (dir_x >= 0.0) != (forward_speed >= 0.0)
+        };
+
+        let max_speed_scale_x = if should_dodge_backwards {
+            CAR_FLIP_BACKWARD_IMPULSE_MAX_SPEED_SCALE
+        } else {
+            CAR_FLIP_FORWARD_IMPULSE_MAX_SPEED_SCALE
+        };
+        let mut dodge_vel = Vec3::new(
+            dir_x * CAR_FLIP_INITIAL_VEL,
+            dir_y * CAR_FLIP_INITIAL_VEL,
+            0.0,
+        );
+        dodge_vel.x *= ((max_speed_scale_x - 1.0) * forward_ratio) + 1.0;
+        dodge_vel.y *= ((CAR_FLIP_SIDE_IMPULSE_MAX_SPEED_SCALE - 1.0) * forward_ratio) + 1.0;
+        if should_dodge_backwards {
+            dodge_vel.x *= CAR_FLIP_BACKWARD_IMPULSE_SCALE_X;
+        }
+
+        let forward_2d = self.forward.xz().normalized();
+        let right_2d = self.right().xz().normalized();
+        self.velocity += forward_2d * dodge_vel.x + right_2d * dodge_vel.y;
+    }
+
+    /// Integrate the body attitude from the angular velocity and re-orthonormalise.
+    fn integrate_orientation(&mut self, dt: f64) {
+        let w = self.ang_vel;
+        let f = (self.forward + w.cross(self.forward) * dt).normalized();
+        let u_raw = self.up + w.cross(self.up) * dt;
+        let ortho = u_raw - f * u_raw.dot(f);
+        let up = if ortho.length_squared() > 1e-12 {
+            ortho.normalized()
+        } else {
+            // Degenerate: `up` became parallel to `forward`. Rebuild it from a
+            // reference axis so the frame stays valid.
+            let fallback = (Vec3::UP - f * f.y).normalized();
+            if fallback.length_squared() > 1e-12 {
+                fallback
+            } else {
+                (Vec3::new(1.0, 0.0, 0.0) - f * f.x).normalized()
+            }
+        };
+        self.forward = f;
+        self.up = up;
     }
 
     /// Land on the floor, or stop at the ceiling. The box rests on the ground,
@@ -379,6 +632,16 @@ impl Car {
             self.pos.y = CAR_HALF_HEIGHT;
             self.velocity.y = self.velocity.y.max(0.0);
             self.airborne = false;
+            // Our model has no suspension or auto-roll, so a car that lands
+            // tilted is snapped back to an upright, yaw-only attitude.
+            let horizontal = self.forward.xz();
+            self.forward = if horizontal.length_squared() > 1e-12 {
+                horizontal.normalized()
+            } else {
+                Vec3::new(0.0, 0.0, 1.0)
+            };
+            self.up = Vec3::UP;
+            self.ang_vel = Vec3::ZERO;
         }
 
         let ceiling = arena.height - CAR_HALF_HEIGHT;
@@ -388,30 +651,24 @@ impl Car {
         }
     }
 
-    fn clamp_horizontal_speed(&mut self, max: f64) {
-        let horizontal = self.velocity.xz();
-        let speed = horizontal.length();
-        if speed > max {
-            let scale = max / speed;
-            self.velocity.x = horizontal.x * scale;
-            self.velocity.z = horizontal.z * scale;
-        }
-    }
-
-    /// Rocket League clamps the car's *total* speed to `CAR_MAX_SPEED` every
-    /// tick (RocketSim's `Car::_FinishPhysicsTick`), so a car cannot be pushed
-    /// past its own top speed by a collision with the ball. Applied once per
-    /// tick, after collisions, by `World::step`.
-    pub fn clamp_speed(&mut self) {
+    /// Rocket League clamps both the car's *total* speed and its angular speed
+    /// every tick (RocketSim's `Car::_FinishPhysicsTick`), so neither boost nor
+    /// a collision can leave it overspeed. Applied once per tick, after
+    /// collisions, by `World::step`.
+    pub fn clamp_limits(&mut self) {
         let speed = self.velocity.length();
         if speed > CAR_MAX_SPEED {
             self.velocity = self.velocity * (CAR_MAX_SPEED / speed);
+        }
+        let spin = self.ang_vel.length();
+        if spin > CAR_MAX_ANG_SPEED {
+            self.ang_vel = self.ang_vel * (CAR_MAX_ANG_SPEED / spin);
         }
     }
 
     fn collide_walls(&mut self, arena: &Arena) {
         // Footprint of the oriented box projected onto the world axes.
-        let f = self.heading;
+        let f = self.forward;
         let r = self.right();
         let half_x = f.x.abs() * CAR_HALF_LENGTH + r.x.abs() * CAR_HALF_WIDTH;
         let half_z = f.z.abs() * CAR_HALF_LENGTH + r.z.abs() * CAR_HALF_WIDTH;
@@ -446,7 +703,9 @@ impl Car {
     pub fn hash_into(&self, h: &mut StateHasher) {
         self.pos.hash_into(h);
         self.velocity.hash_into(h);
-        self.heading.hash_into(h);
+        self.forward.hash_into(h);
+        self.up.hash_into(h);
+        self.ang_vel.hash_into(h);
         h.fold(self.yaw_rate);
         h.fold(self.boost);
         h.fold_u64(self.airborne as u64);
@@ -454,11 +713,20 @@ impl Car {
         h.fold_u64(self.is_jumping as u64);
         h.fold(self.jump_time);
         h.fold_u64(self.has_double_jumped as u64);
+        h.fold_u64(self.has_flipped as u64);
+        h.fold_u64(self.is_flipping as u64);
+        self.flip_dir.hash_into(h);
+        h.fold(self.flip_time);
         h.fold(self.air_time_since_jump);
         h.fold(self.handbrake_val);
         h.fold_u64(self.jump_held as u64);
         h.fold_u64(self.extra_impulse_cooldown as u64);
     }
+}
+
+/// True if `a` and `b` share a sign (used by the flip-cancel check).
+fn same_sign(a: f64, b: f64) -> bool {
+    (a >= 0.0) == (b >= 0.0)
 }
 
 /// Rocket League's `STEER_ANGLE_FROM_SPEED_CURVE`: the maximum front-wheel
@@ -499,13 +767,38 @@ mod tests {
     #[test]
     fn turn_radius_follows_the_bicycle_model() {
         // radius = 0.85 / tan(delta(v)), with delta from the RL curve.
-        let radius = |v: f64| Car {
-            velocity: Vec3::new(0.0, 0.0, 1.0) * v,
-            ..Default::default()
-        }
-        .turn_radius();
+        let radius = |v: f64| {
+            Car {
+                velocity: Vec3::new(0.0, 0.0, 1.0) * v,
+                ..Default::default()
+            }
+            .turn_radius()
+        };
         assert!((radius(5.0) - 2.57).abs() < 0.05, "r(5) = {}", radius(5.0));
-        assert!((radius(10.0) - 4.62).abs() < 0.05, "r(10) = {}", radius(10.0));
-        assert!((radius(22.0) - 12.69).abs() < 0.1, "r(22) = {}", radius(22.0));
+        assert!(
+            (radius(10.0) - 4.62).abs() < 0.05,
+            "r(10) = {}",
+            radius(10.0)
+        );
+        assert!(
+            (radius(22.0) - 12.69).abs() < 0.1,
+            "r(22) = {}",
+            radius(22.0)
+        );
+    }
+
+    #[test]
+    fn orientation_stays_orthonormal_under_spin() {
+        let mut car = Car {
+            airborne: true,
+            ang_vel: Vec3::new(3.0, 4.0, 5.0),
+            ..Default::default()
+        };
+        for _ in 0..600 {
+            car.integrate_orientation(1.0 / 120.0);
+        }
+        assert!((car.forward.length() - 1.0).abs() < 1e-9);
+        assert!((car.up.length() - 1.0).abs() < 1e-9);
+        assert!(car.forward.dot(car.up).abs() < 1e-9);
     }
 }

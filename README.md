@@ -29,16 +29,20 @@ dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 | `ctrl`                    | `A`               | jump               |
 | `space`                   | `B`               | boost              |
 | `shift`                   | `X`               | drift (handbrake)  |
+| `Q` / `E`                 | hold `X` + stick  | air roll           |
 | `R`                       | `start`           | reset car and ball |
 | `esc`                     | -                 | quit               |
 
 Keyboard and pad are merged per axis, so either works and holding both does not
 cancel out. On the pad the triggers are analogue throttle: pull the right trigger
 to accelerate, the left to reverse. Jump (`ctrl` / `A`) is edge-triggered, and
-pressing it again while airborne gives a double jump. The right stick (or `IJKL`)
-swivels the camera and pitches it, and clicking the right stick in (`R3`) looks
-behind you; everything springs back when released. (If your pad reports nothing,
-see the gamepad section under "A note on Bevy's features" below.)
+pressing it again while airborne gives a double jump — or, with the stick held
+off centre, a **flip**. The drive stick doubles as air control: stick up is a
+frontflip, stick left yaws left, and `Q`/`E` (or `X`/`B`-style drift + stick)
+rolls. The right stick (or `IJKL`) swivels the camera and pitches it, and
+clicking the right stick in (`R3`) looks behind you; everything springs back when
+released. (If your pad reports nothing, see the gamepad section under "A note on
+Bevy's features" below.)
 
 The camera trails the car and leans its aim toward the ball. This needs a GPU
 and a window; it was developed on Vulkan.

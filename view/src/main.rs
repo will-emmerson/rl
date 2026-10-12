@@ -384,29 +384,55 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
         &[KeyCode::KeyA, KeyCode::ArrowLeft],
         &[KeyCode::KeyD, KeyCode::ArrowRight],
     );
+    // Air roll, on dedicated keys: E rolls right, Q rolls left.
+    let keyboard_roll = axis(keys, &[KeyCode::KeyE], &[KeyCode::KeyQ]);
     let keyboard_jump = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
 
     // Triggers are analogue, so they give proportional throttle rather than the
     // keyboard's full-on. Button layout matches Rocket League: A jumps, B boosts
-    // and X is the handbrake.
-    let (pad_throttle, pad_steer, pad_boost, pad_drift, pad_jump) = match gamepad {
+    // and X is the handbrake. The pad's *stick* axes carry steer and air pitch
+    // (throttle is the triggers), which is how RL binds it.
+    let (pad_throttle, pad_steer, pad_pitch, pad_boost, pad_drift, pad_jump) = match gamepad {
         Some(pad) => (
             trigger(pad, GamepadAxis::RightZ, GamepadButton::RightTrigger2)
                 - trigger(pad, GamepadAxis::LeftZ, GamepadButton::LeftTrigger2),
             // Sticks are positive to the right; `steer` is positive to the left.
             -pad.get(GamepadAxis::LeftStickX).unwrap_or(0.0) as f64,
+            // Sticks are positive up here (see `look_input`); pitch +1 is nose
+            // up, so the sign flips.
+            -pad.get(GamepadAxis::LeftStickY).unwrap_or(0.0) as f64,
             pad.get(GamepadButton::East).unwrap_or(0.0) > 0.5,
             pad.get(GamepadButton::West).unwrap_or(0.0) > 0.5,
             pad.get(GamepadButton::South).unwrap_or(0.0) > 0.5,
         ),
-        None => (0.0, 0.0, false, false, false),
+        None => (0.0, 0.0, 0.0, false, false, false),
     };
 
-    SimInput::new(
-        strongest(keyboard_throttle, pad_throttle),
-        strongest(keyboard_steer, pad_steer),
+    let throttle = strongest(keyboard_throttle, pad_throttle);
+    let steer = strongest(keyboard_steer, pad_steer);
+    let drift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) || pad_drift;
+
+    // Air orientation. RL flies with the same stick it drives with: stick up is a
+    // frontflip (`pitch -1`) and stick left yaws left (`yaw = -steer`). On the
+    // keyboard the W/S keys double as pitch; the pad uses the left stick's
+    // vertical axis, which is why pitch is *not* taken from the throttle.
+    let keyboard_pitch = -keyboard_throttle;
+    let pitch = strongest(keyboard_pitch, pad_pitch);
+    let yaw = -steer;
+
+    // On the pad, air roll is the handbrake/drift button plus the stick, as in
+    // Rocket League; the keyboard uses Q/E.
+    let pad_roll = if pad_drift { -pad_steer } else { 0.0 };
+    let roll = strongest(keyboard_roll, pad_roll);
+
+    SimInput::with_air(
+        throttle,
+        steer,
+        pitch,
+        yaw,
+        roll,
         keys.pressed(KeyCode::Space) || pad_boost,
-        keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) || pad_drift,
+        drift,
         keyboard_jump || pad_jump,
     )
 }
@@ -519,11 +545,17 @@ fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis)>) {
         match vis {
             Vis::Car => {
                 let car = &sim.0.car;
-                let heading = car.heading;
+                let f = Vec3::new(
+                    car.forward.x as f32,
+                    car.forward.y as f32,
+                    car.forward.z as f32,
+                );
+                let u = Vec3::new(car.up.x as f32, car.up.y as f32, car.up.z as f32);
                 transform.translation =
                     Vec3::new(car.pos.x as f32, car.pos.y as f32, car.pos.z as f32);
-                transform.rotation =
-                    Quat::from_rotation_y((heading.x as f32).atan2(heading.z as f32));
+                // Full 3D attitude, so flips and air control are visible. The
+                // basis columns are (right, up, forward).
+                transform.rotation = Quat::from_mat3(&Mat3::from_cols(u.cross(f), u, f));
             }
             Vis::Ball => {
                 let ball = &sim.0.ball;
@@ -654,7 +686,7 @@ fn chase_camera(
     mut behind_last: Local<bool>,
 ) {
     let car = sim.0.car.pos;
-    let heading = sim.0.car.heading;
+    let heading = sim.0.car.heading();
     let ball = sim.0.ball.pos;
 
     let forward = Vec3::new(heading.x as f32, 0.0, heading.z as f32).normalize_or_zero();
@@ -961,5 +993,28 @@ mod tests {
         keys.press(KeyCode::KeyI);
         let (_, y) = look_input(&keys, None);
         assert!(y < -0.5, "I should look down (inverted), got {y}");
+    }
+
+    #[test]
+    fn the_drive_stick_doubles_as_air_control() {
+        // Stick up (W) is throttle on the ground and a frontflip (pitch -1) in
+        // the air; stick left (A) is steer left and yaw left. Roll is Q/E.
+        let press = |code| {
+            let mut keys = ButtonInput::<KeyCode>::default();
+            keys.press(code);
+            read_input(&keys, None)
+        };
+
+        let up = press(KeyCode::KeyW);
+        assert!(up.throttle > 0.5 && up.pitch < -0.5, "W: {up:?}");
+
+        let down = press(KeyCode::KeyS);
+        assert!(down.throttle < -0.5 && down.pitch > 0.5, "S: {down:?}");
+
+        let left = press(KeyCode::KeyA);
+        assert!(left.steer > 0.5 && left.yaw < -0.5, "A: {left:?}");
+
+        let roll_right = press(KeyCode::KeyE);
+        assert!(roll_right.roll > 0.5, "E: {roll_right:?}");
     }
 }

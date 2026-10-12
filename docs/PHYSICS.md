@@ -177,12 +177,12 @@ does and doesn't mean:
 
 ## Model summary
 
-| Piece    | Model                                                                                                                                                                                                                                                                                                                                                                                                         |
-| -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Arena    | 6 static planes, sequential resolution, 81.92 x 102.40 x 20.48 m (RocketSim `ARENA_EXTENT_X/Y`, `ARENA_HEIGHT`); a box, not RL's collision mesh                                                                                                                                                                                                                                                               |
-| Ball     | Sphere, `r = 0.9125`, `m = 30`. Gravity, Bullet-style linear drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin. Speed and spin are hard-capped at 60 m/s and 6 rad/s                                                                                                                                                                                                       |
-| Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.205 x 0.867 x 0.387 (real Octane, per RocketSim), `m = 180`. Steering from RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model (`omega = v * tan(steer) / wheelbase`), so the turn radius grows with speed; analog powerslide; boost meter; jump is an immediate impulse plus a held force, with a double jump; total speed clamped to 23 m/s |
-| Car-ball | Sphere vs OBB closest-point, inelastic impulse (`e = 0`) with relative velocity at contact (car rotation included), plus Rocket League's extra hit impulse, equal-and-opposite reaction                                                                                                                                                                                                                       |
+| Piece    | Model                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Arena    | 6 static planes, sequential resolution, 81.92 x 102.40 x 20.48 m (RocketSim `ARENA_EXTENT_X/Y`, `ARENA_HEIGHT`); a box, not RL's collision mesh                                                                                                                                                                                                                                                                                                |
+| Ball     | Sphere, `r = 0.9125`, `m = 30`. Gravity, Bullet-style linear drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin. Speed and spin are hard-capped at 60 m/s and 6 rad/s                                                                                                                                                                                                                                        |
+| Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.205 x 0.867 x 0.387 (real Octane, per RocketSim), `m = 180`. Steering from RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model (`omega = v * tan(steer) / wheelbase`); analog powerslide; boost meter; jump = immediate impulse + held force, then a double jump _or_ a flip; full 3D air attitude with air control; total speed clamped to 23 m/s, angular speed to 5.5 rad/s |
+| Car-ball | Sphere vs OBB closest-point, inelastic impulse (`e = 0`) with relative velocity at contact (car rotation included), plus Rocket League's extra hit impulse, equal-and-opposite reaction                                                                                                                                                                                                                                                        |
 
 Constants are community-sourced Rocket League figures converted to SI, now
 sourced from RocketSim rather than memory. They are still _approximations_ of a
@@ -219,11 +219,13 @@ What that changed:
   turn radius grows from ~1.4 m at a crawl to ~13 m at top speed. Powerslide is
   the analog 0..1 value RL uses, ramping in and out, and it widens the usable
   steer angle via `POWERSLIDE_STEER_ANGLE_FROM_SPEED_CURVE`.
-- **Jump.** Ported from `_UpdateJump`: an immediate impulse
+- **Jump, flips and air control.** Ported from `_UpdateJump`,
+  `_UpdateAirTorque` and `_UpdateDoubleJumpOrFlip`: an immediate jump impulse
   (`JUMP_IMMEDIATE_FORCE = 875/3 uu/s`) plus a held force (`JUMP_ACCEL`) for a
-  0.025-0.2 s window, so a tap and a hold are different heights (~0.8 m vs
-  ~2.5 m above rest). The double jump is available within
-  `DOUBLEJUMP_MAX_DELAY = 1.25 s` of the first jump finishing.
+  0.025-0.2 s window (a tap peaks ~0.8 m, a hold ~2.5 m); then a double jump _or_
+  a flip within `DOUBLEJUMP_MAX_DELAY = 1.25 s`. Air control is RL's pitch/yaw/roll
+  torque (`CAR_AIR_CONTROL_TORQUE`) with its damping, and a flip applies the
+  dodge impulse (`FLIP_INITIAL_VEL_SCALE`) plus the fixed-time flip torque.
 - **Car-ball.** Restitution dropped to `0.0` and friction raised to `2.0`, and
   the collision is now followed by Rocket League's **extra impulse**
   (`Ball::_OnHit`): a velocity kick along the car->ball direction, scaled by the
@@ -245,10 +247,19 @@ What is still approximate, deliberately:
   RL's real steer curve and wheelbase, but a two-wheel approximation of a
   four-wheel vehicle that ignores slip, so the radii are a good first cut rather
   than exactly RL's. Tyre grip and the engine/brake forces are still tuned.
-- **No flips, air control, or suspension.** The jump is RL's immediate-impulse
-  - held-force model, but the mid-air pitch/yaw/roll torque
-    (`CAR_AIR_CONTROL_TORQUE`), dodges/flips, and wall/ceiling driving are not
-    ported.
+- **The car is bespoke, and the vehicle is a bicycle model.** RL drives a
+  `btRaycastVehicle` with four wheels, suspension and tyre slip. Steering uses
+  RL's real steer curve and wheelbase, but a two-wheel approximation of a
+  four-wheel vehicle that ignores slip, so the radii are a good first cut rather
+  than exactly RL's. Tyre grip and the engine/brake forces are still tuned.
+- **Attitude is free in the air, snapped upright on landing.** Our car has no
+  suspension or auto-roll, so whatever way up a flipped car lands, it is set back
+  to a yaw-only attitude. Wall/ceiling driving therefore does not work yet.
+- **The world frame is left-handed.** The body frame here is `(forward, right,
+up)` with right = `forward x up`, which is left-handed, whereas RL's is
+  right-handed. The air-control and flip torque _axes_ were therefore derived to
+  match RL's behaviour rather than transliterated from its cross products; the
+  magnitudes and timings are RL's.
 
 Matching RL _exactly_ still needs a parity harness against recorded ticks; see
 the end of this document.
@@ -268,16 +279,17 @@ Small surface area, but the choices are deliberate:
   0.025 s and a maximum of 0.2 s (`JUMP_MIN_TIME` / `JUMP_MAX_TIME`). A tap
   peaks ~0.8 m above rest; a full hold ~2.5 m
   (`holding_jump_goes_higher_than_tapping_it`).
-- **One double jump.** A single extra launch while airborne, within 1.25 s of
-  the first jump finishing, then nothing until the car touches down again.
-- **No traction in the air.** The engine and tyres do nothing, so the car keeps
-  its momentum; boost still works. There is no air control or dodge yet, so a
-  jump cannot be turned into a shot.
+- **One double jump or one flip.** A single extra action while airborne, within
+  1.25 s of the first jump finishing: with the stick centred it is a double jump,
+  off-centre (past `dodgeDeadzone`) it is a flip. Then nothing until the car
+  touches down again.
+- **Air control.** Once airborne the body attitude is free 3D, and pitch/yaw/roll
+  drive RL's angular-acceleration torque with damping, so a jump can be aimed or
+  turned into a shot. Boost and the (small) air throttle still work.
 
 ## Not implemented yet
 
-Dodges/flips (the fixed-time impulse that turns a jump into a shot), air control,
-wall/ceiling driving (a signature mechanic, and a real change to the car model),
+Wall/ceiling driving (a signature mechanic, and a real change to the car model),
 boost pads, car-car collisions, demolitions, goals and kickoff, multiple cars,
 and the actual network layer.
 

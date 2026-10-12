@@ -163,7 +163,7 @@ fn yaw_rate_vanishes_at_a_standstill() {
 #[test]
 fn sustained_turn_has_a_sane_radius() {
     let mut world = World::new();
-    world.car.velocity = world.car.heading * 15.0;
+    world.car.velocity = world.car.heading() * 15.0;
     let steer = Input::new(1.0, 1.0, false, false, false);
 
     let mut yaw = 0.0;
@@ -338,6 +338,84 @@ fn double_jump_reaches_higher_than_a_single_jump() {
     );
 }
 
+// --- Air control and flips ---
+
+/// Jump once, let the jump finish, and return a world that is still airborne.
+fn airborne_world() -> World {
+    let mut world = World::new();
+    world.step(&Input::new(0.0, 0.0, false, false, true));
+    for _ in 0..20 {
+        world.step(&Input::new(0.0, 0.0, false, false, false));
+    }
+    assert!(world.car.airborne, "should still be in the air");
+    world
+}
+
+#[test]
+fn frontflip_pushes_the_car_forward() {
+    let mut world = airborne_world();
+    let before = world.car.forward_speed();
+    // Stick forward (throttle +1) is `pitch = -1`: a frontflip.
+    let mut input = Input::new(1.0, 0.0, false, false, true);
+    input.pitch = -1.0;
+    world.step(&input);
+    assert!(
+        world.car.has_flipped,
+        "should have flipped, not double jumped"
+    );
+    assert!(
+        world.car.forward_speed() > before + 2.0,
+        "frontflip should add forward speed: {before} -> {}",
+        world.car.forward_speed()
+    );
+}
+
+#[test]
+fn frontflip_pitches_the_nose_down() {
+    let mut world = airborne_world();
+    let mut input = Input::new(0.0, 0.0, false, false, true);
+    input.pitch = -1.0;
+    world.step(&input);
+    for _ in 0..20 {
+        world.step(&Input::new(0.0, 0.0, false, false, false));
+    }
+    assert!(
+        world.car.forward.y < -0.1,
+        "frontflip should pitch the nose down, forward = {:?}",
+        world.car.forward
+    );
+}
+
+#[test]
+fn air_control_rolls_the_car() {
+    let mut world = airborne_world();
+    let mut input = Input::new(0.0, 0.0, false, false, false);
+    input.roll = 1.0;
+    for _ in 0..30 {
+        world.step(&input);
+    }
+    // A pure roll must not yaw, and the up axis must tilt away from world up.
+    assert!(
+        world.car.ang_vel.y.abs() < 0.5,
+        "roll should not yaw: {:?}",
+        world.car.ang_vel
+    );
+    assert!(
+        world.car.up.dot(Vec3::UP) < 0.95,
+        "car should have rolled, up = {:?}",
+        world.car.up
+    );
+}
+
+#[test]
+fn flip_needs_directional_input() {
+    // A second jump press with the stick centred is a double jump, not a flip.
+    let mut world = airborne_world();
+    world.step(&Input::new(0.0, 0.0, false, false, true));
+    assert!(world.car.has_double_jumped, "centred press = double jump");
+    assert!(!world.car.has_flipped, "...not a flip");
+}
+
 // --- Parity checks against RocketSim's `RLConst.h` ---
 
 #[test]
@@ -402,7 +480,7 @@ fn car_speed_is_capped_by_the_world() {
     // RL clamps the car's total speed to CAR_MAX_SPEED every tick, so neither
     // boost nor a collision can leave it overspeed.
     let mut world = World::new();
-    world.car.velocity = world.car.heading * 100.0;
+    world.car.velocity = world.car.heading() * 100.0;
     world.step(&Input::default());
     assert!(
         world.car.speed() <= CAR_MAX_SPEED + 1e-9,

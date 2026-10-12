@@ -11,8 +11,21 @@ fn scripted(tick: u32) -> Input {
     match phase {
         0..=180 => Input::new(1.0, 0.0, false, false, false),
         181..=240 => Input::new(1.0, 0.6, true, false, false),
-        // Hold jump through this phase: exercises the airborne path in the hash.
-        241..=360 => Input::new(1.0, -0.8, false, false, true),
+        // Jump, release, then re-press with the stick forward: a flip.
+        241..=260 => Input::new(1.0, -0.8, false, false, true),
+        261..=300 => Input::new(1.0, -0.8, false, false, false),
+        301..=320 => {
+            let mut i = Input::new(1.0, 0.0, false, false, true);
+            i.pitch = -1.0;
+            i.roll = 0.4;
+            i
+        }
+        // Air-control yaw once the flip is over.
+        321..=360 => {
+            let mut i = Input::new(0.0, 0.0, false, false, false);
+            i.yaw = 0.7;
+            i
+        }
         361..=420 => Input::new(-1.0, 0.3, false, true, false),
         _ => Input::new(0.5, 0.0, false, false, false),
     }

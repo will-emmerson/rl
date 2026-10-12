@@ -18,9 +18,9 @@
   - get the car moving properly just on flat ground
   - get the ball moving properly
 - port the rest of the car handling from RocketSim:
-  - dodges/flips and air control (`CAR_AIR_CONTROL_TORQUE`)
   - suspension and tyre slip, so the turn radii are more than a bicycle-model
     approximation
+  - auto-roll / staying upright on landing, so wall driving becomes possible
 - start comparing our physics with the real game by looking at replay files:
   - I should be able to produce some replay files doing really simpler things like:
     - driving forward, reversing, to make sure acceleration is correct
@@ -32,6 +32,11 @@
 
 # DONE
 
+- ported flips and air control from RocketSim (`_UpdateAirTorque` /
+  `_UpdateDoubleJumpOrFlip`): a full 3D car attitude in the air, pitch/yaw/roll
+  air-control torque with damping, and dodges (initial impulse + fixed-time flip
+  torque). Because the sim's frame is left-handed the torque axes had to be
+  re-derived rather than copied.
 - ported the car handling from RocketSim: steering via
   `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model (turn radius now grows
   from ~1.4 m to ~13 m with speed), the analog powerslide, and the jump model
