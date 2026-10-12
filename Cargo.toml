@@ -29,6 +29,11 @@ opt-level = 3
 # incremental build painful. This is the standard middle ground.
 [profile.dev]
 opt-level = 1
+# Full debug info is the bulk of both the build time and the ~4 GB link peak
+# (and of the multi-GB target dir). Line tables keep file/line in backtraces
+# while cutting most of that. Use `false` for the lightest builds, or remove
+# this for full debug info if you need to inspect variables interactively.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3

@@ -1,0 +1,21 @@
+# Build configuration for this workspace.
+#
+# Link with LLVM's `lld` instead of the system GNU `ld`. `clang` is used only as
+# the driver so we can pass `-fuse-ld=lld`; no C code is compiled, so the C
+# compiler is otherwise irrelevant. This mostly cuts the relink time of the Bevy
+# viewer, which is the bulk of an edit-and-run cycle.
+#
+# Gotcha: changing the rustflags below changes the fingerprint of every crate,
+# so the first build after editing them (or switching linker) rebuilds
+# everything, Bevy included. That one-off cost is paid once.
+[target.x86_64-unknown-linux-gnu]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+# Cap parallel compilation. This machine has ~7 GB of RAM, but a full Bevy build
+# wants a lot more: cargo would otherwise start one rustc per core and then run a
+# single link that peaks around 4 GB, pushing the box into swap and making every
+# build crawl. Fewer jobs keeps the peak inside RAM, which wins on wall-clock
+# even though it looks slower on paper. Raise this if you ever add memory.
+[build]
+jobs = 4
