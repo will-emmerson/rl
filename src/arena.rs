@@ -1,6 +1,13 @@
 //! The arena: an axis-aligned box. A fixed set of static planes is all the
 //! geometry the simulation ever needs, which is exactly why a general
 //! broadphase/contact solver is overkill here.
+//!
+//! Dimensions come from RocketSim's `RLConst.h` (`ARENA_EXTENT_X/Y`,
+//! `ARENA_HEIGHT`), which are in Unreal units (1 uu = 1 cm). Real Rocket League
+//! uses a collision *mesh* (dumped with RLArenaCollisionDumper): the walls are
+//! chamfered near the corners and the ceiling is domed, and the goals cut into
+//! the end walls. A plain box is a deliberate approximation of that — it gets
+//! the playable extents right, which is what the physics here needs.
 
 use crate::math::Vec3;
 
@@ -28,11 +35,17 @@ pub struct Arena {
 
 impl Default for Arena {
     fn default() -> Self {
-        // Roughly 80 m x 50 m x 12 m.
+        // Standard "Soccar" arena, converted from uu to metres:
+        //   ARENA_EXTENT_X = 4096 uu half-width   -> 40.96 m
+        //   ARENA_EXTENT_Y = 5120 uu half-length  -> 51.20 m
+        //   ARENA_HEIGHT   = 2048 uu              -> 20.48 m
+        // So the field is 81.92 m across, 102.40 m long and 20.48 m high. The
+        // long axis is Z here (Rocket League's Y), which is the direction the
+        // car spawns facing.
         Self {
-            half_x: 40.0,
-            half_z: 25.0,
-            height: 12.0,
+            half_x: 40.96,
+            half_z: 51.20,
+            height: 20.48,
         }
     }
 }

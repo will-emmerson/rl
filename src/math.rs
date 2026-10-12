@@ -98,7 +98,8 @@ impl Vec3 {
 /// *not* guaranteed identical across platforms — which would silently break
 /// the determinism guarantee. These Taylor polynomials are pure arithmetic and
 /// agree with the true value to a few parts in 1e-8 across the range used
-/// here (|x| <= 0.5).
+/// here (the rotation step uses |x| <= 0.5; `tan_small` pushes it to RL's
+/// maximum steering angle, 0.534 rad, where it is still good to ~1e-7).
 fn sin_cos_small(x: f64) -> (f64, f64) {
     let x2 = x * x;
     let x4 = x2 * x2;
@@ -131,6 +132,31 @@ pub fn rotate_y(f: Vec3, angle: f64) -> Vec3 {
 /// Forward vector for a heading, exposed for tests and views.
 pub fn heading_forward(heading: Vec3) -> Vec3 {
     heading.normalized()
+}
+
+/// Deterministic `tan` for the small angles the steering model uses (Rocket
+/// League's maximum steer angle is 0.534 rad). Built from the same Taylor
+/// polynomials as `rotate_y`, so it never calls libm.
+pub fn tan_small(x: f64) -> f64 {
+    let (sin, cos) = sin_cos_small(x);
+    sin / cos
+}
+
+/// Linear interpolation over a sorted, ascending list of `(input, output)`
+/// knots, clamped to the end values. This is the shape of Rocket League's
+/// `LinearPieceCurve`s, and it is pure arithmetic, so it is deterministic.
+pub fn piecewise_linear(points: &[(f64, f64)], x: f64) -> f64 {
+    if x <= points[0].0 {
+        return points[0].1;
+    }
+    for pair in points.windows(2) {
+        let (x0, y0) = pair[0];
+        let (x1, y1) = pair[1];
+        if x <= x1 {
+            return y0 + (y1 - y0) * (x - x0) / (x1 - x0);
+        }
+    }
+    points[points.len() - 1].1
 }
 
 /// Right vector for a heading (forward x up).
@@ -282,5 +308,28 @@ mod tests {
         let mut b = StateHasher::new();
         b.fold(-0.0);
         assert_eq!(a.0, b.0);
+    }
+
+    #[test]
+    fn tan_small_tracks_the_true_tangent() {
+        // Accurate across RL's full steering range.
+        for x in [0.0, 0.05, 0.25, 0.4, 0.53356] {
+            assert!(
+                (tan_small(x) - x.tan()).abs() < 1e-6,
+                "tan_small({x}) = {} vs {}",
+                tan_small(x),
+                x.tan()
+            );
+        }
+    }
+
+    #[test]
+    fn piecewise_linear_clamps_and_interpolates() {
+        let knots = [(0.0, 1.0), (10.0, 0.5), (20.0, 0.0)];
+        assert_eq!(piecewise_linear(&knots, -5.0), 1.0);
+        assert_eq!(piecewise_linear(&knots, 0.0), 1.0);
+        assert!((piecewise_linear(&knots, 5.0) - 0.75).abs() < 1e-12);
+        assert!((piecewise_linear(&knots, 15.0) - 0.25).abs() < 1e-12);
+        assert_eq!(piecewise_linear(&knots, 100.0), 0.0);
     }
 }

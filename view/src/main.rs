@@ -22,9 +22,9 @@ use rl::car::{CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH};
 use rl::{Input as SimInput, World as SimWorld};
 
 /// Arena dimensions, matching `rl::Arena::default()`.
-const ARENA_HALF_X: f32 = 40.0;
-const ARENA_HALF_Z: f32 = 25.0;
-const ARENA_HEIGHT: f32 = 12.0;
+const ARENA_HALF_X: f32 = 40.96;
+const ARENA_HALF_Z: f32 = 51.20;
+const ARENA_HEIGHT: f32 = 20.48;
 
 /// The camera never gets closer to a wall than this.
 const CAMERA_WALL_MARGIN: f32 = 0.8;

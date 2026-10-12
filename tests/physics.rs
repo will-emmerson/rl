@@ -4,8 +4,8 @@
 //! editor — just `cargo test` and exact numbers.
 
 use rl::arena::Arena;
-use rl::ball::BALL_RADIUS;
-use rl::car::{CAR_HALF_HEIGHT, CAR_MAX_YAW_RATE, CAR_STEER_ENGAGE_SPEED};
+use rl::ball::{BALL_MASS, BALL_MAX_ANG_SPEED, BALL_MAX_SPEED, BALL_RADIUS};
+use rl::car::{CAR_HALF_HEIGHT, CAR_MASS, CAR_MAX_SPEED};
 use rl::math::Vec3;
 use rl::{Ball, Car, Input, World, DT, GRAVITY};
 
@@ -51,7 +51,7 @@ fn head_on_floor_bounce_is_specular() {
     };
     ball.step(DT, GRAVITY, &arena);
 
-    assert!(ball.vel.y > 6.0 && ball.vel.y < 6.5, "vy={}", ball.vel.y);
+    assert!(ball.vel.y > 5.5 && ball.vel.y < 6.5, "vy={}", ball.vel.y);
     assert!(ball.vel.x.abs() < 1e-12, "vx drifted: {}", ball.vel.x);
     assert!(ball.vel.z.abs() < 1e-12, "vz drifted: {}", ball.vel.z);
     assert!(ball.spin.length() < 1e-12, "spin appeared");
@@ -78,7 +78,8 @@ fn angled_bounce_trades_sliding_for_spin() {
 #[test]
 fn spin_curves_the_ball_in_flight() {
     // Identical launches, one ball spinning about +Y. Magnus is the only
-    // difference, so any lateral divergence is the curve.
+    // difference, so any lateral divergence is the curve. Spin is capped at
+    // `BALL_MAX_ANG_SPEED` (6 rad/s) in Rocket League, so that is what we use.
     let arena = Arena::default();
     let mut plain = Ball {
         pos: Vec3::new(0.0, 6.0, -20.0),
@@ -86,7 +87,7 @@ fn spin_curves_the_ball_in_flight() {
         ..Default::default()
     };
     let mut spun = plain;
-    spun.spin = Vec3::new(0.0, 40.0, 0.0);
+    spun.spin = Vec3::new(0.0, BALL_MAX_ANG_SPEED, 0.0);
 
     for _ in 0..120 {
         plain.step(DT, GRAVITY, &arena);
@@ -94,7 +95,7 @@ fn spin_curves_the_ball_in_flight() {
     }
     assert!(plain.pos.x.abs() < 1e-9, "unspun ball drifted");
     let curve = (spun.pos.x - plain.pos.x).abs();
-    assert!(curve > 1.0, "expected visible curve, got {curve} m");
+    assert!(curve > 0.3, "expected a visible curve, got {curve} m");
 }
 
 fn yaw_rate_for_speed(speed: f64) -> f64 {
@@ -123,43 +124,40 @@ fn car_accelerates_then_saturates() {
         world.step(&drive);
         peak = peak.max(world.car.speed());
     }
-    assert!((peak - 22.0).abs() < 0.05, "peaked at {peak}");
+    assert!((peak - CAR_MAX_SPEED).abs() < 0.05, "peaked at {peak}");
 }
 
 #[test]
-fn steering_rate_is_bounded_and_radius_grows_with_speed() {
-    // The rate is capped rather than derived from an acceleration budget, so it
-    // never exceeds the cap and the radius scales with speed.
-    let slow = yaw_rate_for_speed(5.0);
-    let fast = yaw_rate_for_speed(22.0);
-    for rate in [slow, fast] {
-        assert!(
-            rate.abs() <= CAR_MAX_YAW_RATE + 1e-9,
-            "rate {rate} exceeds the cap"
-        );
+fn steering_follows_the_rocketsim_curve() {
+    // The turn radius comes from RL's steer-angle-vs-speed curve through the
+    // bicycle model, so it grows with speed and matches the game: ~2.6 m at
+    // 5 m/s, ~4.6 m at 10, ~12.7 m at 22.
+    let radius = |v: f64| v / yaw_rate_for_speed(v).abs();
+    let (r5, r10, r22) = (radius(5.0), radius(10.0), radius(22.0));
+    assert!((r5 - 2.57).abs() < 0.1, "r(5) = {r5}");
+    assert!((r10 - 4.62).abs() < 0.1, "r(10) = {r10}");
+    assert!((r22 - 12.69).abs() < 0.3, "r(22) = {r22}");
+    assert!(r5 < r10 && r10 < r22, "radius should grow with speed");
+
+    // Peak yaw rate sits around 8 m/s and is bounded (~2.3 rad/s).
+    let mut peak: f64 = 0.0;
+    let mut v = 1.0;
+    while v <= 23.0 {
+        peak = peak.max(yaw_rate_for_speed(v).abs());
+        v += 0.5;
     }
-
-    let radius_slow = 5.0 / slow;
-    let radius_fast = 22.0 / fast;
-    assert!(
-        radius_fast > radius_slow * 2.0,
-        "radius should grow with speed: {radius_slow} -> {radius_fast}"
-    );
-    // A real circle, not a spin in place. This is the regression that made
-    // cornering feel twitchy: the old model pivoted in a 1.2 m circle.
-    assert!(radius_slow > 1.5, "radius at 5 m/s is {radius_slow} m");
+    assert!(peak > 2.0 && peak < 2.5, "peak yaw rate {peak} rad/s");
 }
 
 #[test]
-fn steering_needs_speed_to_engage() {
-    // Dead stop: no rotation at all, rather than pivoting on the spot.
-    assert!(yaw_rate_for_speed(0.0).abs() < 1e-9);
-    // Half the engagement speed gives half the rate.
-    let half = yaw_rate_for_speed(CAR_STEER_ENGAGE_SPEED * 0.5);
-    assert!(
-        (half - CAR_MAX_YAW_RATE * 0.5).abs() < 1e-9,
-        "expected half rate, got {half}"
-    );
+fn yaw_rate_vanishes_at_a_standstill() {
+    // The bicycle model is proportional to v, so a stationary car cannot turn
+    // however hard the stick is held — no pivot-on-the-spot.
+    assert!(yaw_rate_for_speed(0.0).abs() < 1e-12);
+    // And the rate grows once the car is rolling.
+    let slow = yaw_rate_for_speed(2.0).abs();
+    let faster = yaw_rate_for_speed(8.0).abs();
+    assert!(slow > 0.0 && slow < faster, "slow {slow}, faster {faster}");
 }
 
 #[test]
@@ -285,7 +283,7 @@ fn jump_lifts_the_car_then_it_lands() {
     }
 
     assert!(
-        peak > CAR_HALF_HEIGHT + 1.0,
+        peak > CAR_HALF_HEIGHT + 0.5,
         "jump peaked at {peak}, barely off the ground"
     );
     assert!(!world.car.airborne, "should have come back down");
@@ -337,5 +335,94 @@ fn double_jump_reaches_higher_than_a_single_jump() {
     assert!(
         double > single + 0.3,
         "double jump peaked at {double}, single at {single}"
+    );
+}
+
+// --- Parity checks against RocketSim's `RLConst.h` ---
+
+#[test]
+fn holding_jump_goes_higher_than_tapping_it() {
+    // RL's jump is an immediate impulse plus a held force, so the button time
+    // matters: a tap is a low hop (~0.8 m above rest), a full hold is much
+    // higher (~2.5 m).
+    let peak = |hold: bool| {
+        let mut world = World::new();
+        let mut top = world.car.pos.y;
+        for tick in 0..600 {
+            let jump = tick == 0 || (hold && tick < 30);
+            world.step(&Input::new(0.0, 0.0, false, false, jump));
+            top = top.max(world.car.pos.y);
+        }
+        top
+    };
+    let tap = peak(false);
+    let held = peak(true);
+    assert!(held > tap + 1.0, "hold {held} m vs tap {tap} m");
+}
+
+#[test]
+fn arena_matches_rocket_league_soccar() {
+    // ARENA_EXTENT_X/Y and ARENA_HEIGHT in uu, over 100.
+    let a = Arena::default();
+    assert!((a.half_x - 40.96).abs() < 1e-12, "half_x = {}", a.half_x);
+    assert!((a.half_z - 51.20).abs() < 1e-12, "half_z = {}", a.half_z);
+    assert!((a.height - 20.48).abs() < 1e-12, "height = {}", a.height);
+    assert!(
+        (BALL_RADIUS - 0.9125).abs() < 1e-12,
+        "radius = {BALL_RADIUS}"
+    );
+}
+
+#[test]
+fn ball_speed_and_spin_are_capped() {
+    // BALL_MAX_SPEED = 6000 uu/s and BALL_MAX_ANG_SPEED = 6 rad/s are hard
+    // clamps in the game; a pinch must not be able to exceed them.
+    let arena = Arena::default();
+    let mut ball = Ball {
+        pos: Vec3::new(0.0, 6.0, 0.0),
+        vel: Vec3::new(0.0, 0.0, 500.0),
+        spin: Vec3::new(0.0, 200.0, 0.0),
+        ..Default::default()
+    };
+    ball.step(DT, GRAVITY, &arena);
+    assert!(
+        ball.vel.length() <= BALL_MAX_SPEED + 1e-9,
+        "{}",
+        ball.vel.length()
+    );
+    assert!(
+        ball.spin.length() <= BALL_MAX_ANG_SPEED + 1e-9,
+        "{}",
+        ball.spin.length()
+    );
+}
+
+#[test]
+fn car_speed_is_capped_by_the_world() {
+    // RL clamps the car's total speed to CAR_MAX_SPEED every tick, so neither
+    // boost nor a collision can leave it overspeed.
+    let mut world = World::new();
+    world.car.velocity = world.car.heading * 100.0;
+    world.step(&Input::default());
+    assert!(
+        world.car.speed() <= CAR_MAX_SPEED + 1e-9,
+        "car at {} m/s",
+        world.car.speed()
+    );
+}
+
+#[test]
+fn car_hit_adds_the_extra_impulse() {
+    // A pure inelastic car-ball collision would leave the ball at
+    // m_car/(m_car+m_ball) * closing speed. RL adds a separate extra impulse on
+    // top, so the ball must beat that bound.
+    let (impact, ball_speed) = rl::head_on_shot();
+    let inelastic_bound = (CAR_MASS / (CAR_MASS + BALL_MASS)) * impact;
+    eprintln!(
+        "head-on: car {impact:.1} m/s, inelastic bound {inelastic_bound:.1} m/s, ball {ball_speed:.1} m/s"
+    );
+    assert!(
+        ball_speed > inelastic_bound + 1.0,
+        "ball {ball_speed} did not beat the inelastic bound {inelastic_bound} (impact {impact})"
     );
 }

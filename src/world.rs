@@ -7,8 +7,11 @@
 
 use crate::arena::Arena;
 use crate::ball::Ball;
-use crate::car::{Car, CAR_BALL_FRICTION, CAR_BALL_RESTITUTION, CAR_MASS};
-use crate::math::{StateHasher, Vec3};
+use crate::car::{
+    Car, BALL_CAR_EXTRA_IMPULSE_FORWARD_SCALE, BALL_CAR_EXTRA_IMPULSE_MAX_DELTA_VEL,
+    BALL_CAR_EXTRA_IMPULSE_Z_SCALE, CAR_BALL_FRICTION, CAR_BALL_RESTITUTION, CAR_MASS,
+};
+use crate::math::{piecewise_linear, StateHasher, Vec3};
 
 pub const TICK_HZ: u32 = 120;
 pub const DT: f64 = 1.0 / TICK_HZ as f64;
@@ -84,6 +87,11 @@ impl World {
         self.car.step(DT, input, &self.arena);
         self.ball.step(DT, GRAVITY, &self.arena);
         self.resolve_car_ball();
+        // Rocket League clamps both bodies at the end of the tick, *after*
+        // collisions and the extra ball impulse (RocketSim's
+        // `_FinishPhysicsTick`), so a collision cannot leave a body overspeed.
+        self.car.clamp_speed();
+        self.ball.clamp_speeds();
         self.tick += 1;
     }
 
@@ -101,6 +109,11 @@ impl World {
         let car_vel = self.car.velocity;
         let car_spin = self.car.angular_velocity();
 
+        // Rocket League computes its extra hit impulse inside the collision
+        // callback, i.e. from the pre-solver velocities, so capture them here.
+        let ball_pos_before = self.ball.pos;
+        let ball_vel_before = self.ball.vel;
+
         let contact = self.ball.resolve_obb(
             car_pos,
             axes,
@@ -114,11 +127,55 @@ impl World {
 
         if let Some((normal, impulse)) = contact {
             if impulse > 0.0 {
-                // Equal and opposite on the car. It weighs 120x the ball, so
-                // it barely notices, which is exactly how RL feels.
+                // Equal and opposite on the car. The ball is now a sixth of the
+                // car rather than a 120th, so the car does recoil noticeably.
                 self.car.velocity -= normal * (impulse / CAR_MASS);
             }
+            self.apply_extra_impulse(car_pos, car_vel, ball_pos_before, ball_vel_before);
         }
+    }
+
+    /// Rocket League's "extra" car-to-ball impulse (RocketSim `Ball::_OnHit`).
+    ///
+    /// The plain car-ball collision is inelastic, so on its own the ball would
+    /// leave at only `m_car/(m_car+m_ball)` of the closing speed. RL adds this
+    /// separate velocity kick on top of it, scaled by the closing speed, which
+    /// is why car hits pop the ball far faster than momentum alone allows. It
+    /// is applied to the ball only, and at most every other tick.
+    fn apply_extra_impulse(
+        &mut self,
+        car_pos: Vec3,
+        car_vel: Vec3,
+        ball_pos: Vec3,
+        ball_vel: Vec3,
+    ) {
+        if self.car.extra_impulse_cooldown > 0 {
+            return;
+        }
+
+        let rel_vel = ball_vel - car_vel;
+        let rel_speed = rel_vel.length().min(BALL_CAR_EXTRA_IMPULSE_MAX_DELTA_VEL);
+        if rel_speed <= 0.0 {
+            return;
+        }
+
+        // Direction from the car to the ball, with the vertical squashed, then
+        // with part of the car-forward component removed: a flat hit therefore
+        // pushes the ball more forward than straight up.
+        let delta = ball_pos - car_pos;
+        let flattened = Vec3::new(delta.x, delta.y * BALL_CAR_EXTRA_IMPULSE_Z_SCALE, delta.z);
+        let mut hit_dir = flattened.normalized();
+        let car_forward = self.car.heading.normalized();
+        hit_dir = (hit_dir
+            - car_forward
+                * (hit_dir.dot(car_forward) * (1.0 - BALL_CAR_EXTRA_IMPULSE_FORWARD_SCALE)))
+            .normalized();
+
+        let factor = extra_impulse_factor(rel_speed);
+        self.ball.vel += hit_dir * (rel_speed * factor);
+
+        // Block the next tick, matching `tickCountWhenExtraImpulseApplied`.
+        self.car.extra_impulse_cooldown = 2;
     }
 
     pub fn state_hash(&self) -> u64 {
@@ -145,5 +202,30 @@ impl World {
     /// Distance between the two hitboxes' centres, handy for assertions.
     pub fn car_ball_distance(&self) -> f64 {
         self.car.pos.distance(self.ball.pos)
+    }
+}
+
+/// Rocket League's `BALL_CAR_EXTRA_IMPULSE_FACTOR_CURVE`, with the speed axis
+/// converted from uu/s to m/s.
+fn extra_impulse_factor(rel_speed: f64) -> f64 {
+    const POINTS: [(f64, f64); 4] = [(0.0, 0.65), (5.0, 0.65), (23.0, 0.55), (46.0, 0.30)];
+    piecewise_linear(&POINTS, rel_speed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extra_impulse_factor_matches_the_rocketsim_curve() {
+        // End points and a midpoint, in m/s (uu/s / 100).
+        assert!((extra_impulse_factor(0.0) - 0.65).abs() < 1e-12);
+        assert!((extra_impulse_factor(5.0) - 0.65).abs() < 1e-12);
+        assert!((extra_impulse_factor(23.0) - 0.55).abs() < 1e-12);
+        assert!((extra_impulse_factor(46.0) - 0.30).abs() < 1e-12);
+        // 14 m/s sits halfway between the 5 and 23 m/s knots.
+        assert!((extra_impulse_factor(14.0) - 0.60).abs() < 1e-12);
+        // Clamped outside the range.
+        assert!((extra_impulse_factor(100.0) - 0.30).abs() < 1e-12);
     }
 }

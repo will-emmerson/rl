@@ -1,8 +1,8 @@
 //! The ball: a sphere with linear velocity and spin.
 //!
 //! The model is real rigid-body physics for a single sphere, just written out
-//! by hand: gravity, quadratic drag, the Magnus force from spin, and
-//! impulse-based contact resolution against the arena planes with Coulomb
+//! by hand: gravity, Rocket League's linear drag, the Magnus force from spin,
+//! and impulse-based contact resolution against the arena planes with Coulomb
 //! friction that is allowed to convert sliding into spin. That friction term
 //! is what gives you curve off the wall and "pinch" behaviour, and because we
 //! control it directly it is reproducible rather than emergent.
@@ -10,17 +10,33 @@
 use crate::arena::Arena;
 use crate::math::{StateHasher, Vec3};
 
-/// Community-derived Rocket League scale, in metres.
-pub const BALL_RADIUS: f64 = 0.93;
-pub const BALL_MASS: f64 = 1.5;
-/// Quadratic drag coefficient: a = -k * |v| * v.
-pub const BALL_DRAG: f64 = 0.0009;
-/// Magnus coefficient: a = k * (spin x velocity).
+// All values below are lifted from RocketSim's `RLConst.h`, which reverse-
+// engineered them from the shipped game. Unreal units are 1 cm, so the
+// conversions are exact divisions by 100.
+
+/// `BALL_COLLISION_RADIUS_SOCCAR = 91.25 uu`. This is the *collision* radius;
+/// the ball you see is slightly larger and Rocket League rests it at 93.15 uu
+/// to account for the collision margin.
+pub const BALL_RADIUS: f64 = 0.9125;
+/// `BALL_MASS_BT = CAR_MASS_BT / 6`: Rocket League's ball is one sixth of a car.
+pub const BALL_MASS: f64 = 30.0;
+/// Ball linear damping. RocketSim sets the Bullet body's `linearDamping` to
+/// `BALL_DRAG = 0.03`, so the ball keeps `0.97` of its speed per second. The
+/// per-tick factor is `(1 - 0.03)^(1/120)`, precomputed so the step needs no
+/// `pow` (which is a platform libm call and would break determinism).
+pub const BALL_DRAG_KEEP: f64 = 0.999_746_205_482_239_6;
+/// Magnus coefficient: a = k * (spin x velocity). RocketSim/Bullet do *not*
+/// model this — a freely-spinning sphere gets no aerodynamic force there — but
+/// Rocket League balls do curve, so it is kept as a deliberate extra.
 pub const BALL_MAGNUS: f64 = 0.010;
-/// Spin retained per 120 Hz tick.
-pub const BALL_SPIN_KEEP: f64 = 0.999;
-pub const BALL_WALL_RESTITUTION: f64 = 0.62;
-pub const BALL_WALL_FRICTION: f64 = 0.45;
+/// `BALL_RESTITUTION = 0.6`.
+pub const BALL_WALL_RESTITUTION: f64 = 0.6;
+/// `BALL_FRICTION = 0.35`.
+pub const BALL_WALL_FRICTION: f64 = 0.35;
+/// `BALL_MAX_SPEED = 6000 uu/s`.
+pub const BALL_MAX_SPEED: f64 = 60.0;
+/// `BALL_MAX_ANG_SPEED = 6 rad/s`. The ball can never spin faster than this.
+pub const BALL_MAX_ANG_SPEED: f64 = 6.0;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Ball {
@@ -50,19 +66,36 @@ impl Ball {
         0.4 * self.mass * self.radius * self.radius
     }
 
-    /// Acceleration from gravity + drag + Magnus.
+    /// Acceleration from gravity + Magnus. Drag is *not* here: Rocket League
+    /// models it as Bullet linear damping, which scales the velocity rather
+    /// than adding an acceleration, so it is applied in `step`.
     pub fn acceleration(&self, gravity: f64) -> Vec3 {
-        let speed = self.vel.length();
-        let drag = self.vel * (-BALL_DRAG * speed);
         let magnus = self.spin.cross(self.vel) * BALL_MAGNUS;
-        Vec3::new(0.0, gravity, 0.0) + drag + magnus
+        Vec3::new(0.0, gravity, 0.0) + magnus
     }
 
     pub fn step(&mut self, dt: f64, gravity: f64, arena: &Arena) {
         self.vel += self.acceleration(gravity) * dt;
+        // Linear damping, applied the way Bullet does: a per-tick velocity
+        // multiplier of `(1 - damping)^dt`.
+        self.vel = self.vel * BALL_DRAG_KEEP;
         self.pos += self.vel * dt;
-        self.spin = self.spin * BALL_SPIN_KEEP;
         self.collide_arena(arena);
+        self.clamp_speeds();
+    }
+
+    /// Apply Rocket League's hard velocity caps. `BALL_MAX_SPEED` is a real
+    /// thing in the game (RocketSim clamps the rigid body to it every tick) and
+    /// is what bounds the absurd ball speeds a pinch can otherwise produce.
+    pub fn clamp_speeds(&mut self) {
+        let speed = self.vel.length();
+        if speed > BALL_MAX_SPEED {
+            self.vel = self.vel * (BALL_MAX_SPEED / speed);
+        }
+        let spin = self.spin.length();
+        if spin > BALL_MAX_ANG_SPEED {
+            self.spin = self.spin * (BALL_MAX_ANG_SPEED / spin);
+        }
     }
 
     pub fn collide_arena(&mut self, arena: &Arena) {

@@ -308,16 +308,28 @@ fn render(world: &World, subtitle: &str) -> String {
         row[COLS - 1] = '|';
     }
 
-    // At 2 m per cell the car is smaller than one cell, so draw a marker for
-    // the body plus one for the nose rather than trying to rasterise it.
-    let (bx, by) = cell_of(world.ball.pos.x, world.ball.pos.z);
+    // The grid is stretched to the arena, so it now covers the real 81.92 m x
+    // 102.4 m pitch rather than the old 80 x 50. The car is far smaller than a
+    // cell, so draw a marker for the body plus one for the nose rather than
+    // trying to rasterise it.
+    let (bx, by) = cell_of(
+        world.ball.pos.x,
+        world.ball.pos.z,
+        world.arena.half_x,
+        world.arena.half_z,
+    );
     set_cell(&mut grid, bx, by, 'O');
 
-    let (cx, cy) = cell_of(world.car.pos.x, world.car.pos.z);
+    let (cx, cy) = cell_of(
+        world.car.pos.x,
+        world.car.pos.z,
+        world.arena.half_x,
+        world.arena.half_z,
+    );
     set_cell(&mut grid, cx, cy, '@');
 
     let nose = world.car.pos + world.car.heading * (CAR_HALF_LENGTH + 0.7);
-    let (nx, ny) = cell_of(nose.x, nose.z);
+    let (nx, ny) = cell_of(nose.x, nose.z, world.arena.half_x, world.arena.half_z);
     set_cell_if_free(&mut grid, nx, ny, '+');
 
     let mut lines: Vec<String> = Vec::new();
@@ -335,7 +347,7 @@ fn render(world: &World, subtitle: &str) -> String {
     for row in &grid {
         lines.push(row.iter().collect());
     }
-    lines.push("O ball   @ car   + nose              (grid: 2 m per cell)".to_string());
+    lines.push("O ball   @ car   + nose          (grid: full arena)".to_string());
 
     // Pad every line to a fixed width, otherwise a line that got shorter
     // would leave residue from the previous frame on screen.
@@ -369,8 +381,8 @@ fn set_cell_if_free(grid: &mut [Vec<char>], col: i64, row: i64, glyph: char) {
     }
 }
 
-fn cell_of(x: f64, z: f64) -> (i64, i64) {
-    let col = ((x + 40.0) / 80.0 * COLS as f64).floor() as i64;
-    let row = ((25.0 - z) / 50.0 * ROWS as f64).floor() as i64;
+fn cell_of(x: f64, z: f64, half_x: f64, half_z: f64) -> (i64, i64) {
+    let col = ((x + half_x) / (2.0 * half_x) * COLS as f64).floor() as i64;
+    let row = ((half_z - z) / (2.0 * half_z) * ROWS as f64).floor() as i64;
     (col.clamp(0, COLS as i64 - 1), row.clamp(0, ROWS as i64 - 1))
 }

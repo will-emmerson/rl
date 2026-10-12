@@ -33,7 +33,7 @@ client-side prediction and replays can work. Inside the simulation step:
 - **`DT` is a compile-time constant** (120 Hz). Never introduce a variable `dt`.
 - **New state must be hashed.** Add fields to `StateHasher` in `Car::hash_into` /
   `Ball::hash_into`, and make sure `Clone` copies them, or divergence goes
-  undetected.
+  undetected. (The car-ball extra-impulse cooldown is hashed this way.)
 - **`-0.0` is canonicalised** in the hash — keep it that way.
 - `rl` has **zero dependencies** by design. New crates go at most into
   `view/`.
@@ -41,6 +41,23 @@ client-side prediction and replays can work. Inside the simulation step:
 The viewer must never feed back into the simulation: it reads `World` and writes
 transforms, nothing more. (The `sin`/`cos` ban is about the simulation step — the
 viewer is free to use trigonometry.)
+
+## Physics constants come from RocketSim
+
+Gameplay constants (arena extents, ball radius/mass/friction, boost accel,
+hitbox size, car-ball restitution, and the car-ball _extra impulse_) are taken
+from **[RocketSim](https://github.com/ZealanL/RocketSim)**, not memory or
+community lore. Unreal units are centimetres, so the sim's SI values are the
+RocketSim number / 100. When you add or change one, cite the RocketSim name in
+its doc comment, as `arena.rs` / `ball.rs` / `car.rs` already do.
+
+The car's _handling_ is now partly ported from RocketSim too: steering uses
+RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model
+(`omega = v * tan(steer) / wheelbase`), the analog powerslide, and the jump is
+RL's immediate-impulse-plus-held-force model. What is _not_ reverse-engineered
+is the tyre grip (`CAR_GRIP_KEEP` / `CAR_DRIFT_KEEP`) and the engine/brake
+forces (`CAR_ENGINE_ACCEL`, `CAR_BRAKE_DECEL`); suspension, tyre slip, flips
+and air control are not modelled at all.
 
 ## Build / run / validate
 
@@ -84,4 +101,7 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
   and don't aim at a weighted average of car/ball positions (it ends up facing
   the floor). See the comments in `view/src/main.rs`.
 - **Car turning:** never derive yaw rate from a lateral-acceleration budget — it
-  rises as `1/v` and pivots the car on the spot. The rate is bounded directly.
+  rises as `1/v` and pivots the car on the spot. The rate now comes from RL's
+  steer-angle curve as `omega = v * tan(steer) / wheelbase`, which is
+  proportional to `v`, so a standstill cannot pivot (`math::tan_small` keeps it
+  libm-free).
