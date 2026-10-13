@@ -22,7 +22,7 @@ use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
 use rl::ball::BALL_RADIUS;
-use rl::car::{CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH};
+use rl::car::{CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH, CAR_WHEELBASE};
 use rl::{Input as SimInput, World as SimWorld};
 
 /// Arena dimensions, matching `rl::Arena::default()`.
@@ -43,6 +43,13 @@ const GRID_CELL_PX: u32 = GRID_TEXELS / GRID_CELLS;
 /// render the fillets smoothly; the grid lines come from the texture, not the
 /// mesh, so this does not set the grid spacing.
 const ARENA_MESH_CELL: f32 = 1.0;
+
+/// Visual wheel radius, in metres. A fraction of the hitbox half height, so the
+/// tyre reaches the hitbox floor.
+const WHEEL_RADIUS: f32 = 0.52 * CAR_HALF_HEIGHT as f32;
+/// Full-lock angle for the visual front wheels, in radians. RL's real front-wheel
+/// angle is speed-dependent; this is a fixed stand-in.
+const MAX_WHEEL_STEER: f32 = 0.5;
 
 /// The camera never gets closer to a wall than this.
 const CAMERA_WALL_MARGIN: f32 = 0.8;
@@ -123,6 +130,19 @@ struct ChaseCam;
 #[derive(Component)]
 struct HudText;
 
+/// A visual wheel. `steers` marks the front pair, which also yaw with the
+/// steering input; every wheel rolls about its axle.
+#[derive(Component)]
+struct Wheel {
+    steers: bool,
+}
+
+/// The steering input from the most recent tick, so the visual front wheels can
+/// follow the stick. The simulation does not expose the last input, so the viewer
+/// keeps its own copy.
+#[derive(Resource, Default)]
+struct LastSteer(f64);
+
 fn main() {
     let mut mode = Mode::Play;
     let mut gamepad_debug = false;
@@ -148,6 +168,7 @@ fn main() {
         .insert_resource(mode)
         .insert_resource(GamepadDebug(gamepad_debug))
         .insert_resource(BallCam(true))
+        .init_resource::<LastSteer>()
         .insert_resource(Time::<Fixed>::from_hz(rl::TICK_HZ as f64))
         .add_systems(Startup, setup_scene)
         .add_systems(FixedUpdate, step_simulation)
@@ -159,6 +180,7 @@ fn main() {
                 report_gamepads,
                 report_gamepad_events,
                 sync_visuals,
+                spin_wheels,
                 chase_camera,
                 update_hud,
                 screenshot_driver,
@@ -246,42 +268,172 @@ fn setup_scene(
     }
 
     // --- car ---
-    // Local axes are (+Z forward, +Y up, +X right), matching the simulation.
+    // Local axes are (+Z forward, +Y up, +X right), matching the simulation, with
+    // the origin at the hitbox centre. The body is a three-box sedan - bonnet,
+    // cabin, boot - built by extruding Z-Y profiles across the width, so the roof
+    // reaches the hitbox ceiling, the nose and tail reach its ends, and the sill
+    // sits clear of the ground with the wheels filling the arches. The collision
+    // box is unchanged; this is only what you see.
+    let (hw, hh, hl) = (
+        CAR_HALF_WIDTH as f32,
+        CAR_HALF_HEIGHT as f32,
+        CAR_HALF_LENGTH as f32,
+    );
+    let body_color = linear_rgba(0.10, 0.60, 0.95);
+    let glass_color = linear_rgba(0.04, 0.09, 0.15);
+    let underside_color = linear_rgba(0.07, 0.07, 0.08);
+    // One material for the whole body: the colours come from the vertices.
+    let car_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        metallic: 0.35,
+        perceptual_roughness: 0.4,
+        // Both sides, rather than relying on the winding of every extruded strip.
+        cull_mode: None,
+        ..default()
+    });
+    let tyre_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.05, 0.05, 0.06),
+        perceptual_roughness: 0.9,
+        ..default()
+    });
+    let rim_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.74, 0.77, 0.80),
+        metallic: 0.6,
+        perceptual_roughness: 0.4,
+        ..default()
+    });
+    let light_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.93, 0.62),
+        emissive: LinearRgba::rgb(1.1, 0.95, 0.5),
+        ..default()
+    });
+    let tail_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.85, 0.10, 0.10),
+        emissive: LinearRgba::rgb(0.6, 0.05, 0.05),
+        ..default()
+    });
+
+    // A bare node: the parts hang off it so `sync_visuals` can drive the whole
+    // car from the hitbox transform.
     let car = commands
-        .spawn((
-            Mesh3d(meshes.add(Cuboid::new(
-                CAR_HALF_WIDTH as f32 * 2.0,
-                CAR_HALF_HEIGHT as f32 * 2.0,
-                CAR_HALF_LENGTH as f32 * 2.0,
-            ))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.10, 0.60, 0.95),
-                metallic: 0.3,
-                perceptual_roughness: 0.35,
-                ..default()
-            })),
-            Transform::default(),
-            Vis::Car,
-        ))
+        .spawn((Transform::default(), Visibility::default(), Vis::Car))
         .id();
 
-    // A vertical fin at the front. The chase camera sits directly behind the
-    // car, where a low nose is completely hidden, so the fin is what actually
-    // tells you which way you are pointing.
     commands.entity(car).with_children(|parent| {
+        // The sill is the underside of the bodywork. It sits at the wheel centre,
+        // so the wheels stand proud of it - flush with the sill they would look
+        // like castors, and the car would appear to have no ground clearance.
+        let sill = -0.09_f32;
+        let beltline = 0.10_f32; // the bonnet/boot top, where the glass begins
+
+        // Lower body: one slab the full hitbox length, its nose and tail sloping
+        // in below the beltline. The bonnet and boot are just the parts of its top
+        // in front of and behind the cabin.
         parent.spawn((
-            Mesh3d(meshes.add(Cuboid::new(0.10, 0.34, 0.42))),
-            MeshMaterial3d(materials.add(StandardMaterial {
-                base_color: Color::srgb(0.98, 0.78, 0.16),
-                emissive: LinearRgba::rgb(0.45, 0.28, 0.0),
-                ..default()
-            })),
-            Transform::from_xyz(
-                0.0,
-                CAR_HALF_HEIGHT as f32 + 0.12,
-                CAR_HALF_LENGTH as f32 - 0.22,
-            ),
+            Mesh3d(meshes.add(extrude_profile(
+                &[
+                    (hl, sill),
+                    (hl, -0.02),
+                    (0.94 * hl, beltline),
+                    (-0.94 * hl, beltline),
+                    (-hl, -0.02),
+                    (-hl, sill),
+                ],
+                0.83 * hw,
+                body_color,
+                &[
+                    body_color,
+                    body_color,
+                    body_color,
+                    body_color,
+                    body_color,
+                    underside_color,
+                ],
+            ))),
+            MeshMaterial3d(car_mat.clone()),
+            Transform::default(),
         ));
+        // Cabin: the greenhouse, sitting on the beltline and narrower than the
+        // body so its flanks show as glass, with a raked windscreen and rear
+        // window and a solid roof on the hitbox ceiling.
+        parent.spawn((
+            Mesh3d(meshes.add(extrude_profile(
+                &[
+                    (0.33 * hl, beltline),
+                    (0.27 * hl, hh),
+                    (-0.27 * hl, hh),
+                    (-0.33 * hl, beltline),
+                ],
+                0.69 * hw,
+                glass_color,
+                &[glass_color, body_color, glass_color, body_color],
+            ))),
+            MeshMaterial3d(car_mat.clone()),
+            Transform::default(),
+        ));
+
+        // Wheels. Each is a node that steers (the front pair only) and rolls
+        // about its axle, so tyre, rim and spoke cross turn together - a plain
+        // cylinder looks identical however it is spun, so the rim and spokes are
+        // what make the rotation visible. They sit flush with the body sides, on
+        // the sim's wheelbase.
+        let front_axle = 0.46_f32;
+        let rear_axle = front_axle - CAR_WHEELBASE as f32;
+        let wheel_w = 0.24 * hw;
+        for (x, z, steers) in [
+            (-0.72 * hw, front_axle, true),
+            (0.72 * hw, front_axle, true),
+            (-0.72 * hw, rear_axle, false),
+            (0.72 * hw, rear_axle, false),
+        ] {
+            parent
+                .spawn((
+                    Transform::from_xyz(x, -hh + WHEEL_RADIUS, z),
+                    Visibility::default(),
+                    Wheel { steers },
+                ))
+                .with_children(|wheel| {
+                    let axle = Quat::from_rotation_z(PI / 2.0);
+                    wheel.spawn((
+                        Mesh3d(meshes.add(Cylinder::new(WHEEL_RADIUS, wheel_w))),
+                        MeshMaterial3d(tyre_mat.clone()),
+                        Transform::from_rotation(axle),
+                    ));
+                    wheel.spawn((
+                        Mesh3d(meshes.add(Cylinder::new(0.62 * WHEEL_RADIUS, wheel_w * 1.12))),
+                        MeshMaterial3d(rim_mat.clone()),
+                        Transform::from_rotation(axle),
+                    ));
+                    for angle in [0.0, PI / 2.0] {
+                        wheel.spawn((
+                            Mesh3d(meshes.add(Cuboid::new(
+                                wheel_w * 1.16,
+                                1.4 * WHEEL_RADIUS,
+                                0.04,
+                            ))),
+                            MeshMaterial3d(rim_mat.clone()),
+                            Transform::from_rotation(Quat::from_rotation_x(angle)),
+                        ));
+                    }
+                });
+        }
+
+        // Headlights at the nose and tail lights at the back, so the two ends
+        // read apart.
+        for x in [-0.55 * hw, 0.55 * hw] {
+            parent.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.30 * hw, 0.055, 0.05))),
+                MeshMaterial3d(light_mat.clone()),
+                Transform::from_xyz(x, -0.055, hl + 0.005),
+            ));
+        }
+        for x in [-0.55 * hw, 0.55 * hw] {
+            parent.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.30 * hw, 0.055, 0.05))),
+                MeshMaterial3d(tail_mat.clone()),
+                Transform::from_xyz(x, -0.055, -hl - 0.005),
+            ));
+        }
     });
 
     // --- lighting ---
@@ -706,6 +858,67 @@ fn push_panel(
     }
 }
 
+/// Extrude a closed, convex 2D profile - a list of `(z, y)` points - across X by
+/// ±`half_w`, giving the prism used for the car's body panels. `strip_colors[i]`
+/// colours the quad on the edge from point `i` to point `i + 1`; both end caps
+/// take `cap_color`. The profile must be listed so that the edge normal
+/// `(dy, -dz)` points outwards (the order the car profiles use).
+fn extrude_profile(
+    profile: &[(f32, f32)],
+    half_w: f32,
+    cap_color: [f32; 4],
+    strip_colors: &[[f32; 4]],
+) -> Mesh {
+    let n = profile.len();
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut colors = Vec::new();
+    let mut indices = Vec::new();
+
+    // The two end caps, fanned from the first point (the profiles are convex).
+    for side in [-1.0_f32, 1.0] {
+        let base = positions.len() as u32;
+        for &(z, y) in profile {
+            positions.push([side * half_w, y, z]);
+            normals.push([side, 0.0, 0.0]);
+            colors.push(cap_color);
+        }
+        for k in 1..n as u32 - 1 {
+            indices.extend_from_slice(&[base, base + k, base + k + 1]);
+        }
+    }
+
+    // One quad per profile edge, spanning the width.
+    for i in 0..n {
+        let (z0, y0) = profile[i];
+        let (z1, y1) = profile[(i + 1) % n];
+        let (dz, dy) = (z1 - z0, y1 - y0);
+        let len = (dz * dz + dy * dy).sqrt();
+        let (nz, ny) = (dy / len, -dz / len);
+        let base = positions.len() as u32;
+        for (x, z, y) in [
+            (-half_w, z0, y0),
+            (half_w, z0, y0),
+            (half_w, z1, y1),
+            (-half_w, z1, y1),
+        ] {
+            positions.push([x, y, z]);
+            normals.push([0.0, ny, nz]);
+            colors.push(strip_colors[i]);
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
 /// An sRGB colour as a linear `[f32; 4]`, for a vertex colour attribute.
 fn linear_rgba(r: f32, g: f32, b: f32) -> [f32; 4] {
     let c = Color::srgb(r, g, b).to_linear();
@@ -848,6 +1061,7 @@ fn step_simulation(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
     mut sim: ResMut<Sim>,
+    mut last_steer: ResMut<LastSteer>,
     mode: Res<Mode>,
 ) {
     let input = match &*mode {
@@ -856,6 +1070,7 @@ fn step_simulation(
         // the frame rate. See `capture_input` for the schedule.
         Mode::Capture { .. } => capture_input(sim.0.tick),
     };
+    last_steer.0 = input.steer;
     sim.0.step(&input);
 }
 
@@ -999,6 +1214,25 @@ fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis, &mut Visi
                 };
             }
         }
+    }
+}
+
+/// Roll and steer the visual wheels. View-only: the simulation has no wheels, so
+/// the roll integrates the distance the car has travelled over the wheel radius,
+/// and the steer angle comes from the last input.
+fn spin_wheels(
+    time: Res<Time>,
+    sim: Res<Sim>,
+    steer: Res<LastSteer>,
+    mut rolled: Local<f32>,
+    mut wheels: Query<(&mut Transform, &Wheel)>,
+) {
+    let speed = sim.0.car.forward_speed() as f32;
+    *rolled = (*rolled + speed * time.delta_secs() / WHEEL_RADIUS) % std::f32::consts::TAU;
+    let steer_angle = steer.0 as f32 * MAX_WHEEL_STEER;
+    for (mut transform, wheel) in &mut wheels {
+        let yaw = if wheel.steers { steer_angle } else { 0.0 };
+        transform.rotation = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(*rolled);
     }
 }
 

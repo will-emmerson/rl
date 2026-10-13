@@ -55,9 +55,12 @@ it was developed on Vulkan.
 The arena is drawn as its actual collision surface, with a repeating 2 m grid
 (and a heavier 10 m major grid) on every face, so you can read distances and see
 the chamfered corners and the rounded wall-to-ceiling joins. The ball is a proper
-football (black pentagons and white hexagons), so its spin reads. You can drive up
-the walls and across the ceiling — the surface only pushes, never pulls, so the
-ceiling will not hold you once you slow down.
+football (black pentagons and white hexagons), so its spin reads, and the car is a
+sedan-shaped mesh sized to the Octane hitbox, with wheels that roll and steer. The
+collision box is unchanged: the roof sits on the hitbox ceiling, so a ball balanced
+on the car rests on the roof rather than on the lower bonnet. You can drive up the
+walls and across the ceiling — the surface only pushes, never pulls, so the ceiling
+will not hold you once you slow down.
 
 ### From Zed
 
