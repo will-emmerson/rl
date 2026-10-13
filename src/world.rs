@@ -5,7 +5,7 @@
 //! step depends on how the host chooses to schedule it. Advance the world by
 //! calling `step` an integral number of times; never pass a variable `dt`.
 
-use crate::arena::Arena;
+use crate::arena::{Arena, Goal};
 use crate::ball::Ball;
 use crate::car::{
     Car, BALL_CAR_EXTRA_IMPULSE_FORWARD_SCALE, BALL_CAR_EXTRA_IMPULSE_MAX_DELTA_VEL,
@@ -82,6 +82,8 @@ impl Input {
 #[derive(Clone, Copy, Debug)]
 pub struct Snapshot {
     pub tick: u64,
+    /// Goals conceded, indexed `[blue, orange]`.
+    pub score: [u32; 2],
     pub car_pos: Vec3,
     pub car_velocity: Vec3,
     pub car_heading: Vec3,
@@ -98,6 +100,10 @@ pub struct World {
     pub car: Car,
     /// The Soccar boost pads, in a fixed order (see `boost_pad::soccar`).
     pub boost_pads: Vec<crate::boost_pad::BoostPad>,
+    /// Goals scored, indexed `[blue, orange]`. Blue defends the `-Z` goal and
+    /// orange the `+Z` one, as in Rocket League, so the ball in the `-Z` net
+    /// scores for orange.
+    pub score: [u32; 2],
     pub tick: u64,
 }
 
@@ -114,6 +120,7 @@ impl World {
             ball: Ball::default(),
             car: Car::default(),
             boost_pads: crate::boost_pad::soccar(),
+            score: [0, 0],
             tick: 0,
         }
     }
@@ -125,12 +132,30 @@ impl World {
         self.ball.step(DT, GRAVITY, &self.arena);
         self.resolve_car_ball();
         self.update_boost_pads();
+        self.check_goal();
         // Rocket League clamps both bodies at the end of the tick, *after*
         // collisions and the extra ball impulse (RocketSim's
         // `_FinishPhysicsTick`), so a collision cannot leave a body overspeed.
         self.car.clamp_limits();
         self.ball.clamp_speeds();
         self.tick += 1;
+    }
+
+    /// Count a goal and put the ball back on the centre spot for a kickoff.
+    ///
+    /// Blue defends the `-Z` goal and orange the `+Z` one, so a ball in the `-Z`
+    /// net scores for orange. Only the ball is reset - the car and the boost pads
+    /// carry on - which keeps a goal from teleporting the car the player is
+    /// driving (and keeps the determinism fuzz tests calm).
+    fn check_goal(&mut self) {
+        if let Some(goal) = self.arena.ball_in_goal(self.ball.pos, self.ball.radius) {
+            let scorer = match goal {
+                Goal::Minus => 1,
+                Goal::Plus => 0,
+            };
+            self.score[scorer] += 1;
+            self.ball = Ball::default();
+        }
     }
 
     /// Tick every pad's cooldown and hand out boost for any the car is over.
@@ -238,6 +263,8 @@ impl World {
     pub fn state_hash(&self) -> u64 {
         let mut h = StateHasher::new();
         h.fold_u64(self.tick);
+        h.fold_u64(self.score[0] as u64);
+        h.fold_u64(self.score[1] as u64);
         self.car.hash_into(&mut h);
         self.ball.hash_into(&mut h);
         for pad in &self.boost_pads {
@@ -249,6 +276,7 @@ impl World {
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
             tick: self.tick,
+            score: self.score,
             car_pos: self.car.pos,
             car_velocity: self.car.velocity,
             car_heading: self.car.heading(),

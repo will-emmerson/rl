@@ -183,6 +183,7 @@ does and doesn't mean:
 | Ball     | Sphere, `r = 0.9125`, `m = 30`. Gravity, Bullet-style linear drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin. Speed and spin are hard-capped at 60 m/s and 6 rad/s                                                                                                                                                                                                                                                                                                                                                                      |
 | Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.205 x 0.867 x 0.387 (real Octane, per RocketSim), `m = 180`. Steering from RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model (`omega = v * tan(steer) / wheelbase`); analog powerslide; boost meter; jump = immediate impulse + held force, then a double jump _or_ a flip; full 3D air attitude with air control; total speed clamped to 23 m/s, angular speed to 5.5 rad/s. The driving model runs in the current _surface's_ frame, so the car drives on the floor, up the walls and across the ceiling |
 | Boost    | 34 pads (6 big, 28 small) at RL's positions; big gives 100 boost / 10 s cooldown, small 12 / 4 s. Taken by driving over a pad near the floor                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Goal     | A full-size Soccar goal at each end: a 17.8551 x 6.42775 m mouth, carved into the arena SDF. The net is a semicircular scoop (radius ~2.70 m) swept across the width, so a car can drive in low and ride the curve out the top. The ball scores when its centre passes RocketSim's `SOCCAR_GOAL_SCORE_BASE_THRESHOLD_Y` plus the ball radius (fully over the line), then resets to the centre spot                                                                                                                                                                           |
 | Car-ball | Sphere vs OBB closest-point, inelastic impulse (`e = 0`) with relative velocity at contact (car rotation included), plus Rocket League's extra hit impulse, equal-and-opposite reaction                                                                                                                                                                                                                                                                                                                                                                                      |
 
 Constants are community-sourced Rocket League figures converted to SI, now
@@ -235,6 +236,12 @@ What that changed:
   taken when the car drives over a pad near the floor; the pickup is a simple
   horizontal radius (`CYL_RAD_BIG` / `CYL_RAD_SMALL`) rather than RL's
   cylinder/box triggers.
+- **Goals.** Both end walls now carry a full-size goal mouth cut into the arena
+  SDF, with the net recess behind it (blue at -Z, orange at +Z). The mouth
+  (RLBot `goal center-to-post` / `goal height`), depth (`goal depth`) and score
+  threshold (RocketSim `SOCCAR_GOAL_SCORE_BASE_THRESHOLD_Y`) are the real
+  figures. A ball whose centre crosses the line scores and resets to the centre
+  spot.
 - **Car-ball.** Restitution dropped to `0.0` and friction raised to `2.0`, and
   the collision is now followed by Rocket League's **extra impulse**
   (`Ball::_OnHit`): a velocity kick along the car->ball direction, scaled by the
@@ -327,8 +334,9 @@ ground plane:
 
 ## Not implemented yet
 
-Car-car collisions, demolitions, goals and kickoff, multiple cars, and the
-actual network layer.
+Car-car collisions, demolitions, the kickoff countdown/replay, multiple cars,
+and the actual network layer. (Goals themselves are in: a ball crossing the line
+scores and returns to the centre spot - see `World::check_goal`.)
 
 The useful next step for the determinism story is a _parity harness_: record
 input streams plus state hashes from a reference build, then assert them in CI.

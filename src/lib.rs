@@ -24,7 +24,7 @@ pub mod car;
 pub mod math;
 pub mod world;
 
-pub use arena::Arena;
+pub use arena::{Arena, Goal};
 pub use ball::Ball;
 pub use boost_pad::BoostPad;
 pub use car::Car;

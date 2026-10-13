@@ -54,7 +54,10 @@ it was developed on Vulkan.
 
 The arena is drawn as its actual collision surface, with a repeating 2 m grid
 (and a heavier 10 m major grid) on every face, so you can read distances and see
-the chamfered corners and the rounded wall-to-ceiling joins. The ball is a proper
+the chamfered corners and the rounded wall-to-ceiling joins. Both ends carry a
+full-size Soccar goal — a 17.86 m × 6.43 m mouth cut into the end wall with a
+curved net scoop behind it (blue at -Z, orange at +Z) — and the ball scores when
+it crosses the line, with the score on the HUD. The ball is a proper
 football (black pentagons and white hexagons), so its spin reads, and the car is a
 sedan-shaped mesh sized to the Octane hitbox, with wheels that roll and steer. The
 collision box is unchanged: the roof sits on the hitbox ceiling, so a ball balanced
@@ -166,7 +169,7 @@ no engine or GPU in the way, so it is what the determinism tests drive.
 Cargo.toml        workspace; `rl` is the root package
 src/              the simulation (no dependencies)
   math.rs         Vec3, hashing, deterministic sin/cos for rotation
-  arena.rs        the arena, a rounded box as a signed-distance field
+  arena.rs        the arena (rounded box + goal mouths) as a signed-distance field
   ball.rs         sphere: gravity, drag, Magnus, contact friction -> spin
   car.rs          bespoke driving model (not a rigid body) + box hitbox
   world.rs        120 Hz fixed step, input, state hash, snapshots

@@ -3,7 +3,9 @@
 //! This is what a hand-rolled engine buys you: no window, no render loop, no
 //! editor — just `cargo test` and exact numbers.
 
-use rl::arena::Arena;
+use rl::arena::{
+    Arena, GOAL_DEPTH, GOAL_HALF_WIDTH, GOAL_HEIGHT, GOAL_NET_CENTER_HEIGHT, GOAL_SCORE_BASE_Z,
+};
 use rl::ball::{BALL_MASS, BALL_MAX_ANG_SPEED, BALL_MAX_SPEED, BALL_RADIUS};
 use rl::car::{CAR_HALF_HEIGHT, CAR_MASS, CAR_MAX_SPEED};
 use rl::math::Vec3;
@@ -201,8 +203,10 @@ fn car_never_leaves_the_arena() {
         world.step(&input);
     }
     let a = &world.arena;
+    // The goals are recesses in the end walls, so the car may sit inside one -
+    // but it must stay within the playable space, goals included.
     assert!(
-        world.car.pos.x.abs() <= a.half_x && world.car.pos.z.abs() <= a.half_z,
+        a.inside_distance(world.car.pos) <= 1e-3,
         "car escaped to {:?}",
         world.car.pos
     );
@@ -560,7 +564,11 @@ fn car_does_not_stick_in_a_corner() {
             min_after_corner = min_after_corner.min(world.car.speed());
         }
     }
-    assert!(world.car.pos.x.abs() < a.half_x && world.car.pos.z.abs() < a.half_z);
+    assert!(
+        a.inside_distance(world.car.pos) <= 1e-3,
+        "car left the playable space: {:?}",
+        world.car.pos
+    );
     if min_after_corner != f64::MAX {
         assert!(
             min_after_corner > 0.5,
@@ -675,6 +683,126 @@ fn arena_matches_rocket_league_soccar() {
         (BALL_RADIUS - 0.9125).abs() < 1e-12,
         "radius = {BALL_RADIUS}"
     );
+}
+
+// --- Goals ---
+
+#[test]
+fn goal_dimensions_match_the_game() {
+    // RLBot "Useful Game Values" (the page RocketSim cites): goal
+    // center-to-post 892.755 uu, height 642.775 uu, depth 880 uu. RocketSim
+    // `SOCCAR_GOAL_SCORE_BASE_THRESHOLD_Y` = 5124.25 uu.
+    assert!(
+        (2.0 * GOAL_HALF_WIDTH - 17.8551).abs() < 1e-9,
+        "mouth = {}",
+        2.0 * GOAL_HALF_WIDTH
+    );
+    assert!(
+        (GOAL_HEIGHT - 6.42775).abs() < 1e-9,
+        "height = {GOAL_HEIGHT}"
+    );
+    assert!((GOAL_DEPTH - 8.80).abs() < 1e-9, "depth = {GOAL_DEPTH}");
+    assert!(
+        (GOAL_SCORE_BASE_Z - 51.2425).abs() < 1e-9,
+        "score line = {GOAL_SCORE_BASE_Z}"
+    );
+}
+
+#[test]
+fn the_end_wall_is_open_only_where_the_goal_is() {
+    // The collision field must carry the ball through the mouth and keep the
+    // end wall solid around it - under the crossbar and between the posts.
+    let a = Arena::default();
+    let just_short = a.half_z - 0.01;
+    // In the mouth: no wall, so the ball passes.
+    let in_mouth = Vec3::new(0.0, 3.0, just_short);
+    assert!(
+        a.inside_distance(in_mouth) + BALL_RADIUS < 0.0,
+        "the goal mouth is blocked"
+    );
+    // Above the crossbar, and beside a post: solid wall.
+    let above = Vec3::new(0.0, GOAL_HEIGHT + 0.2, just_short);
+    assert!(
+        a.inside_distance(above) + BALL_RADIUS > 0.0,
+        "open above the crossbar"
+    );
+    let beside = Vec3::new(GOAL_HALF_WIDTH + 0.2, 3.0, just_short);
+    assert!(
+        a.inside_distance(beside) + BALL_RADIUS > 0.0,
+        "open beside a post"
+    );
+}
+
+#[test]
+fn the_goal_net_is_a_curved_scoop() {
+    // The net is not a flat back wall: it bulges back at mid-height so a car can
+    // drive in low and ride the curve up and out. Depth at a few heights down the
+    // centre line, walked out from the goal line to the first surface.
+    let a = Arena::default();
+    let depth_at = |h: f64| {
+        let mut z = a.half_z + 0.001;
+        while z < a.half_z + GOAL_DEPTH + 0.5 {
+            if a.inside_distance(Vec3::new(0.0, h, z)) > 0.0 {
+                return z - a.half_z;
+            }
+            z += 0.001;
+        }
+        f64::INFINITY
+    };
+    let low = depth_at(0.3);
+    let mid = depth_at(GOAL_NET_CENTER_HEIGHT);
+    let high = depth_at(GOAL_HEIGHT - 1.0);
+    assert!(mid > low + 1.0, "mid {mid:.2} m vs low {low:.2} m");
+    assert!(mid > high + 1.0, "mid {mid:.2} m vs high {high:.2} m");
+    // And the deepest point is the full goal depth.
+    assert!((mid - GOAL_DEPTH).abs() < 0.1, "deepest {mid:.2} m");
+}
+
+#[test]
+fn a_car_drives_up_the_goal_scoop() {
+    // Drive into the goal along the floor at speed: the curved net must carry the
+    // car up the back rather than stopping it flat, i.e. it clears the mouth
+    // height. (This is the "in at the bottom, out the top" shape.)
+    let mut world = World::new();
+    let half_z = world.arena.half_z;
+    world.car.pos = Vec3::new(0.0, CAR_HALF_HEIGHT, -half_z + 4.0);
+    world.car.forward = Vec3::new(0.0, 0.0, -1.0);
+    world.car.up = Vec3::UP;
+    world.car.velocity = Vec3::new(0.0, 0.0, -18.0);
+    let drive = Input::new(1.0, 0.0, false, false, false);
+    let mut peak = 0.0_f64;
+    for _ in 0..240 {
+        world.step(&drive);
+        peak = peak.max(world.car.pos.y);
+    }
+    assert!(peak > 2.0, "car did not climb the scoop: peak {peak:.2} m");
+}
+
+#[test]
+fn ball_scores_in_the_goal_and_returns_to_kickoff() {
+    let mut world = World::new();
+    let half_z = world.arena.half_z;
+    // Fire the ball at the -Z (blue) goal from just shy of the line.
+    world.ball.pos = Vec3::new(0.0, 1.0, -half_z + 2.0);
+    world.ball.vel = Vec3::new(0.0, 0.0, -25.0);
+    let mut scored = false;
+    for _ in 0..240 {
+        world.step(&Input::default());
+        if world.score != [0, 0] {
+            scored = true;
+            break;
+        }
+    }
+    assert!(scored, "the ball never scored");
+    // Blue defends -Z, so a ball in the -Z net scores for orange (index 1).
+    assert_eq!(world.score, [0, 1], "score {:?}", world.score);
+    // The ball is back on the centre spot, at rest, the instant it scores.
+    assert!(
+        world.ball.pos.x.abs() < 1e-9 && world.ball.pos.z.abs() < 1e-9,
+        "ball not on the centre spot: {:?}",
+        world.ball.pos
+    );
+    assert_eq!(world.ball.vel, Vec3::ZERO, "ball still moving");
 }
 
 #[test]

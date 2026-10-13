@@ -43,7 +43,11 @@ The viewer must never feed back into the simulation: it reads `World` and writes
 transforms, nothing more. (The `sin`/`cos` ban is about the simulation step — the
 viewer is free to use trigonometry.)
 
-## Physics constants come from RocketSim
+## Physics constants and dimensions come from RocketSim
+
+**[RocketSim](https://github.com/ZealanL/RocketSim) is the reference for
+Rocket League physics and dimensions** — use it (not memory or community lore)
+for both the numbers and the model.
 
 Gameplay constants (arena extents, ball radius/mass/friction, boost accel,
 hitbox size, car-ball restitution, and the car-ball _extra impulse_) are taken
@@ -51,6 +55,17 @@ from **[RocketSim](https://github.com/ZealanL/RocketSim)**, not memory or
 community lore. Unreal units are centimetres, so the sim's SI values are the
 RocketSim number / 100. When you add or change one, cite the RocketSim name in
 its doc comment, as `arena.rs` / `ball.rs` / `car.rs` already do.
+
+Goal geometry (the mouth width/height and net depth, `arena::GOAL_*`) comes the
+same way, but is not in `RLConst.h`: RocketSim bakes the goal into its dumped
+arena collision mesh. So those numbers are taken from the RLBot
+[Useful Game Values](https://github.com/RLBot/RLBot/wiki/Useful-Game-Values)
+page that RocketSim's own comments cite, with the score line from RocketSim's
+`SOCCAR_GOAL_SCORE_BASE_THRESHOLD_Y`. The goal is not a box: fitting a circle to
+the goal region of RocketSim's soccar mesh gives the net's curved profile
+(`arena::GOAL_NET_*`). The goals are carved into the arena SDF (see
+`Arena::goal_field`) — the viewer draws the shell, cuts the same openings, and
+adds the frame and the swept net scoop.
 
 The car's _handling_ is now largely ported from RocketSim: steering uses RL's
 `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model

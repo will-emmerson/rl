@@ -25,6 +25,7 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
+use rl::arena::{GOAL_HALF_WIDTH, GOAL_HEIGHT};
 use rl::ball::BALL_RADIUS;
 use rl::car::{CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH, CAR_WHEELBASE};
 use rl::{Input as SimInput, World as SimWorld};
@@ -425,6 +426,57 @@ fn setup_scene(
         }
     }
 
+    // --- goals ---
+    // Soccar goal recesses in the two end walls: a team-coloured frame (posts and
+    // crossbar) around the opening, with a translucent net filling the box behind
+    // it. Sizes come from `rl::arena`; see that module for the sources. The mouth
+    // in the drawn shell is cut out in `arena_surface_mesh`.
+    let goal_frame_blue = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.20, 0.45, 0.95),
+        emissive: LinearRgba::rgb(0.10, 0.22, 0.50),
+        perceptual_roughness: 0.5,
+        ..default()
+    });
+    let goal_frame_orange = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.00, 0.45, 0.12),
+        emissive: LinearRgba::rgb(0.50, 0.20, 0.04),
+        perceptual_roughness: 0.5,
+        ..default()
+    });
+    let goal_net = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.88, 0.92, 1.0, 0.16),
+        alpha_mode: AlphaMode::Blend,
+        // Seen from both sides: the camera is inside the goal as often as not.
+        cull_mode: None,
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+    let w = GOAL_HALF_WIDTH as f32;
+    let h = GOAL_HEIGHT as f32;
+    // Blue defends -Z, orange +Z (matching `rl::arena::Goal`).
+    for (sign, frame) in [(-1.0_f32, goal_frame_blue), (1.0_f32, goal_frame_orange)] {
+        let z_line = sign * ARENA_HALF_Z;
+        // Frame: two posts and a crossbar, at the goal line.
+        for x in [-w, w] {
+            commands.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.16, h, 0.16))),
+                MeshMaterial3d(frame.clone()),
+                Transform::from_xyz(x, h * 0.5, z_line),
+            ));
+        }
+        commands.spawn((
+            Mesh3d(meshes.add(Cuboid::new(2.0 * w + 0.16, 0.16, 0.16))),
+            MeshMaterial3d(frame.clone()),
+            Transform::from_xyz(0.0, h, z_line),
+        ));
+        // Net: the curved scoop, swept across the width (see `goal_net_mesh`).
+        commands.spawn((
+            Mesh3d(meshes.add(goal_net_mesh(sign))),
+            MeshMaterial3d(goal_net.clone()),
+            Transform::default(),
+        ));
+    }
+
     // --- car ---
     // Local axes are (+Z forward, +Y up, +X right), matching the simulation, with
     // the origin at the hitbox centre. The body is a three-box sedan - bonnet,
@@ -672,7 +724,7 @@ fn setup_scene(
             left: px(12),
             ..default()
         },
-        children![TextSpan::new(""), TextSpan::new("")],
+        children![TextSpan::new(""), TextSpan::new(""), TextSpan::new("")],
         HudText,
     ));
 }
@@ -690,6 +742,9 @@ struct BoxFace {
     v_len: f32,
     nu: u32,
     nv: u32,
+    /// A goal end wall: quads inside the goal mouth are skipped, so the opening
+    /// is an actual hole rather than a dented surface.
+    hole: bool,
 }
 
 /// The arena's collision surface as a single triangle mesh, with the grid UV and
@@ -712,7 +767,8 @@ fn arena_surface_mesh() -> Mesh {
     let ny = (height / cell).round().max(1.0) as u32;
 
     // Floor, ceiling, then the four walls. The subdivision of each shared edge
-    // matches (same lengths along the same axes), so the pieces line up.
+    // matches (same lengths along the same axes), so the pieces line up. The two
+    // end walls carry `hole`, so the goal openings are cut from the surface.
     let faces = [
         BoxFace {
             origin: Vec3::new(-half_x, 0.0, -half_z),
@@ -722,6 +778,7 @@ fn arena_surface_mesh() -> Mesh {
             v_len: 2.0 * half_z,
             nu: nx,
             nv: nz,
+            hole: false,
         },
         BoxFace {
             origin: Vec3::new(-half_x, height, -half_z),
@@ -731,6 +788,7 @@ fn arena_surface_mesh() -> Mesh {
             v_len: 2.0 * half_z,
             nu: nx,
             nv: nz,
+            hole: false,
         },
         BoxFace {
             origin: Vec3::new(half_x, 0.0, -half_z),
@@ -740,6 +798,7 @@ fn arena_surface_mesh() -> Mesh {
             v_len: height,
             nu: nz,
             nv: ny,
+            hole: false,
         },
         BoxFace {
             origin: Vec3::new(-half_x, 0.0, -half_z),
@@ -749,6 +808,7 @@ fn arena_surface_mesh() -> Mesh {
             v_len: height,
             nu: nz,
             nv: ny,
+            hole: false,
         },
         BoxFace {
             origin: Vec3::new(-half_x, 0.0, half_z),
@@ -758,6 +818,7 @@ fn arena_surface_mesh() -> Mesh {
             v_len: height,
             nu: nx,
             nv: ny,
+            hole: true,
         },
         BoxFace {
             origin: Vec3::new(-half_x, 0.0, -half_z),
@@ -767,6 +828,7 @@ fn arena_surface_mesh() -> Mesh {
             v_len: height,
             nu: nx,
             nv: ny,
+            hole: true,
         },
     ];
 
@@ -789,7 +851,7 @@ fn arena_surface_mesh() -> Mesh {
                 let surface = project_to_surface(&arena, centre, (box_point - centre).normalize());
                 positions.push(surface.to_array());
 
-                let n = arena.normal_at(rl::Vec3::new(
+                let n = arena.shell_normal_at(rl::Vec3::new(
                     surface.x as f64,
                     surface.y as f64,
                     surface.z as f64,
@@ -812,6 +874,16 @@ fn arena_surface_mesh() -> Mesh {
         let row = face.nu + 1;
         for j in 0..face.nv {
             for i in 0..face.nu {
+                if face.hole {
+                    // Cut the goal opening: skip any quad whose centre is inside
+                    // the mouth, so the end wall has a hole the goal sits in.
+                    let u = face.u_len * (i as f32 + 0.5) / face.nu as f32;
+                    let v = face.v_len * (j as f32 + 0.5) / face.nv as f32;
+                    let p = face.origin + face.u_dir * u + face.v_dir * v;
+                    if p.x.abs() <= GOAL_HALF_WIDTH as f32 && p.y <= GOAL_HEIGHT as f32 {
+                        continue;
+                    }
+                }
                 let a = base + j * row + i;
                 let b = a + 1;
                 let c = a + row;
@@ -832,6 +904,84 @@ fn arena_surface_mesh() -> Mesh {
     .with_inserted_indices(Indices::U32(indices))
 }
 
+/// The curved goal net, as a triangle mesh.
+///
+/// The net is the same semicircular scoop the collision field uses
+/// (`rl::arena::goal_field`): a profile in the depth/height plane swept across
+/// the goal's width, capped at each post. The profile runs from the mouth floor,
+/// around the scoop arc, and up the back to the roof; the mouth itself is left
+/// open. `sign` is -1 for the -Z (blue) goal and +1 for +Z (orange).
+fn goal_net_mesh(sign: f32) -> Mesh {
+    use rl::arena::{GOAL_NET_CENTER_DEPTH, GOAL_NET_CENTER_HEIGHT, GOAL_NET_RADIUS};
+    let dc = GOAL_NET_CENTER_DEPTH as f32;
+    let hc = GOAL_NET_CENTER_HEIGHT as f32;
+    let r = GOAL_NET_RADIUS as f32;
+    let top = GOAL_HEIGHT as f32;
+    let half_w = GOAL_HALF_WIDTH as f32;
+    let z0 = ARENA_HALF_Z;
+
+    // Profile as (depth, height) pairs: mouth floor, then the scoop arc, then the
+    // flat back up to the roof and forward to the mouth top.
+    let mut profile: Vec<[f32; 2]> = vec![[0.0, 0.0]];
+    let steps = 24;
+    let th0 = -(hc / r).clamp(-1.0, 1.0).asin(); // angle where the arc meets y=0
+    let th1 = std::f32::consts::FRAC_PI_2;
+    for i in 0..=steps {
+        let t = th0 + (th1 - th0) * i as f32 / steps as f32;
+        profile.push([dc + r * t.cos(), hc + r * t.sin()]);
+    }
+    profile.push([dc, top]);
+    profile.push([0.0, top]);
+
+    let at = |x: f32, d: f32, h: f32| Vec3::new(x, h, sign * (z0 + d));
+    // A point inside the cavity, used to orient every face's normal inward.
+    let inside = Vec3::new(0.0, 3.0, sign * (z0 + 3.0));
+
+    let mut positions: Vec<[f32; 3]> = Vec::new();
+    let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut tri = |a: Vec3, b: Vec3, c: Vec3| {
+        let n = (b - a).cross(c - a).normalize_or_zero();
+        let centroid = (a + b + c) / 3.0;
+        let n = if n.dot(inside - centroid) < 0.0 {
+            -n
+        } else {
+            n
+        };
+        for p in [a, b, c] {
+            positions.push(p.to_array());
+            normals.push(n.to_array());
+        }
+    };
+
+    // The swept scoop walls.
+    for seg in profile.windows(2) {
+        let a = at(-half_w, seg[0][0], seg[0][1]);
+        let b = at(half_w, seg[0][0], seg[0][1]);
+        let c = at(half_w, seg[1][0], seg[1][1]);
+        let d = at(-half_w, seg[1][0], seg[1][1]);
+        tri(a, b, c);
+        tri(a, c, d);
+    }
+    // Side caps at the posts (the mouth edge is left open).
+    for x in [-half_w, half_w] {
+        let origin = at(x, 0.0, 0.0);
+        for seg in profile.windows(2).skip(1) {
+            tri(
+                origin,
+                at(x, seg[0][0], seg[0][1]),
+                at(x, seg[1][0], seg[1][1]),
+            );
+        }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+}
+
 /// March a ray from inside the arena out to the collision surface. The surface
 /// lies inside the bounding box, so any point past the box corner is outside;
 /// the shape is convex, so a plain bisection finds the crossing.
@@ -843,7 +993,7 @@ fn project_to_surface(arena: &rl::Arena, centre: Vec3, direction: Vec3) -> Vec3 
     for _ in 0..30 {
         let mid = 0.5 * (lo + hi);
         let p = centre + direction * mid;
-        let d = arena.inside_distance(rl::Vec3::new(p.x as f64, p.y as f64, p.z as f64));
+        let d = arena.shell_inside_distance(rl::Vec3::new(p.x as f64, p.y as f64, p.z as f64));
         if d < 0.0 {
             lo = mid;
         } else {
@@ -1745,13 +1895,17 @@ fn update_hud(
     let car = &sim.0.car;
     let ball = &sim.0.ball;
     *writer.text(entity, 1) = format!(
+        "BLUE {:>2} - {:<2} ORANGE\n",
+        sim.0.score[0], sim.0.score[1]
+    );
+    *writer.text(entity, 2) = format!(
         "speed {:>5.1} m/s   boost {:>5.1}   tick {:>6}   cam {}\n",
         car.speed(),
         car.boost,
         sim.0.tick,
         if ball_cam.0 { "ball" } else { "car" }
     );
-    *writer.text(entity, 2) = format!(
+    *writer.text(entity, 3) = format!(
         "ball {:>5.1} m/s   height {:>5.2} m   spin {:>5.1} rad/s\n",
         ball.vel.length(),
         ball.pos.y,
