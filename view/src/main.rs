@@ -8,6 +8,8 @@
 //! Run it:
 //!   cargo run -p rl_view                          # play (dev profile is playable)
 //!   cargo run -p rl_view -- --screenshot shot.png # render one frame, then exit
+//!   cargo run -p rl_view -- --screenshot shot.png --cam 0,12,-30 --look 0,1,0
+//!                                                 # instant free-cam shot, no sim
 //!   cargo run -p rl_view -- --gamepad-debug       # log every raw pad event
 
 use std::f32::consts::PI;
@@ -98,11 +100,40 @@ struct Sim(SimWorld);
 enum Mode {
     Play,
     /// Run until the simulation reaches `capture_at_tick`, dump a PNG, exit.
+    ///
+    /// When `free_cam` is set the camera is pinned and the simulation is never
+    /// advanced: the frame is captured once the renderer has warmed up (see
+    /// `FREE_SHOT_MIN_FRAMES`). That is the fast path for eyeballing the scene
+    /// from a chosen angle, and `capture_at_tick` is ignored.
     Capture {
         path: String,
         capture_at_tick: u64,
+        free_cam: Option<FreeCam>,
     },
 }
+
+/// A pinned camera pose: where the eye sits and the point it aims at, both in
+/// world space. Set by `--cam` / `--look`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct FreeCam {
+    pos: Vec3,
+    look: Vec3,
+}
+
+/// Warm-up before a free-cam capture fires. The 3D scene is not drawn for the
+/// first fraction of a second (pipeline compilation and window bring-up), so a
+/// shot grabbed sooner comes out as the bare clear colour - the same reason the
+/// driven capture has to run for a while before its frame is representative.
+///
+/// Gate on both a wall-clock floor and a minimum frame count, so the wait holds
+/// whether the app is throttled (few frames, lots of time) or running flat out
+/// (many frames, little time). This is still far quicker than driving to a tick.
+const FREE_SHOT_MIN_FRAMES: u32 = 20;
+const FREE_SHOT_MIN_SECS: f32 = 1.0;
+/// Where `--cam` looks from when it is given without `--look`, and what `--look`
+/// aims at when it is given without `--cam`: a high overview behind the kickoff.
+const FREE_CAM_DEFAULT_POS: Vec3 = Vec3::new(0.0, 12.0, -30.0);
+const FREE_CAM_DEFAULT_LOOK: Vec3 = Vec3::new(0.0, 1.0, 0.0);
 
 /// Set by `--gamepad-debug`: log every raw gamepad event.
 ///
@@ -148,23 +179,52 @@ struct Wheel {
 struct LastSteer(f64);
 
 fn main() {
-    let mut mode = Mode::Play;
     let mut gamepad_debug = false;
-    let mut args = std::env::args().skip(1);
+    // A capture is asked for by `--screenshot PATH [TICK]`. `--cam` / `--look`
+    // turn it into an instant free-camera shot (see `resolve_free_cam`).
+    let mut shot: Option<(String, Option<u64>)> = None;
+    let mut cam: Option<Vec3> = None;
+    let mut look: Option<Vec3> = None;
+
+    let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
-        if arg == "--screenshot" {
-            let path = args.next().unwrap_or_else(|| "screenshot.png".into());
-            // Gate on the simulation tick, not the frame count: the render
-            // frame rate varies with load, the tick does not.
-            let capture_at_tick = args.next().and_then(|v| v.parse().ok()).unwrap_or(250);
-            mode = Mode::Capture {
-                path,
-                capture_at_tick,
-            };
-        } else if arg == "--gamepad-debug" {
-            gamepad_debug = true;
+        match arg.as_str() {
+            "--screenshot" => {
+                let path = args.next().unwrap_or_else(|| "screenshot.png".into());
+                // The tick is an optional bare number. Only consume it when it
+                // really is one, so a following flag is not eaten as the tick.
+                let capture_at_tick = match args.peek().and_then(|v| v.parse::<u64>().ok()) {
+                    Some(tick) => {
+                        args.next();
+                        Some(tick)
+                    }
+                    None => None,
+                };
+                shot = Some((path, capture_at_tick));
+            }
+            "--cam" => cam = Some(parse_vec3_arg(&mut args, "--cam")),
+            "--look" => look = Some(parse_vec3_arg(&mut args, "--look")),
+            "--gamepad-debug" => gamepad_debug = true,
+            _ => {}
         }
     }
+
+    let free_cam = resolve_free_cam(cam, look);
+    if free_cam.is_some() && shot.is_none() {
+        eprintln!("note: --cam/--look only pin the camera for a --screenshot capture");
+    }
+
+    let mode = match shot {
+        Some((path, capture_at_tick)) => Mode::Capture {
+            path,
+            // Gate on the simulation tick, not the frame count: the render frame
+            // rate varies with load, the tick does not. A free-cam shot ignores
+            // the tick and captures after a short warm-up instead.
+            capture_at_tick: capture_at_tick.unwrap_or(250),
+            free_cam,
+        },
+        None => Mode::Play,
+    };
 
     App::new()
         .add_plugins(DefaultPlugins)
@@ -175,7 +235,7 @@ fn main() {
         .init_resource::<LastSteer>()
         .insert_resource(Time::<Fixed>::from_hz(rl::TICK_HZ as f64))
         .add_systems(Startup, setup_scene)
-        .add_systems(FixedUpdate, step_simulation)
+        .add_systems(FixedUpdate, step_simulation.run_if(simulating))
         .add_systems(
             Update,
             (
@@ -185,13 +245,61 @@ fn main() {
                 report_gamepad_events,
                 sync_visuals,
                 spin_wheels,
-                chase_camera,
+                chase_camera.run_if(simulating),
                 update_hud,
                 screenshot_driver,
                 quit_on_escape,
             ),
         )
         .run();
+}
+
+/// Combine `--cam` / `--look` into a pinned camera pose. Either flag alone is
+/// enough; the missing half falls back to a default overview. `None` means
+/// neither was given, i.e. keep the chase camera.
+fn resolve_free_cam(cam: Option<Vec3>, look: Option<Vec3>) -> Option<FreeCam> {
+    if cam.is_none() && look.is_none() {
+        return None;
+    }
+    Some(FreeCam {
+        pos: cam.unwrap_or(FREE_CAM_DEFAULT_POS),
+        look: look.unwrap_or(FREE_CAM_DEFAULT_LOOK),
+    })
+}
+
+/// Read the `x,y,z` value for `flag`, exiting with a clear message if it is
+/// missing or malformed.
+fn parse_vec3_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Vec3 {
+    let raw = args
+        .next()
+        .unwrap_or_else(|| panic!("{flag} needs an x,y,z value"));
+    parse_vec3(&raw).unwrap_or_else(|| panic!("{flag}: bad value {raw:?}, want x,y,z"))
+}
+
+/// Parse a comma-separated `x,y,z` triple (`12,6,-30` or `12, 6, -30`).
+fn parse_vec3(s: &str) -> Option<Vec3> {
+    let mut parts = s.split(',');
+    let x = parts.next()?.trim().parse::<f32>().ok()?;
+    let y = parts.next()?.trim().parse::<f32>().ok()?;
+    let z = parts.next()?.trim().parse::<f32>().ok()?;
+    parts.next().is_none().then_some(Vec3::new(x, y, z))
+}
+
+/// True when `--cam` has pinned the camera for an instant shot. Then there is no
+/// simulation to advance and the chase camera must not fight the fixed pose.
+fn is_free_shot(mode: &Mode) -> bool {
+    matches!(
+        mode,
+        Mode::Capture {
+            free_cam: Some(_),
+            ..
+        }
+    )
+}
+
+/// Run condition for the systems that only make sense while simulating.
+fn simulating(mode: Res<Mode>) -> bool {
+    !is_free_shot(&mode)
 }
 
 // ---------------------------------------------------------------------------
@@ -204,6 +312,7 @@ fn setup_scene(
     mut materials: ResMut<Assets<StandardMaterial>>,
     mut images: ResMut<Assets<Image>>,
     sim: Res<Sim>,
+    mode: Res<Mode>,
 ) {
     // --- arena ---
     // The arena is drawn as its actual collision surface: a mesh found by
@@ -524,6 +633,16 @@ fn setup_scene(
     // are held under the threshold on purpose so they stay translucent (see
     // `pad_small_mat`). The soft knee reaches down to
     // `threshold * (1 - softness)` = 3.0, still clear of the ball.
+    // The chase camera normally starts behind the kickoff and then follows the
+    // car. A `--cam` shot pins it to a fixed pose instead, and the chase system
+    // is skipped (see `simulating`).
+    let camera_pose = match &*mode {
+        Mode::Capture {
+            free_cam: Some(free),
+            ..
+        } => Transform::from_translation(free.pos).looking_at(free.look, Vec3::Y),
+        _ => Transform::from_xyz(0.0, 3.2, -22.0).looking_at(Vec3::new(0.0, 0.8, 0.0), Vec3::Y),
+    };
     commands.spawn((
         Camera3d::default(),
         Hdr,
@@ -539,7 +658,7 @@ fn setup_scene(
             composite_mode: BloomCompositeMode::Additive,
             ..Bloom::NATURAL
         },
-        Transform::from_xyz(0.0, 3.2, -22.0).looking_at(Vec3::new(0.0, 0.8, 0.0), Vec3::Y),
+        camera_pose,
         ChaseCam,
     ));
 
@@ -1646,10 +1765,13 @@ fn quit_on_escape(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppEx
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn screenshot_driver(
     mut commands: Commands,
     mode: Res<Mode>,
     sim: Res<Sim>,
+    time: Res<Time>,
+    mut elapsed: Local<u32>,
     mut frames_since_capture: Local<u32>,
     mut captured: Local<bool>,
     mut exit: MessageWriter<AppExit>,
@@ -1657,16 +1779,27 @@ fn screenshot_driver(
     let Mode::Capture {
         path,
         capture_at_tick,
+        free_cam,
     } = &*mode
     else {
         return;
     };
 
-    if !*captured && sim.0.tick >= *capture_at_tick {
+    *elapsed += 1;
+
+    // A driven shot waits for the simulation to reach the moment; a free-cam
+    // shot has no tick to reach, so it fires once the scene has had its warm-up
+    // - and the simulation never runs at all.
+    let ready = match free_cam {
+        Some(_) => *elapsed >= FREE_SHOT_MIN_FRAMES && time.elapsed_secs() >= FREE_SHOT_MIN_SECS,
+        None => sim.0.tick >= *capture_at_tick,
+    };
+
+    if !*captured && ready {
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(path.clone()));
-        info!("capturing screenshot at tick {} to {path}", sim.0.tick);
+        info!("capturing screenshot to {path} (tick {})", sim.0.tick);
         *captured = true;
     }
 
@@ -1909,5 +2042,49 @@ mod tests {
 
         let roll_right = press(KeyCode::KeyE);
         assert!(roll_right.roll > 0.5, "E: {roll_right:?}");
+    }
+
+    #[test]
+    fn parse_vec3_reads_a_triple() {
+        assert_eq!(parse_vec3("1,2,3"), Some(Vec3::new(1.0, 2.0, 3.0)));
+        assert_eq!(
+            parse_vec3(" 12, 6, -30 "),
+            Some(Vec3::new(12.0, 6.0, -30.0))
+        );
+        // Wrong arity or a non-number is rejected, not silently defaulted.
+        assert_eq!(parse_vec3("1,2"), None);
+        assert_eq!(parse_vec3("1,2,3,4"), None);
+        assert_eq!(parse_vec3("a,2,3"), None);
+    }
+
+    #[test]
+    fn a_lone_cam_or_look_fills_the_other_half() {
+        assert!(resolve_free_cam(None, None).is_none());
+
+        let from_cam = resolve_free_cam(Some(Vec3::new(1.0, 2.0, 3.0)), None).unwrap();
+        assert_eq!(from_cam.pos, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(from_cam.look, FREE_CAM_DEFAULT_LOOK);
+
+        let from_look = resolve_free_cam(None, Some(Vec3::new(4.0, 5.0, 6.0))).unwrap();
+        assert_eq!(from_look.pos, FREE_CAM_DEFAULT_POS);
+        assert_eq!(from_look.look, Vec3::new(4.0, 5.0, 6.0));
+    }
+
+    #[test]
+    fn only_a_free_cam_capture_skips_the_simulation() {
+        assert!(!is_free_shot(&Mode::Play));
+        assert!(!is_free_shot(&Mode::Capture {
+            path: "x.png".into(),
+            capture_at_tick: 250,
+            free_cam: None,
+        }));
+        assert!(is_free_shot(&Mode::Capture {
+            path: "x.png".into(),
+            capture_at_tick: 0,
+            free_cam: Some(FreeCam {
+                pos: FREE_CAM_DEFAULT_POS,
+                look: Vec3::ONE,
+            }),
+        }));
     }
 }

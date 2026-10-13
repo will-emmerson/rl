@@ -79,6 +79,23 @@ cargo clippy --workspace --all-targets # kept clean
   `view/Cargo.toml`.
 - Project tasks are defined in `.zed/tasks.json`.
 
+**To see your work, render a PNG** — both forms exit on their own:
+
+```sh
+cargo run -p rl_view -- --screenshot out.png [TICK]          # chase cam, drives
+cargo run -p rl_view -- --screenshot out.png --cam X,Y,Z --look X,Y,Z  # free cam
+```
+
+- `--screenshot PATH [TICK]` drives the self-driving script to `TICK` (default
+  **250**) and shoots the chase cam — a _dynamic_ pose. With no `PATH`,
+  `screenshot.png` is used.
+- `--cam X,Y,Z` / `--look X,Y,Z` pin the camera at that eye point looking at
+  that target and **skip the sim**: instant, for eyeballing
+  geometry/materials/lighting from a chosen angle — but it only ever shows the
+  kickoff scene (no dynamic pose). Either flag alone works (the other falls back
+  to an overview default), and `TICK` is then ignored.
+- `--gamepad-debug` logs every raw pad event — the viewer's only other flag.
+
 ## Bevy is pinned to 0.19.1
 
 Its API differs from most docs and training data — check the crate source rather
@@ -134,3 +151,9 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
   own frame and `align_up_to` rotates both attitude _and velocity_ onto the new
   normal, which is what carries speed around the floor→wall→ceiling joins. Use
   `rotate_about` / the cross-dot rotation there, never `acos`.
+- **Screenshots need a render warm-up.** The first ~second of 3D frames is the
+  bare clear colour (pipeline compilation + window bring-up); a frame grabbed
+  before that is blank. The driven `--screenshot N` clears it by running to tick
+  N (~125 frames), and the free-cam path gates on `FREE_SHOT_MIN_FRAMES` +
+  `FREE_SHOT_MIN_SECS`. Don't "speed up" a capture by grabbing an early frame.
+  The sim isn't what's slow — the frames are.

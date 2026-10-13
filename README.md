@@ -80,6 +80,7 @@ and pick one, or `task: rerun` to repeat the last one.
 | `RL: cargo check`                     | type-check the workspace on demand (see below)     |
 | `RL: clippy (workspace, all targets)` | lints                                              |
 | `RL: render screenshot (tick 250)`    | dump a frame to `docs/screenshot.png`              |
+| `RL: render free-cam shot (no sim)`   | instant shot from a fixed angle to `docs/shot.png` |
 | `RL: physics throughput bench`        | ticks/s                                            |
 
 To put one on a key, add to your `keymap.json`:
@@ -118,9 +119,26 @@ You can also have it render a single frame and exit, which is handy for CI or
 for eyeballing a change:
 
 ```sh
-cargo run --release -p rl_view -- --screenshot shot.png 250
-#                                              path      tick to capture
+cargo run -p rl_view -- --screenshot shot.png 250
+#                                     path      tick to capture
 ```
+
+That runs the self-driving script up to the tick and shoots the chase camera, so
+the pose is a _dynamic_ moment (tick 250 is the car mid-hit). If you just want to
+look at the scene from a chosen angle, pass `--cam` / `--look` instead: the
+simulation is skipped entirely and the shot is taken as soon as the renderer has
+warmed up.
+
+```sh
+cargo run -p rl_view -- --screenshot shot.png --cam 0,12,-30 --look 0,1,0
+#                                     path             eye x,y,z   aim x,y,z
+```
+
+Both `--cam` and `--look` are optional and fill each other from an overview
+default, so `--cam` alone works. This only shows the **starting** scene (the car
+on its spot, the ball at centre), so it is for checking geometry, materials,
+lighting and camera framing, not a dynamic pose. The tick is ignored when
+`--cam`/`--look` are given.
 
 ## Play it in the terminal
 

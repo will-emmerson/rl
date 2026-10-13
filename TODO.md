@@ -13,6 +13,8 @@
 
 # TODO
 
+- free-cam shots show only the kickoff scene; add pose flags (`--car` / `--ball`)
+  so a specific dynamic setup can be shot instantly without simulating to it
 - aim for just being able to bounce a ball against a wall
 - I need to break things down into really simple things:
   - get the car moving properly just on flat ground
@@ -32,6 +34,12 @@
 
 # DONE
 
+- viewer screenshots: `--cam x,y,z` / `--look x,y,z` pin the camera and skip the
+  simulation, so a static shot from a chosen angle (`Mode::Capture { free_cam }`)
+  is instant instead of driving the sim to a tick. The driven `--screenshot PATH
+[TICK]` stays for dynamic poses. The wait can't reach zero: the first fully
+  drawn frame is ~a second in (pipeline/window warm-up), so a free shot still
+  waits a short, bounded warm-up.
 - curved arena + wall/ceiling driving: the arena is a signed-distance field (a
   box with chamfered vertical corners and filleted floor/wall and wall/ceiling
   joins), and the car drives in the frame of whatever surface it is on, so it
