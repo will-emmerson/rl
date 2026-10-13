@@ -416,6 +416,159 @@ fn flip_needs_directional_input() {
     assert!(!world.car.has_flipped, "...not a flip");
 }
 
+// --- Curved arena: driving on walls and the ceiling ---
+
+/// Aim the car at the +X wall and drive flat out, returning the world.
+fn drive_at_the_wall(speed: f64) -> World {
+    let mut world = World::new();
+    world.car.forward = Vec3::new(1.0, 0.0, 0.0);
+    world.car.up = Vec3::UP;
+    world.car.velocity = Vec3::new(speed, 0.0, 0.0);
+    world
+}
+
+#[test]
+fn car_drives_up_a_wall() {
+    // Straight into the wall from the floor. The rounded floor-to-wall join
+    // must turn the car onto the wall: its up axis rotates from vertical to
+    // horizontal and it climbs clear of the floor.
+    let mut world = drive_at_the_wall(12.0);
+    let drive = Input::new(1.0, 0.0, false, false, false);
+    let a = Arena::default();
+
+    let mut on_wall = false;
+    for tick in 0..1200 {
+        world.step(&drive);
+        // Grounded on the wall: out near the wall face, tilted onto it.
+        if world.car.pos.x > a.half_x - 0.5 && world.car.up.y < 0.3 && world.car.pos.y > 3.0 {
+            on_wall = true;
+            eprintln!("on wall after {tick} ticks at {:?}", world.car.pos);
+            break;
+        }
+    }
+    assert!(
+        on_wall,
+        "never climbed the wall: pos {:?} up {:?}",
+        world.car.pos, world.car.up
+    );
+}
+
+#[test]
+fn car_rolls_from_the_wall_onto_the_ceiling() {
+    // Keep driving once on the wall: the rounded wall-to-ceiling join must
+    // carry the car over the rim so its up ends up pointing down.
+    let mut world = drive_at_the_wall(18.0);
+    let drive = Input::new(1.0, 0.0, false, false, false);
+    let a = Arena::default();
+
+    let mut on_ceiling = false;
+    for tick in 0..3000 {
+        world.step(&drive);
+        if world.car.up.y < -0.5 && world.car.pos.y > a.height - 1.0 {
+            on_ceiling = true;
+            eprintln!("on ceiling after {tick} ticks at {:?}", world.car.pos);
+            break;
+        }
+    }
+    assert!(
+        on_ceiling,
+        "never reached the ceiling: pos {:?} up {:?}",
+        world.car.pos, world.car.up
+    );
+}
+
+#[test]
+fn car_falls_off_the_ceiling_when_it_slows() {
+    // A ceiling cannot hold the car (it can only push, never pull), so once the
+    // car stops powering itself it must lose speed and fall back down rather
+    // than sticking to the roof forever.
+    let a = Arena::default();
+    let mut world = drive_at_the_wall(18.0);
+    let drive = Input::new(1.0, 0.0, false, false, false);
+
+    let mut on_ceiling = false;
+    for _ in 0..3000 {
+        world.step(&drive);
+        if world.car.up.y < -0.5 && world.car.pos.y > a.height - 1.0 {
+            on_ceiling = true;
+            break;
+        }
+    }
+    assert!(on_ceiling, "never reached the ceiling");
+
+    // Coast: the car should fall off and end up back on the floor, upright.
+    let idle = Input::default();
+    for _ in 0..2400 {
+        world.step(&idle);
+    }
+    assert!(
+        world.car.pos.y < a.height * 0.5,
+        "stuck to the ceiling at {:?}",
+        world.car.pos
+    );
+    assert!(
+        world.car.up.y > 0.5 && (world.car.pos.y - CAR_HALF_HEIGHT).abs() < 0.1,
+        "should have settled on the floor: pos {:?} up {:?}",
+        world.car.pos,
+        world.car.up
+    );
+}
+
+#[test]
+fn car_slides_down_a_wall_when_it_stops() {
+    // Parked on a vertical wall with no throttle, the slope gravity must pull
+    // the car back down to the floor.
+    let a = Arena::default();
+    let mut world = World::new();
+    world.car.pos = Vec3::new(a.half_x - CAR_HALF_HEIGHT, 12.0, 0.0);
+    world.car.up = Vec3::new(-1.0, 0.0, 0.0);
+    world.car.forward = Vec3::new(0.0, 1.0, 0.0);
+    world.car.velocity = Vec3::ZERO;
+    world.car.airborne = false;
+
+    let idle = Input::default();
+    for _ in 0..1500 {
+        world.step(&idle);
+    }
+    assert!(
+        world.car.up.y > 0.9 && world.car.pos.y < 1.0,
+        "did not slide back to the floor: pos {:?} up {:?}",
+        world.car.pos,
+        world.car.up
+    );
+}
+
+#[test]
+fn car_does_not_stick_in_a_corner() {
+    // Drive hard into a vertical corner. With the old box arena the car wedged
+    // there; with the chamfer it should keep moving and never blow up.
+    let a = Arena::default();
+    let mut world = World::new();
+    // Aim at the +X/-Z corner.
+    let dir = Vec3::new(1.0, 0.0, -1.0).normalized();
+    world.car.forward = dir;
+    world.car.up = Vec3::UP;
+    world.car.velocity = dir * 15.0;
+    let drive = Input::new(1.0, 0.0, false, false, false);
+
+    let mut min_after_corner = f64::MAX;
+    for _ in 0..1200 {
+        world.step(&drive);
+        assert!(world.car.pos.is_finite(), "car went non-finite");
+        // Track how slowly it moves once it is out at the corner.
+        if world.car.pos.x > a.half_x - 2.0 && world.car.pos.z < -a.half_z + 2.0 {
+            min_after_corner = min_after_corner.min(world.car.speed());
+        }
+    }
+    assert!(world.car.pos.x.abs() < a.half_x && world.car.pos.z.abs() < a.half_z);
+    if min_after_corner != f64::MAX {
+        assert!(
+            min_after_corner > 0.5,
+            "car stuck at the corner ({min_after_corner} m/s)"
+        );
+    }
+}
+
 // --- Boost pads ---
 
 #[test]

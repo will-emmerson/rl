@@ -52,6 +52,13 @@ The camera trails the car and, in ball cam (the default), keeps the ball framed;
 `Y` (or `C`) switches to a straight-ahead car cam. This needs a GPU and a window;
 it was developed on Vulkan.
 
+The arena is drawn as its actual collision surface, with a repeating 2 m grid
+(and a heavier 10 m major grid) on every face, so you can read distances and see
+the chamfered corners and the rounded wall-to-ceiling joins. The ball is a proper
+football (black pentagons and white hexagons), so its spin reads. You can drive up
+the walls and across the ceiling — the surface only pushes, never pulls, so the
+ceiling will not hold you once you slow down.
+
 ### From Zed
 
 `.zed/tasks.json` defines all of the commands below as project tasks, so you
@@ -138,7 +145,7 @@ no engine or GPU in the way, so it is what the determinism tests drive.
 Cargo.toml        workspace; `rl` is the root package
 src/              the simulation (no dependencies)
   math.rs         Vec3, hashing, deterministic sin/cos for rotation
-  arena.rs        the six planes that make up the arena
+  arena.rs        the arena, a rounded box as a signed-distance field
   ball.rs         sphere: gravity, drag, Magnus, contact friction -> spin
   car.rs          bespoke driving model (not a rigid body) + box hitbox
   world.rs        120 Hz fixed step, input, state hash, snapshots

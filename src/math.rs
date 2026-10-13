@@ -142,6 +142,25 @@ pub fn tan_small(x: f64) -> f64 {
     sin / cos
 }
 
+/// Rotate `v` about a unit `axis` by `angle` radians (Rodrigues' formula).
+///
+/// Same Taylor `sin`/`cos` and sub-stepping as `rotate_y`, so it stays libm-free
+/// and deterministic. Used to steer the car on a wall or ceiling, where the
+/// steer axis is the surface normal rather than world +Y.
+pub fn rotate_about(v: Vec3, axis: Vec3, angle: f64) -> Vec3 {
+    let axis = axis.normalized();
+    let steps = ((angle.abs() / 0.5).ceil() as i64).max(1);
+    let step = angle / steps as f64;
+    let (sin, cos) = sin_cos_small(step);
+    let mut result = v;
+    for _ in 0..steps {
+        let cross = axis.cross(result);
+        let dot = axis.dot(result);
+        result = result * cos + cross * sin + axis * (dot * (1.0 - cos));
+    }
+    result.normalized()
+}
+
 /// Linear interpolation over a sorted, ascending list of `(input, output)`
 /// knots, clamped to the end values. This is the shape of Rocket League's
 /// `LinearPieceCurve`s, and it is pure arithmetic, so it is deterministic.
@@ -299,6 +318,18 @@ mod tests {
         assert!(r.dot(f).abs() < 1e-12);
         // Facing +Z with +Y up, "right" is -X.
         assert!(r.x < 0.0, "got {r:?}");
+    }
+
+    #[test]
+    fn rotate_about_matches_rotate_y_for_a_vertical_axis() {
+        let f = Vec3::new(0.0, 0.0, 1.0);
+        let a = rotate_about(f, Vec3::UP, 1.1);
+        let b = rotate_y(f, 1.1);
+        // The two agree to the Taylor polynomials' accuracy (~1e-8), not to the
+        // last bit: `rotate_y` renormalises every sub-step, `rotate_about`
+        // normalises once at the end.
+        assert!((a - b).length() < 1e-6, "{a:?} vs {b:?}");
+        assert!((a.length() - 1.0).abs() < 1e-12);
     }
 
     #[test]

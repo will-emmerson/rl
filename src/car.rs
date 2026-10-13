@@ -8,9 +8,13 @@
 //! The steering, jump, air-control and flip models are ported from RocketSim
 //! (`RLConst.h` + `Car::_UpdateWheels` / `_UpdateJump` / `_UpdateAirTorque` /
 //! `_UpdateDoubleJumpOrFlip`); the engine/brake numbers are still tuned for feel.
+//!
+//! The driving model runs in the frame of whatever surface the car is on, so the
+//! same steering and forces apply on the floor, the walls and the ceiling (see
+//! `step_grounded` / `resolve_arena`) rather than only in the ground plane.
 
 use crate::arena::Arena;
-use crate::math::{piecewise_linear, rotate_y, tan_small, StateHasher, Vec3};
+use crate::math::{piecewise_linear, rotate_about, tan_small, StateHasher, Vec3};
 use crate::world::{Input, GRAVITY};
 
 // RocketSim's internal Octane hitbox (`CAR_CONFIG_OCTANE`), in uu converted to
@@ -57,6 +61,23 @@ pub const CAR_BRAKE_DECEL: f64 = 18.0;
 pub const CAR_GRIP_KEEP: f64 = 0.90;
 pub const CAR_DRIFT_KEEP: f64 = 0.985;
 pub const CAR_ROLLING_KEEP: f64 = 0.995;
+
+/// Restitution for a car *bouncing* off a surface it is not landing on - a
+/// sideways wall hit, or the floor while inverted. Not a RocketSim figure: RL
+/// resolves those contacts with its suspension and tyre model, which this does
+/// not have, so this is tuned for feel.
+pub const CAR_SURFACE_RESTITUTION: f64 = 0.2;
+/// How far a grounded car may drift clear of its surface before it is treated
+/// as having left it. A grounded car is glued to the surface, so this is only a
+/// sanity valve against numerical drift.
+pub const CAR_SURFACE_SNAP: f64 = 0.10;
+/// Minimum speed to stay glued to an *overhanging* surface (the ceiling, and the
+/// upper part of the wall-to-ceiling fillet), in m/s. A surface can only push,
+/// never pull, so with its normal pointing away from gravity it cannot hold the
+/// car: the car stays only while it is moving fast enough to carry itself, and
+/// peels off and falls once it slows. A floor or a wall has no such requirement.
+/// Tuned for feel - RL resolves this through its tyre model.
+pub const CAR_STICK_SPEED: f64 = 4.0;
 
 /// Powerslide is an *analog* 0..1 value in Rocket League: it ramps in at
 /// `POWERSLIDE_RISE_RATE` and out at `POWERSLIDE_FALL_RATE` per second, rather
@@ -244,9 +265,16 @@ impl Car {
         self.forward.cross(self.up)
     }
 
-    /// Horizontal facing direction, for the ground-plane maths and the viewers.
+    /// Facing direction for the ground-plane maths and the viewers: the body
+    /// forward flattened to the horizontal, or the full forward when the car is
+    /// on a wall or the ceiling and that flattening would be degenerate.
     pub fn heading(&self) -> Vec3 {
-        self.forward.xz().normalized()
+        let h = self.forward.xz();
+        if h.length_squared() > 1e-12 {
+            h.normalized()
+        } else {
+            self.forward
+        }
     }
 
     /// Angular velocity vector, used so the car can flick the ball while
@@ -284,21 +312,30 @@ impl Car {
         if self.airborne {
             self.step_airborne(dt, input);
         } else {
-            self.step_grounded(dt, input);
+            self.step_grounded(dt, input, arena);
         }
 
         self.update_jump(dt, input, jump_pressed);
 
         self.pos += self.velocity * dt;
-        self.resolve_vertical(arena);
-        self.collide_walls(arena);
+        self.resolve_arena(arena);
     }
 
-    /// The driving model. Runs only while the car is on the ground, where the
-    /// attitude is held upright and yaw-only.
-    fn step_grounded(&mut self, dt: f64, input: &Input) {
-        let f = self.forward;
-        let r = self.right();
+    /// The driving model. Runs while the car is on a surface, which is not
+    /// necessarily the floor: on a wall or the ceiling the same steering,
+    /// engine, brake and boost apply in that surface's own frame.
+    fn step_grounded(&mut self, dt: f64, input: &Input, arena: &Arena) {
+        // Rotate the attitude (and the velocity with it) so `up` matches the
+        // surface normal. Crossing from the floor onto a wall turns the whole
+        // car by the angle the surface turned, which is what carries its speed
+        // up the wall instead of stopping it dead.
+        let normal = arena.normal_at(self.pos);
+        self.align_up_to(normal);
+
+        let up = self.up;
+        let mut f = self.tangent_forward();
+        self.forward = f;
+        let r = f.cross(up);
         let mut v_forward = self.velocity.dot(f);
         let mut v_lateral = self.velocity.dot(r);
 
@@ -307,7 +344,8 @@ impl Car {
         // (`STEER_ANGLE_FROM_SPEED_CURVE`), scales it by the steering input, and
         // the yaw that produces is the bicycle-model v * tan(delta) / wheelbase.
         // Because it is proportional to v, the car cannot pivot on the spot at a
-        // standstill, and because v is signed, reversing mirrors the turn.
+        // standstill, and because v is signed, reversing mirrors the turn. On a
+        // wall the steer axis is the surface normal, not world +Y.
         let speed_uu = v_forward.abs() * 100.0;
         let mut steer_angle = steer_angle_from_speed(speed_uu);
         if self.handbrake_val > 0.0 {
@@ -317,11 +355,21 @@ impl Car {
         }
         steer_angle *= input.steer;
         self.yaw_rate = v_forward * tan_small(steer_angle) / CAR_WHEELBASE;
-        self.forward = rotate_y(f, self.yaw_rate * dt);
-        self.up = Vec3::UP;
-        self.ang_vel = Vec3::new(0.0, self.yaw_rate, 0.0);
-        let f = self.forward;
-        let r = self.right();
+        self.forward = rotate_about(f, up, self.yaw_rate * dt);
+        self.forward = self.tangent_forward();
+        self.up = up;
+        self.ang_vel = up * self.yaw_rate;
+        f = self.forward;
+        let r = f.cross(up);
+
+        // --- gravity along the slope ---
+        // A grounded car is held to the surface, so only gravity's component
+        // *along* the surface counts: none on the flat floor or the ceiling, a
+        // full pull down a vertical wall.
+        let gravity = Vec3::new(0.0, GRAVITY, 0.0);
+        let g_tangent = gravity - up * gravity.dot(up);
+        v_forward += g_tangent.dot(f) * dt;
+        v_lateral += g_tangent.dot(r) * dt;
 
         // --- longitudinal ---
         let boosting = input.boost && self.boost > 0.0;
@@ -486,7 +534,10 @@ impl Car {
         } else if on_ground && jump_pressed {
             self.is_jumping = true;
             self.jump_time = 0.0;
-            self.velocity.y += CAR_JUMP_IMMEDIATE_SPEED;
+            // Jump along the car's own up axis, which is the surface normal on
+            // the ground: straight up off the floor, straight out of a wall,
+            // straight down off the ceiling.
+            self.velocity += self.up * CAR_JUMP_IMMEDIATE_SPEED;
             self.airborne = true;
         }
 
@@ -498,7 +549,7 @@ impl Car {
             } else {
                 1.0
             };
-            self.velocity.y += CAR_JUMP_ACCEL * scale * dt;
+            self.velocity += self.up * (CAR_JUMP_ACCEL * scale * dt);
         }
 
         // The double jump / flip.
@@ -523,7 +574,7 @@ impl Car {
                 if magnitude >= CAR_DODGE_DEADZONE {
                     self.start_flip(input);
                 } else {
-                    self.velocity.y += CAR_JUMP_IMMEDIATE_SPEED;
+                    self.velocity += self.up * CAR_JUMP_IMMEDIATE_SPEED;
                     self.has_double_jumped = true;
                 }
             }
@@ -598,9 +649,10 @@ impl Car {
             dodge_vel.x *= CAR_FLIP_BACKWARD_IMPULSE_SCALE_X;
         }
 
-        let forward_2d = self.forward.xz().normalized();
-        let right_2d = self.right().xz().normalized();
-        self.velocity += forward_2d * dodge_vel.x + right_2d * dodge_vel.y;
+        // Push along the car's own forward/right axes, so a flip launched off a
+        // wall aims the same way it would from the floor. On the ground those
+        // axes are already horizontal, so this matches the old flattened dodge.
+        self.velocity += self.forward * dodge_vel.x + self.right() * dodge_vel.y;
     }
 
     /// Integrate the body attitude from the angular velocity and re-orthonormalise.
@@ -625,29 +677,118 @@ impl Car {
         self.up = up;
     }
 
-    /// Land on the floor, or stop at the ceiling. The box rests on the ground,
-    /// so on the ground its centre sits at `CAR_HALF_HEIGHT`.
-    fn resolve_vertical(&mut self, arena: &Arena) {
-        if self.pos.y <= CAR_HALF_HEIGHT {
-            self.pos.y = CAR_HALF_HEIGHT;
-            self.velocity.y = self.velocity.y.max(0.0);
-            self.airborne = false;
-            // Our model has no suspension or auto-roll, so a car that lands
-            // tilted is snapped back to an upright, yaw-only attitude.
-            let horizontal = self.forward.xz();
-            self.forward = if horizontal.length_squared() > 1e-12 {
-                horizontal.normalized()
+    /// Rotate the car's attitude - and its velocity with it - so its up axis
+    /// becomes `normal` (the surface normal, pointing into the arena). The
+    /// rotation is the shortest arc from the current up, taken from the cross
+    /// and dot products directly so no `acos`/`sin`/`cos` is needed and the step
+    /// stays deterministic.
+    fn align_up_to(&mut self, normal: Vec3) {
+        let from = self.up;
+        let axis = from.cross(normal);
+        let sin = axis.length();
+        let cos = from.dot(normal);
+        if sin < 1e-9 {
+            // Already aligned, or exactly opposite (which a car on a surface
+            // never should be).
+            self.up = normal;
+            return;
+        }
+        let axis = axis / sin;
+        let rotate = |v: Vec3| v * cos + axis.cross(v) * sin + axis * (axis.dot(v) * (1.0 - cos));
+        self.forward = rotate(self.forward);
+        self.velocity = rotate(self.velocity);
+        self.ang_vel = rotate(self.ang_vel);
+        self.up = normal;
+    }
+
+    /// The car's forward axis projected into the plane perpendicular to its up
+    /// axis, i.e. the direction it is pointing along the surface.
+    fn tangent_forward(&self) -> Vec3 {
+        let f = self.forward - self.up * self.forward.dot(self.up);
+        if f.length_squared() > 1e-12 {
+            f.normalized()
+        } else {
+            // Forward collapsed onto the surface normal. There is no facing to
+            // recover, so pick any tangent rather than returning a zero vector.
+            let alt = Vec3::new(0.0, 0.0, 1.0) - self.up * self.up.z;
+            if alt.length_squared() > 1e-12 {
+                alt.normalized()
             } else {
-                Vec3::new(0.0, 0.0, 1.0)
-            };
-            self.up = Vec3::UP;
-            self.ang_vel = Vec3::ZERO;
+                (Vec3::new(1.0, 0.0, 0.0) - self.up * self.up.x).normalized()
+            }
+        }
+    }
+
+    /// Put the car flat on its wheels, yaw-only. The model has no suspension or
+    /// auto-roll, so a car that lands badly (inverted, or sideways off a wall)
+    /// is simply set back on the ground rather than left to settle.
+    fn snap_upright(&mut self) {
+        let h = self.forward.xz();
+        self.forward = if h.length_squared() > 1e-12 {
+            h.normalized()
+        } else {
+            Vec3::new(0.0, 0.0, 1.0)
+        };
+        self.up = Vec3::UP;
+        self.ang_vel = Vec3::ZERO;
+    }
+
+    /// Resolve the car against the arena surface, after its position has been
+    /// integrated. The car is a box, but the contact is treated as a point at
+    /// its centre held `CAR_HALF_HEIGHT` off the surface - enough for driving on
+    /// the flat parts and around the rounded joins.
+    ///
+    /// A grounded car is glued to whatever surface it is on. An airborne one
+    /// lands if it arrives wheels-down for that surface, and otherwise bounces.
+    fn resolve_arena(&mut self, arena: &Arena) {
+        let distance = arena.inside_distance(self.pos);
+        let normal = arena.normal_at(self.pos);
+        let penetration = distance + CAR_HALF_HEIGHT;
+
+        if !self.airborne {
+            // A surface can only push, never pull. An overhanging surface (the
+            // ceiling, and the upper part of the rim fillet) has its normal
+            // pointing away from gravity, so it cannot hold the car: the car
+            // stays only while it is fast enough, and otherwise peels off and
+            // falls. Everywhere else the car is simply glued on.
+            let overhanging = normal.y < 0.0;
+            let glued =
+                penetration > -CAR_SURFACE_SNAP && !(overhanging && self.speed() < CAR_STICK_SPEED);
+            if glued {
+                // Sit exactly on the surface and remove any normal drift, so a
+                // curved surface never accumulates a gap or a penetration.
+                self.pos += normal * penetration;
+                let vn = self.velocity.dot(normal);
+                self.velocity -= normal * vn;
+                return;
+            }
+            // Overhanging and too slow, or drifted well clear: fall.
+            self.airborne = true;
         }
 
-        let ceiling = arena.height - CAR_HALF_HEIGHT;
-        if self.pos.y > ceiling {
-            self.pos.y = ceiling;
-            self.velocity.y = self.velocity.y.min(0.0);
+        if penetration <= 0.0 {
+            return;
+        }
+
+        // Airborne contact: push out of the surface first.
+        self.pos += normal * penetration;
+        let vn = self.velocity.dot(normal);
+        if vn >= 0.0 {
+            return;
+        }
+
+        if self.up.dot(normal) > 0.5 {
+            // Arriving wheels-down for this surface: land on it.
+            self.airborne = false;
+            self.align_up_to(normal);
+            self.velocity -= normal * self.velocity.dot(normal);
+        } else {
+            // Sideways or inverted: bounce. If it is the floor, also snap
+            // upright so the car can land properly next time.
+            self.velocity -= normal * ((1.0 + CAR_SURFACE_RESTITUTION) * vn);
+            if normal.y > 0.5 {
+                self.snap_upright();
+            }
         }
     }
 
@@ -663,32 +804,6 @@ impl Car {
         let spin = self.ang_vel.length();
         if spin > CAR_MAX_ANG_SPEED {
             self.ang_vel = self.ang_vel * (CAR_MAX_ANG_SPEED / spin);
-        }
-    }
-
-    fn collide_walls(&mut self, arena: &Arena) {
-        // Footprint of the oriented box projected onto the world axes.
-        let f = self.forward;
-        let r = self.right();
-        let half_x = f.x.abs() * CAR_HALF_LENGTH + r.x.abs() * CAR_HALF_WIDTH;
-        let half_z = f.z.abs() * CAR_HALF_LENGTH + r.z.abs() * CAR_HALF_WIDTH;
-
-        let limit_x = arena.half_x - half_x;
-        if self.pos.x > limit_x {
-            self.pos.x = limit_x;
-            self.velocity.x = self.velocity.x.min(0.0);
-        } else if self.pos.x < -limit_x {
-            self.pos.x = -limit_x;
-            self.velocity.x = self.velocity.x.max(0.0);
-        }
-
-        let limit_z = arena.half_z - half_z;
-        if self.pos.z > limit_z {
-            self.pos.z = limit_z;
-            self.velocity.z = self.velocity.z.min(0.0);
-        } else if self.pos.z < -limit_z {
-            self.pos.z = -limit_z;
-            self.velocity.z = self.velocity.z.max(0.0);
         }
     }
 

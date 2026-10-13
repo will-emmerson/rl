@@ -2,7 +2,7 @@
 //!
 //! The model is real rigid-body physics for a single sphere, just written out
 //! by hand: gravity, Rocket League's linear drag, the Magnus force from spin,
-//! and impulse-based contact resolution against the arena planes with Coulomb
+//! and impulse-based contact resolution against the arena surface with Coulomb
 //! friction that is allowed to convert sliding into spin. That friction term
 //! is what gives you curve off the wall and "pinch" behaviour, and because we
 //! control it directly it is reproducible rather than emergent.
@@ -99,38 +99,41 @@ impl Ball {
     }
 
     pub fn collide_arena(&mut self, arena: &Arena) {
-        for plane in arena.planes() {
-            self.resolve_plane(&plane);
-        }
-    }
-
-    /// Resolve one plane contact, touching both linear and angular state.
-    fn resolve_plane(&mut self, plane: &crate::arena::Plane) {
-        let distance = plane.distance(self.pos);
-        let penetration = self.radius - distance;
+        // The ball is a sphere, so a contact is just "the centre is closer to
+        // the surface than the radius", against whatever piece of the rounded
+        // enclosure is nearest.
+        let distance = arena.inside_distance(self.pos);
+        let penetration = self.radius + distance;
         if penetration <= 0.0 {
             return;
         }
+        let normal = arena.normal_at(self.pos);
+        self.resolve_surface(normal, penetration);
+    }
 
-        // Push out of the plane.
-        self.pos += plane.normal * penetration;
+    /// Resolve one surface contact, touching both linear and angular state.
+    /// `normal` points into the playable space, so the ball is pushed out along
+    /// it.
+    fn resolve_surface(&mut self, normal: Vec3, penetration: f64) {
+        // Push out of the surface.
+        self.pos += normal * penetration;
 
         // Vector from the ball's centre to the contact point.
-        let r = plane.normal * -self.radius;
+        let r = normal * -self.radius;
         // Velocity of the material point of the ball at the contact.
         let contact_vel = self.vel + self.spin.cross(r);
-        let vn = contact_vel.dot(plane.normal);
+        let vn = contact_vel.dot(normal);
         if vn >= 0.0 {
             return; // Already separating.
         }
 
-        // Normal impulse. The plane is immovable, so only the ball's mass
+        // Normal impulse. The surface is immovable, so only the ball's mass
         // enters the reduced mass.
         let jn = -(1.0 + BALL_WALL_RESTITUTION) * vn * self.mass;
-        self.vel += plane.normal * (jn / self.mass);
+        self.vel += normal * (jn / self.mass);
 
         // Tangential (friction) impulse, clamped by Coulomb's law.
-        let tangent_vel = contact_vel - plane.normal * vn;
+        let tangent_vel = contact_vel - normal * vn;
         let tangent_speed = tangent_vel.length();
         if tangent_speed <= 1e-9 {
             return;

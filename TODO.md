@@ -19,8 +19,8 @@
   - get the ball moving properly
 - port the rest of the car handling from RocketSim:
   - suspension and tyre slip, so the turn radii are more than a bicycle-model
-    approximation
-  - auto-roll / staying upright on landing, so wall driving becomes possible
+    approximation, and so wall driving is a wheel model rather than "glue the
+    car to the surface"
 - start comparing our physics with the real game by looking at replay files:
   - I should be able to produce some replay files doing really simpler things like:
     - driving forward, reversing, to make sure acceleration is correct
@@ -32,6 +32,14 @@
 
 # DONE
 
+- curved arena + wall/ceiling driving: the arena is a signed-distance field (a
+  box with chamfered vertical corners and filleted floor/wall and wall/ceiling
+  joins), and the car drives in the frame of whatever surface it is on, so it
+  can drive up the walls, across the ceiling and fall back off. Radii are
+  gameplay guesses, not RocketSim figures. The viewer draws the collision
+  surface itself, with a 2 m / 10 m grid so the corners can be eyeballed, and
+  builds the chase-camera boom in the car's own frame so ball cam keeps tracking
+  the ball on a wall.
 - boost pads: the 34 Soccar pads (6 big / 28 small) at RocketSim's positions,
   with RL's amounts and cooldowns; the car takes one by driving over it.
 - ported flips and air control from RocketSim (`_UpdateAirTorque` /

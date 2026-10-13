@@ -13,8 +13,12 @@
 use std::f32::consts::PI;
 
 use bevy::app::AppExit;
+use bevy::asset::RenderAssetUsages;
+use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::gamepad::{RawGamepadAxisChangedEvent, RawGamepadButtonChangedEvent};
+use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::prelude::*;
+use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
 use rl::ball::BALL_RADIUS;
@@ -25,6 +29,20 @@ use rl::{Input as SimInput, World as SimWorld};
 const ARENA_HALF_X: f32 = 40.96;
 const ARENA_HALF_Z: f32 = 51.20;
 const ARENA_HEIGHT: f32 = 20.48;
+
+/// World size of one tile of the arena grid texture, in metres. Inside a tile
+/// the minor lines are spaced `GRID_TILE / GRID_CELLS` apart, and the tile border
+/// is a heavier major line, so the surfaces read as a 2 m grid with a 10 m major
+/// grid - enough to eyeball distances and the curve of the arena corners.
+const GRID_TILE: f32 = 10.0;
+const GRID_CELLS: u32 = 5;
+/// Texture resolution per tile, and the pixels per minor cell.
+const GRID_TEXELS: u32 = 500;
+const GRID_CELL_PX: u32 = GRID_TEXELS / GRID_CELLS;
+/// Size of one quad of the collision-surface mesh, in metres. Small enough to
+/// render the fillets smoothly; the grid lines come from the texture, not the
+/// mesh, so this does not set the grid spacing.
+const ARENA_MESH_CELL: f32 = 1.0;
 
 /// The camera never gets closer to a wall than this.
 const CAMERA_WALL_MARGIN: f32 = 0.8;
@@ -158,91 +176,36 @@ fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
     mut materials: ResMut<Assets<StandardMaterial>>,
+    mut images: ResMut<Assets<Image>>,
     sim: Res<Sim>,
 ) {
     // --- arena ---
+    // The arena is drawn as its actual collision surface: a mesh found by
+    // walking the arena SDF out from its centre, so the chamfered corners and
+    // filleted joins the car drives on are exactly what you see. A repeating
+    // grid texture makes the curve - and the scale - readable. (Vertex colours
+    // pick out the pitch green from the grey walls.)
     commands.spawn((
-        Mesh3d(
-            meshes.add(
-                Plane3d::default()
-                    .mesh()
-                    .size(ARENA_HALF_X * 2.0, ARENA_HALF_Z * 2.0),
-            ),
-        ),
+        Mesh3d(meshes.add(arena_surface_mesh())),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.17, 0.40, 0.29),
-            perceptual_roughness: 0.9,
-            ..default()
-        })),
-    ));
-
-    let wall_material = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.55, 0.58, 0.65),
-        perceptual_roughness: 0.7,
-        ..default()
-    });
-    // Walls are 1 m thick, pushed back so their inner faces sit exactly on the
-    // simulation's bounds.
-    for (half_x, half_y, half_z, x, y, z) in [
-        (
-            ARENA_HALF_X,
-            ARENA_HEIGHT / 2.0,
-            0.5,
-            0.0,
-            ARENA_HEIGHT / 2.0,
-            -ARENA_HALF_Z - 0.5,
-        ),
-        (
-            ARENA_HALF_X,
-            ARENA_HEIGHT / 2.0,
-            0.5,
-            0.0,
-            ARENA_HEIGHT / 2.0,
-            ARENA_HALF_Z + 0.5,
-        ),
-        (
-            0.5,
-            ARENA_HEIGHT / 2.0,
-            ARENA_HALF_Z,
-            -ARENA_HALF_X - 0.5,
-            ARENA_HEIGHT / 2.0,
-            0.0,
-        ),
-        (
-            0.5,
-            ARENA_HEIGHT / 2.0,
-            ARENA_HALF_Z,
-            ARENA_HALF_X + 0.5,
-            ARENA_HEIGHT / 2.0,
-            0.0,
-        ),
-    ] {
-        commands.spawn((
-            Mesh3d(meshes.add(Cuboid::new(half_x * 2.0, half_y * 2.0, half_z * 2.0))),
-            MeshMaterial3d(wall_material.clone()),
-            Transform::from_xyz(x, y, z),
-        ));
-    }
-
-    // Translucent ceiling, so a lofted ball reads as "up there" rather than
-    // vanishing off the top of the screen.
-    commands.spawn((
-        Mesh3d(meshes.add(Cuboid::new(ARENA_HALF_X * 2.0, 0.5, ARENA_HALF_Z * 2.0))),
-        MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgba(0.6, 0.75, 0.92, 0.10),
-            alpha_mode: AlphaMode::Blend,
+            base_color: Color::WHITE,
+            base_color_texture: Some(images.add(arena_grid_texture())),
+            perceptual_roughness: 0.85,
+            // The camera sits inside the shell, so render both sides rather than
+            // relying on the mesh winding.
             cull_mode: None,
             ..default()
         })),
-        Transform::from_xyz(0.0, ARENA_HEIGHT + 0.25, 0.0),
     ));
 
     // --- ball ---
+    // A football (truncated icosahedron): the black pentagons are what make the
+    // spin readable, and it reads as a ball rather than a wireframe globe.
     commands.spawn((
-        Mesh3d(meshes.add(Sphere::new(BALL_RADIUS as f32).mesh().uv(32, 18))),
+        Mesh3d(meshes.add(soccer_ball_mesh(BALL_RADIUS as f32))),
         MeshMaterial3d(materials.add(StandardMaterial {
-            base_color: Color::srgb(0.95, 0.96, 0.99),
-            perceptual_roughness: 0.25,
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.35,
             ..default()
         })),
         Transform::default(),
@@ -366,6 +329,397 @@ fn setup_scene(
         children![TextSpan::new(""), TextSpan::new("")],
         HudText,
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Arena surface and grid
+// ---------------------------------------------------------------------------
+
+/// One face of the arena's bounding box, used to seed the surface rays.
+struct BoxFace {
+    origin: Vec3,
+    u_dir: Vec3,
+    v_dir: Vec3,
+    u_len: f32,
+    v_len: f32,
+    nu: u32,
+    nv: u32,
+}
+
+/// The arena's collision surface as a single triangle mesh, with the grid UV and
+/// the pitch-vs-wall colour baked into the vertices.
+///
+/// Every vertex is placed by casting a ray from the arena centre through a point
+/// on the bounding box and bisecting the SDF to the surface. The shape is convex,
+/// so that is a clean one-to-one map onto the exact surface the car collides
+/// with - including the chamfered vertical corners and the filleted joins.
+fn arena_surface_mesh() -> Mesh {
+    let arena = rl::Arena::default();
+    let half_x = arena.half_x as f32;
+    let half_z = arena.half_z as f32;
+    let height = arena.height as f32;
+    let centre = Vec3::new(0.0, height * 0.5, 0.0);
+
+    let cell = ARENA_MESH_CELL;
+    let nx = (2.0 * half_x / cell).round().max(1.0) as u32;
+    let nz = (2.0 * half_z / cell).round().max(1.0) as u32;
+    let ny = (height / cell).round().max(1.0) as u32;
+
+    // Floor, ceiling, then the four walls. The subdivision of each shared edge
+    // matches (same lengths along the same axes), so the pieces line up.
+    let faces = [
+        BoxFace {
+            origin: Vec3::new(-half_x, 0.0, -half_z),
+            u_dir: Vec3::X,
+            v_dir: Vec3::Z,
+            u_len: 2.0 * half_x,
+            v_len: 2.0 * half_z,
+            nu: nx,
+            nv: nz,
+        },
+        BoxFace {
+            origin: Vec3::new(-half_x, height, -half_z),
+            u_dir: Vec3::X,
+            v_dir: Vec3::Z,
+            u_len: 2.0 * half_x,
+            v_len: 2.0 * half_z,
+            nu: nx,
+            nv: nz,
+        },
+        BoxFace {
+            origin: Vec3::new(half_x, 0.0, -half_z),
+            u_dir: Vec3::Z,
+            v_dir: Vec3::Y,
+            u_len: 2.0 * half_z,
+            v_len: height,
+            nu: nz,
+            nv: ny,
+        },
+        BoxFace {
+            origin: Vec3::new(-half_x, 0.0, -half_z),
+            u_dir: Vec3::Z,
+            v_dir: Vec3::Y,
+            u_len: 2.0 * half_z,
+            v_len: height,
+            nu: nz,
+            nv: ny,
+        },
+        BoxFace {
+            origin: Vec3::new(-half_x, 0.0, half_z),
+            u_dir: Vec3::X,
+            v_dir: Vec3::Y,
+            u_len: 2.0 * half_x,
+            v_len: height,
+            nu: nx,
+            nv: ny,
+        },
+        BoxFace {
+            origin: Vec3::new(-half_x, 0.0, -half_z),
+            u_dir: Vec3::X,
+            v_dir: Vec3::Y,
+            u_len: 2.0 * half_x,
+            v_len: height,
+            nu: nx,
+            nv: ny,
+        },
+    ];
+
+    let floor_color = linear_rgba(0.17, 0.40, 0.29);
+    let wall_color = linear_rgba(0.60, 0.63, 0.70);
+
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut colors = Vec::new();
+    let mut uvs = Vec::new();
+    let mut indices = Vec::new();
+
+    for face in &faces {
+        let base = positions.len() as u32;
+        for j in 0..=face.nv {
+            for i in 0..=face.nu {
+                let u = face.u_len * i as f32 / face.nu as f32;
+                let v = face.v_len * j as f32 / face.nv as f32;
+                let box_point = face.origin + face.u_dir * u + face.v_dir * v;
+                let surface = project_to_surface(&arena, centre, (box_point - centre).normalize());
+                positions.push(surface.to_array());
+
+                let n = arena.normal_at(rl::Vec3::new(
+                    surface.x as f64,
+                    surface.y as f64,
+                    surface.z as f64,
+                ));
+                normals.push([n.x as f32, n.y as f32, n.z as f32]);
+
+                // Green where the surface faces up (the pitch and its base
+                // fillet), grey on the walls and ceiling.
+                let t = ((n.y as f32 - 0.3) / 0.5).clamp(0.0, 1.0);
+                colors.push(lerp_rgba(wall_color, floor_color, t));
+
+                // Grid UVs in world units, so the texture tiles at a fixed
+                // scale no matter which face it is on.
+                uvs.push([
+                    box_point.dot(face.u_dir) / GRID_TILE,
+                    box_point.dot(face.v_dir) / GRID_TILE,
+                ]);
+            }
+        }
+        let row = face.nu + 1;
+        for j in 0..face.nv {
+            for i in 0..face.nu {
+                let a = base + j * row + i;
+                let b = a + 1;
+                let c = a + row;
+                let d = c + 1;
+                indices.extend_from_slice(&[a, b, c, b, d, c]);
+            }
+        }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// March a ray from inside the arena out to the collision surface. The surface
+/// lies inside the bounding box, so any point past the box corner is outside;
+/// the shape is convex, so a plain bisection finds the crossing.
+fn project_to_surface(arena: &rl::Arena, centre: Vec3, direction: Vec3) -> Vec3 {
+    // Longer than the distance from the centre to any box corner (~66 m).
+    const OUTSIDE: f32 = 80.0;
+    let mut lo = 0.0_f32;
+    let mut hi = OUTSIDE;
+    for _ in 0..30 {
+        let mid = 0.5 * (lo + hi);
+        let p = centre + direction * mid;
+        let d = arena.inside_distance(rl::Vec3::new(p.x as f64, p.y as f64, p.z as f64));
+        if d < 0.0 {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    centre + direction * (0.5 * (lo + hi))
+}
+
+/// A repeating grid: white background (so the vertex colour shows through) with a
+/// darker minor line every `GRID_TILE / GRID_CELLS` metres and a heavier major
+/// line on the tile border.
+fn arena_grid_texture() -> Image {
+    let size = GRID_TEXELS as usize;
+    let cell = GRID_CELL_PX as usize;
+    let mut data = vec![0u8; size * size * 4];
+    for y in 0..size {
+        for x in 0..size {
+            let major = x < 3 || y < 3 || x + 3 >= size || y + 3 >= size;
+            let minor = x % cell < 2 || y % cell < 2;
+            let value = if major {
+                55
+            } else if minor {
+                196
+            } else {
+                255
+            };
+            let i = (y * size + x) * 4;
+            data[i] = value;
+            data[i + 1] = value;
+            data[i + 2] = value;
+            data[i + 3] = 255;
+        }
+    }
+    let mut image = Image::new(
+        Extent3d {
+            width: GRID_TEXELS,
+            height: GRID_TEXELS,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        data,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..default()
+    });
+    image
+}
+
+/// A football: the truncated icosahedron - 12 black pentagons and 20 white
+/// hexagons - inscribed at `radius`. The panels are what make the ball's spin
+/// readable, and this reads as a ball rather than a wireframe globe.
+///
+/// The construction is the textbook one: cut every vertex of an icosahedron a
+/// third of the way along each incident edge. Each cut vertex leaves a pentagon,
+/// and what is left of each triangular face is a hexagon. The corner points are
+/// shared, so each panel is emitted as its own fan of triangles with its own
+/// colour.
+fn soccer_ball_mesh(radius: f32) -> Mesh {
+    let phi = (1.0 + 5.0_f32.sqrt()) * 0.5;
+    let raw = [
+        Vec3::new(-1.0, phi, 0.0),
+        Vec3::new(1.0, phi, 0.0),
+        Vec3::new(-1.0, -phi, 0.0),
+        Vec3::new(1.0, -phi, 0.0),
+        Vec3::new(0.0, -1.0, phi),
+        Vec3::new(0.0, 1.0, phi),
+        Vec3::new(0.0, -1.0, -phi),
+        Vec3::new(0.0, 1.0, -phi),
+        Vec3::new(phi, 0.0, -1.0),
+        Vec3::new(phi, 0.0, 1.0),
+        Vec3::new(-phi, 0.0, -1.0),
+        Vec3::new(-phi, 0.0, 1.0),
+    ];
+    let v: Vec<Vec3> = raw.iter().map(|p| p.normalize()).collect();
+
+    // The icosahedron's edge is its shortest vertex-to-vertex distance, so two
+    // vertices are neighbours exactly when they are that far apart.
+    let mut edge = f32::MAX;
+    for i in 0..v.len() {
+        for j in i + 1..v.len() {
+            edge = edge.min(v[i].distance(v[j]));
+        }
+    }
+    let adjacent = |i: usize, j: usize| (v[i].distance(v[j]) - edge).abs() < 1e-4;
+
+    // The point a third of the way from `i` towards its neighbour `j`.
+    let cut = |i: usize, j: usize| v[i] + (v[j] - v[i]) / 3.0;
+
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut colors = Vec::new();
+    let mut indices = Vec::new();
+    let black = linear_rgba(0.06, 0.06, 0.07);
+    let white = linear_rgba(0.95, 0.96, 0.99);
+
+    // Pentagons: one per icosahedron vertex, its five corners the cuts towards
+    // that vertex's five neighbours, sorted into a ring.
+    for i in 0..v.len() {
+        let n = v[i];
+        let seed = if n.x.abs() < 0.9 { Vec3::X } else { Vec3::Y };
+        let t1 = (seed - n * seed.dot(n)).normalize();
+        let t2 = n.cross(t1);
+        let angle = |p: Vec3| p.dot(t2).atan2(p.dot(t1));
+        let mut corners: Vec<Vec3> = (0..v.len())
+            .filter(|&j| j != i && adjacent(i, j))
+            .map(|j| cut(i, j))
+            .collect();
+        corners.sort_by(|a, b| angle(*a).total_cmp(&angle(*b)));
+        push_panel(
+            &corners,
+            black,
+            &mut positions,
+            &mut normals,
+            &mut colors,
+            &mut indices,
+        );
+    }
+
+    // Hexagons: one per icosahedron face, its six corners the two cuts on each
+    // of the face's three edges, in ring order.
+    for i in 0..v.len() {
+        for j in i + 1..v.len() {
+            if !adjacent(i, j) {
+                continue;
+            }
+            for k in j + 1..v.len() {
+                if adjacent(i, k) && adjacent(j, k) {
+                    let corners = [
+                        cut(i, j),
+                        cut(j, i),
+                        cut(j, k),
+                        cut(k, j),
+                        cut(k, i),
+                        cut(i, k),
+                    ];
+                    push_panel(
+                        &corners,
+                        white,
+                        &mut positions,
+                        &mut normals,
+                        &mut colors,
+                        &mut indices,
+                    );
+                }
+            }
+        }
+    }
+
+    // Put the corners on the requested radius.
+    let max_r = positions
+        .iter()
+        .fold(0.0_f32, |m, p| m.max(Vec3::new(p[0], p[1], p[2]).length()));
+    let scale = radius / max_r;
+    for p in &mut positions {
+        p[0] *= scale;
+        p[1] *= scale;
+        p[2] *= scale;
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// Append one convex panel as a triangle fan, in `color`. The ring is wound so
+/// its front face points outwards, and the normals are radial, so the ball still
+/// shades smoothly across the panel seams.
+fn push_panel(
+    points: &[Vec3],
+    color: [f32; 4],
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    colors: &mut Vec<[f32; 4]>,
+    indices: &mut Vec<u32>,
+) {
+    let mut face_normal = Vec3::ZERO;
+    let mut centroid = Vec3::ZERO;
+    for k in 0..points.len() {
+        face_normal += points[k].cross(points[(k + 1) % points.len()]);
+        centroid += points[k];
+    }
+    let ring: Vec<Vec3> = if face_normal.dot(centroid) >= 0.0 {
+        points.to_vec()
+    } else {
+        points.iter().rev().copied().collect()
+    };
+
+    let base = positions.len() as u32;
+    for p in &ring {
+        positions.push(p.to_array());
+        normals.push(p.normalize().to_array());
+        colors.push(color);
+    }
+    for k in 1..ring.len() - 1 {
+        indices.extend_from_slice(&[base, base + k as u32, base + k as u32 + 1]);
+    }
+}
+
+/// An sRGB colour as a linear `[f32; 4]`, for a vertex colour attribute.
+fn linear_rgba(r: f32, g: f32, b: f32) -> [f32; 4] {
+    let c = Color::srgb(r, g, b).to_linear();
+    [c.red, c.green, c.blue, c.alpha]
+}
+
+/// Per-component linear-space blend, `t = 0` giving `a` and `t = 1` giving `b`.
+fn lerp_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
+    [
+        a[0] + (b[0] - a[0]) * t,
+        a[1] + (b[1] - a[1]) * t,
+        a[2] + (b[2] - a[2]) * t,
+        a[3] + (b[3] - a[3]) * t,
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -659,8 +1013,8 @@ fn clamp_inside(p: Vec3, margin: f32) -> Vec3 {
 
 /// How much of the segment `from -> to` stays inside the arena, as a fraction.
 ///
-/// Assumes `from` is already inside, in which case the arena being a box means
-/// this is just clipping against three axis-aligned slabs. The result is where
+/// Assumes `from` is already inside, in which case the arena's bounding box
+/// makes this just clipping against three axis-aligned slabs. The result is where
 /// a camera on a boom from `from` towards `to` would hit a wall.
 fn free_fraction(from: Vec3, to: Vec3, margin: f32) -> f32 {
     let min = [-ARENA_HALF_X + margin, margin, -ARENA_HALF_Z + margin];
@@ -747,20 +1101,39 @@ fn camera_resting_pitch(ball_cam: bool) -> f32 {
 
 /// The camera's offsets from the car: where it sits (`boom`) and the point it
 /// looks at (`aim`), from a yaw offset (`look_yaw_offset`) and an orbit angle
-/// (`pitch`, in radians above the horizontal).
+/// (`pitch`, in radians above the car's own up axis).
 ///
-/// At zero yaw and the resting pitch, `boom` is exactly
-/// `-forward * CAMERA_DISTANCE + Y * CAMERA_HEIGHT` and `aim` is
-/// `Y * CAMERA_AIM_HEIGHT`, so the resting view is unchanged. Yaw swings the boom
-/// horizontally around the car; pitch orbits it vertically, so the camera rises
-/// towards a top-down view (or drops flat) while `aim` stays on the car - which
-/// is what keeps the car in frame instead of aiming into the ground.
-fn camera_frame(forward: Vec3, yaw: f32, pitch: f32) -> (Vec3, Vec3) {
-    let back = Quat::from_rotation_y(yaw) * -forward;
+/// The boom is built in the car's own frame - rotated about the car's `up` axis
+/// and lifted along it - so the camera follows the car onto a wall and the
+/// ceiling instead of collapsing to "straight below" once the forward axis goes
+/// vertical. On the ground `up` is world up, which is exactly the old behaviour:
+/// at zero yaw and the resting pitch, `boom` is `-forward * CAMERA_DISTANCE +
+/// up * CAMERA_HEIGHT` and `aim` is `up * CAMERA_AIM_HEIGHT`.
+fn camera_frame(forward: Vec3, up: Vec3, yaw: f32, pitch: f32) -> (Vec3, Vec3) {
+    let back = Quat::from_axis_angle(up, yaw) * -forward;
     let radius = (CAMERA_DISTANCE * CAMERA_DISTANCE + CAMERA_HEIGHT * CAMERA_HEIGHT).sqrt();
-    let boom = back * (radius * pitch.cos()) + Vec3::Y * (radius * pitch.sin());
-    let aim = Vec3::Y * CAMERA_AIM_HEIGHT;
+    let boom = back * (radius * pitch.cos()) + up * (radius * pitch.sin());
+    let aim = up * CAMERA_AIM_HEIGHT;
     (boom, aim)
+}
+
+/// Signed yaw, about the car's `up` axis, from the car's forward to the ball -
+/// the angle ball cam swings the boom to put the ball behind the car, and hence
+/// in front of the camera.
+///
+/// The bearing is measured in the car's *tangent plane* (the surface it is on),
+/// which is the horizontal plane on the ground and the wall plane on a wall. That
+/// is what keeps ball cam working once the car's forward goes vertical: a purely
+/// horizontal bearing would be degenerate on a wall. Returns `0` when the ball is
+/// (nearly) directly above/below the car's up axis, where there is no bearing to
+/// speak of.
+fn ball_bearing(forward: Vec3, up: Vec3, to_ball: Vec3) -> f32 {
+    let flat = to_ball - up * to_ball.dot(up);
+    if flat.length_squared() <= 0.25 {
+        return 0.0;
+    }
+    let n = flat.normalize();
+    up.dot(forward.cross(n)).atan2(forward.dot(n))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -775,10 +1148,30 @@ fn chase_camera(
     mut behind_last: Local<bool>,
 ) {
     let car = sim.0.car.pos;
-    let heading = sim.0.car.heading();
     let ball = sim.0.ball.pos;
 
-    let forward = Vec3::new(heading.x as f32, 0.0, heading.z as f32).normalize_or_zero();
+    // Follow the car's *full* forward axis, not just its horizontal part, so the
+    // camera trails it up a wall and over onto the ceiling. On the flat ground the
+    // two are the same, because a grounded car's forward is horizontal.
+    let forward = Vec3::new(
+        sim.0.car.forward.x as f32,
+        sim.0.car.forward.y as f32,
+        sim.0.car.forward.z as f32,
+    )
+    .normalize_or_zero();
+    // The car's up axis is the surface normal on the ground, a wall's normal on a
+    // wall, and straight down on the ceiling. That is the frame the camera boom
+    // is built in (see `camera_frame`).
+    let car_up = Vec3::new(
+        sim.0.car.up.x as f32,
+        sim.0.car.up.y as f32,
+        sim.0.car.up.z as f32,
+    );
+    let car_up = if car_up.length_squared() > 0.5 {
+        car_up.normalize()
+    } else {
+        Vec3::Y
+    };
     let car_pos = Vec3::new(car.x as f32, car.y as f32, car.z as f32);
     let ball_pos = Vec3::new(ball.x as f32, ball.y as f32, ball.z as f32);
 
@@ -797,11 +1190,9 @@ fn chase_camera(
     // In ball cam the boom orbits to the far side of the car from the ball, so
     // the camera looks *through* the car at the ball and the car stays in the
     // lower frame. Car cam keeps the boom straight behind the car.
-    let to_ball = (ball_pos - car_pos).with_y(0.0);
-    let ball_yaw = if ball_cam.0 && to_ball.length_squared() > 0.25 {
-        let n = to_ball.normalize();
-        // Signed yaw from the car heading to the ball, about +Y.
-        (forward.z * n.x - forward.x * n.z).atan2(forward.x * n.x + forward.z * n.z)
+    let to_ball = ball_pos - car_pos;
+    let ball_yaw = if ball_cam.0 {
+        ball_bearing(forward, car_up, to_ball)
     } else {
         0.0
     };
@@ -821,6 +1212,7 @@ fn chase_camera(
     *look_yaw += delta * smooth;
     let (boom, aim_offset) = camera_frame(
         forward,
+        car_up,
         *look_yaw,
         pitch_for_look(camera_resting_pitch(ball_cam.0), look_y as f32),
     );
@@ -830,7 +1222,7 @@ fn chase_camera(
     // clamping put the camera on top of the car, which is what made it feel
     // stuck. Clipping a boom from the car finds the farthest position that is
     // actually clear.
-    let pivot = clamp_inside(car_pos + Vec3::Y * 1.2, CAMERA_WALL_MARGIN);
+    let pivot = clamp_inside(car_pos + car_up * 1.2, CAMERA_WALL_MARGIN);
     let wanted = car_pos + boom;
     let reach = free_fraction(pivot, wanted, CAMERA_WALL_MARGIN);
     let mut desired = pivot.lerp(wanted, reach);
@@ -842,7 +1234,7 @@ fn chase_camera(
         // usually facing the middle — stepping that way puts the car behind the
         // camera. Sideways rather than straight up because `look_at` then has
         // no usable up vector.
-        let side = Vec3::new(forward.z, 0.0, -forward.x);
+        let side = car_up.cross(forward).normalize_or_zero();
         let step = if wall_clearance(car_pos + side * CAMERA_SQUEEZE_INSET)
             >= wall_clearance(car_pos - side * CAMERA_SQUEEZE_INSET)
         {
@@ -850,7 +1242,7 @@ fn chase_camera(
         } else {
             -side
         };
-        let escape = car_pos + Vec3::Y * CAMERA_SQUEEZE_HEIGHT + step * CAMERA_SQUEEZE_INSET;
+        let escape = car_pos + car_up * CAMERA_SQUEEZE_HEIGHT + step * CAMERA_SQUEEZE_INSET;
         desired = desired.lerp(escape, squeeze);
     }
 
@@ -893,13 +1285,15 @@ fn chase_camera(
     };
     for mut transform in &mut query {
         transform.translation = transform.translation.lerp(desired, weight);
-        // Directly overhead, world up is parallel to the view direction and
-        // `look_at` has no valid basis. The car's forward is a sane stand-in.
+        // Directly overhead - or, on a wall, directly below - world up is
+        // parallel to the view direction and `look_at` has no valid basis. Fall
+        // back to the car's own up axis, which stays horizontal on a wall.
         let to_aim = aim - transform.translation;
-        let up = if to_aim.with_y(0.0).length() >= 0.5 {
+        let view = to_aim.normalize_or_zero();
+        let up = if view.cross(Vec3::Y).length() > 0.2 {
             Vec3::Y
-        } else if forward.length_squared() > 0.5 {
-            forward
+        } else if view.cross(car_up).length() > 0.2 {
+            car_up
         } else {
             Vec3::X
         };
@@ -1018,7 +1412,7 @@ mod tests {
         // `-forward * CAMERA_DISTANCE + Y * CAMERA_HEIGHT`, and the aim sits
         // CAMERA_AIM_HEIGHT above the car.
         let forward = Vec3::new(0.0, 0.0, 1.0);
-        let (boom, aim) = camera_frame(forward, 0.0, resting_pitch());
+        let (boom, aim) = camera_frame(forward, Vec3::Y, 0.0, resting_pitch());
         let expected = -forward * CAMERA_DISTANCE + Vec3::Y * CAMERA_HEIGHT;
         assert!((boom - expected).length() < 1e-5, "boom {boom:?}");
         assert!(
@@ -1031,10 +1425,15 @@ mod tests {
     fn look_yaw_swings_the_camera_around_the_car() {
         let forward = Vec3::new(0.0, 0.0, 1.0);
         let radius = (CAMERA_DISTANCE * CAMERA_DISTANCE + CAMERA_HEIGHT * CAMERA_HEIGHT).sqrt();
-        let (resting, _) = camera_frame(forward, 0.0, resting_pitch());
+        let (resting, _) = camera_frame(forward, Vec3::Y, 0.0, resting_pitch());
 
         for look_x in [-1.0, -0.5, 0.5, 1.0] {
-            let (swung, _) = camera_frame(forward, look_yaw_offset(look_x, false), resting_pitch());
+            let (swung, _) = camera_frame(
+                forward,
+                Vec3::Y,
+                look_yaw_offset(look_x, false),
+                resting_pitch(),
+            );
             assert!(
                 (swung.length() - radius).abs() < 1e-4,
                 "look_x {look_x}: distance {} vs {radius}",
@@ -1050,13 +1449,23 @@ mod tests {
     #[test]
     fn look_behind_swings_the_camera_to_the_front_of_the_car() {
         let forward = Vec3::new(0.0, 0.0, 1.0);
-        let (resting, _) = camera_frame(forward, look_yaw_offset(0.0, false), resting_pitch());
+        let (resting, _) = camera_frame(
+            forward,
+            Vec3::Y,
+            look_yaw_offset(0.0, false),
+            resting_pitch(),
+        );
         assert!(
             resting.z < 0.0,
             "the resting boom sits behind the car: {resting:?}"
         );
 
-        let (behind, _) = camera_frame(forward, look_yaw_offset(0.0, true), resting_pitch());
+        let (behind, _) = camera_frame(
+            forward,
+            Vec3::Y,
+            look_yaw_offset(0.0, true),
+            resting_pitch(),
+        );
         assert!(behind.z > 0.0, "look-behind must cross the car: {behind:?}");
     }
 
@@ -1067,9 +1476,14 @@ mod tests {
         // the car, so it can never stare past it into the ground.
         let forward = Vec3::new(0.0, 0.0, 1.0);
         let height = |look_y: f32| {
-            camera_frame(forward, 0.0, pitch_for_look(resting_pitch(), look_y))
-                .0
-                .y
+            camera_frame(
+                forward,
+                Vec3::Y,
+                0.0,
+                pitch_for_look(resting_pitch(), look_y),
+            )
+            .0
+            .y
         };
 
         assert!(
@@ -1097,12 +1511,57 @@ mod tests {
         // Throughout the range the aim sits just above the car, never down at the
         // ground.
         for look_y in [-1.0, -0.5, 0.0, 0.5, 1.0] {
-            let (_, aim) = camera_frame(forward, 0.0, pitch_for_look(resting_pitch(), look_y));
+            let (_, aim) = camera_frame(
+                forward,
+                Vec3::Y,
+                0.0,
+                pitch_for_look(resting_pitch(), look_y),
+            );
             assert!(
                 (aim - Vec3::Y * CAMERA_AIM_HEIGHT).length() < 1e-6,
                 "aim drifted off the car at look_y {look_y}: {aim:?}"
             );
         }
+    }
+
+    #[test]
+    fn the_boom_is_built_in_the_cars_own_frame() {
+        // On a wall the car's forward is vertical and its up is horizontal. The
+        // boom must lie in the wall plane - lifted off the wall along the car's
+        // up - rather than collapsing to "straight down", which is what let ball
+        // cam track the ball on a wall.
+        let forward = Vec3::new(0.0, 1.0, 0.0); // up the +X wall
+        let up = Vec3::new(-1.0, 0.0, 0.0); // wall normal, into the arena
+        let (boom, aim) = camera_frame(forward, up, 0.0, resting_pitch());
+        assert!(boom.y < -1.0, "boom should sit down the wall: {boom:?}");
+        assert!(boom.x < -1.0, "boom should lift off the wall: {boom:?}");
+        assert!(boom.z.abs() < 1e-4, "boom left the wall plane: {boom:?}");
+        assert!(
+            (aim - up * CAMERA_AIM_HEIGHT).length() < 1e-5,
+            "aim {aim:?}"
+        );
+    }
+
+    #[test]
+    fn ball_bearing_tracks_the_ball_on_a_wall() {
+        let forward = Vec3::new(0.0, 1.0, 0.0);
+        let up = Vec3::new(-1.0, 0.0, 0.0);
+        // Ball 10 m down the wall from the car: a solid bearing, not zero.
+        let bearing = ball_bearing(forward, up, Vec3::new(0.0, 0.0, -10.0));
+        assert!(bearing.abs() > 0.5, "bearing {bearing}");
+        // Directly off the wall (along the car's up) there is no bearing.
+        assert_eq!(ball_bearing(forward, up, Vec3::new(-10.0, 0.0, 0.0)), 0.0);
+
+        // On the ground it matches the old horizontal formula exactly.
+        let g_forward = Vec3::new(0.0, 0.0, 1.0);
+        let n = Vec3::new(1.0, 0.0, 0.0);
+        let expected =
+            (g_forward.z * n.x - g_forward.x * n.z).atan2(g_forward.x * n.x + g_forward.z * n.z);
+        let got = ball_bearing(g_forward, Vec3::Y, Vec3::new(10.0, 3.0, 0.0));
+        assert!(
+            (got - expected).abs() < 1e-6,
+            "got {got}, expected {expected}"
+        );
     }
 
     #[test]

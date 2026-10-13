@@ -26,7 +26,8 @@ Start with `docs/PHYSICS.md` (why hand-rolled, and its honest caveats) and
 client-side prediction and replays can work. Inside the simulation step:
 
 - **No transcendentals.** `sin`/`cos`/`tan`/`powf`/`exp`/`ln` call platform libm
-  and are not portable across machines. Rotation goes through `math::rotate_y`.
+  and are not portable across machines. Rotation goes through `math::rotate_y`
+  and `math::rotate_about`.
   Otherwise only `+ - * /` and `sqrt`.
 - **No `mul_add`/FMA** — contraction is a real source of cross-target drift.
 - **No RNG, threads, wall-clock, or unordered-map iteration.**
@@ -58,8 +59,9 @@ The car's _handling_ is now largely ported from RocketSim: steering uses RL's
 (`CAR_AIR_CONTROL_TORQUE`), and flips/dodges (`_UpdateDoubleJumpOrFlip`). What is
 _not_ reverse-engineered is the tyre grip (`CAR_GRIP_KEEP` / `CAR_DRIFT_KEEP`) and
 the engine/brake forces (`CAR_ENGINE_ACCEL`, `CAR_BRAKE_DECEL`); suspension, tyre
-slip and auto-roll are not modelled at all (a flipped car is snapped upright on
-landing, so wall driving does not work yet).
+slip and auto-roll are still not modelled. Wall and ceiling driving works anyway,
+via a rounded-arena SDF plus a "glue the car to the surface it is on" model (see
+`Car::step_grounded` / `resolve_arena`) — not RL's wheel model.
 
 ## Build / run / validate
 
@@ -116,3 +118,19 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
 - **Attitude:** the car carries `forward` and `up` (orthonormal), integrated from
   `ang_vel` and re-orthonormalised every step. If you touch that, keep it
   orthonormal and hash every new field, or divergence hides.
+- **Arena is an SDF, not planes.** `Arena::inside_distance` is negative inside;
+  `Arena::normal_at` returns the _inward_ normal (the direction to push an object
+  out). It is a `max` of rounded terms, so its magnitude is only exact near a
+  surface — good enough for contacts, but do not lean on it as a true distance
+  far from the walls. `CORNER_RADIUS` / `FLOOR_FILLET` are gameplay guesses, not
+  RocketSim figures. The viewer draws the arena by ray-projecting this same SDF
+  (`arena_surface_mesh` in `view/src/main.rs`), so the drawn surface and the
+  collision surface stay in sync automatically.
+- **A surface can only push.** A grounded car is glued on _except_ on an
+  overhanging surface (`normal.y < 0`: the ceiling and the upper fillet), where
+  gravity would peel it off, so it stays only above `CAR_STICK_SPEED`. Do not
+  "fix" a car parked on the ceiling — that it falls off is the point.
+- **Grounded car = glued to the surface.** `step_grounded` runs in the surface's
+  own frame and `align_up_to` rotates both attitude _and velocity_ onto the new
+  normal, which is what carries speed around the floor→wall→ceiling joins. Use
+  `rotate_about` / the cross-dot rotation there, never `acos`.

@@ -10,8 +10,8 @@ hold up, so this document separates what's true from what isn't.
 A general 3D engine earns its keep on: broadphase, hierarchical contact
 generation, constraint solvers, stacking stability, joints, sleeping, CCD.
 
-This game has **one sphere, one box, and six planes**. There is no stacking, no
-joints, no chains. Broadphase is a no-op. So ~95% of what the engine provides
+This game has **one sphere, one box, and a rounded arena**. There is no stacking,
+no joints, no chains. Broadphase is a no-op. So ~95% of what the engine provides
 goes unused, and what remains is maybe 300 lines of arithmetic you can read in
 one sitting.
 
@@ -177,13 +177,13 @@ does and doesn't mean:
 
 ## Model summary
 
-| Piece    | Model                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Arena    | 6 static planes, sequential resolution, 81.92 x 102.40 x 20.48 m (RocketSim `ARENA_EXTENT_X/Y`, `ARENA_HEIGHT`); a box, not RL's collision mesh                                                                                                                                                                                                                                                                                                |
-| Ball     | Sphere, `r = 0.9125`, `m = 30`. Gravity, Bullet-style linear drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin. Speed and spin are hard-capped at 60 m/s and 6 rad/s                                                                                                                                                                                                                                        |
-| Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.205 x 0.867 x 0.387 (real Octane, per RocketSim), `m = 180`. Steering from RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model (`omega = v * tan(steer) / wheelbase`); analog powerslide; boost meter; jump = immediate impulse + held force, then a double jump _or_ a flip; full 3D air attitude with air control; total speed clamped to 23 m/s, angular speed to 5.5 rad/s |
-| Boost    | 34 pads (6 big, 28 small) at RL's positions; big gives 100 boost / 10 s cooldown, small 12 / 4 s. Taken by driving over a pad near the floor                                                                                                                                                                                                                                                                                                   |
-| Car-ball | Sphere vs OBB closest-point, inelastic impulse (`e = 0`) with relative velocity at contact (car rotation included), plus Rocket League's extra hit impulse, equal-and-opposite reaction                                                                                                                                                                                                                                                        |
+| Piece    | Model                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Arena    | Rounded box as a signed-distance field (chamfered vertical corners, filleted wall/floor and wall/ceiling joins), 81.92 x 102.40 x 20.48 m (RocketSim `ARENA_EXTENT_X/Y`, `ARENA_HEIGHT`); not RL's collision mesh                                                                                                                                                                                                                                                                                                                                                            |
+| Ball     | Sphere, `r = 0.9125`, `m = 30`. Gravity, Bullet-style linear drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin. Speed and spin are hard-capped at 60 m/s and 6 rad/s                                                                                                                                                                                                                                                                                                                                                                      |
+| Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.205 x 0.867 x 0.387 (real Octane, per RocketSim), `m = 180`. Steering from RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model (`omega = v * tan(steer) / wheelbase`); analog powerslide; boost meter; jump = immediate impulse + held force, then a double jump _or_ a flip; full 3D air attitude with air control; total speed clamped to 23 m/s, angular speed to 5.5 rad/s. The driving model runs in the current _surface's_ frame, so the car drives on the floor, up the walls and across the ceiling |
+| Boost    | 34 pads (6 big, 28 small) at RL's positions; big gives 100 boost / 10 s cooldown, small 12 / 4 s. Taken by driving over a pad near the floor                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Car-ball | Sphere vs OBB closest-point, inelastic impulse (`e = 0`) with relative velocity at contact (car rotation included), plus Rocket League's extra hit impulse, equal-and-opposite reaction                                                                                                                                                                                                                                                                                                                                                                                      |
 
 Constants are community-sourced Rocket League figures converted to SI, now
 sourced from RocketSim rather than memory. They are still _approximations_ of a
@@ -205,7 +205,9 @@ doc comments next to each one (`arena.rs`, `ball.rs`, `car.rs`).
 What that changed:
 
 - **Arena.** Was 80 x 50 x 12 m; the real Soccar pitch is 81.92 x 102.40 x
-  20.48 m. The old field was less than half its proper length.
+  20.48 m. The old field was less than half its proper length. Its sharp box
+  corners have since been rounded into an SDF so the car can drive up the walls
+  and onto the ceiling.
 - **Ball.** Radius 0.93 -> 0.9125 (the _collision_ radius), restitution 0.62 ->
   0.6, friction 0.45 -> 0.35, mass 1.5 -> 30 (a sixth of the car). Drag switched
   from an ad-hoc quadratic term to Rocket League's `linearDamping = 0.03`,
@@ -243,8 +245,10 @@ What that changed:
 
 What is still approximate, deliberately:
 
-- **The arena is a box.** RL collides against a mesh with chamfered corners and
-  a domed ceiling. The extents match; the shape does not.
+- **The arena is a rounded box.** RL collides against a mesh with chamfered
+  corners and a domed ceiling. The extents match and the joins are now filleted
+  (which is what lets the car drive onto the ceiling), but the ceiling is flat
+  rather than domed, and the rounding radii are gameplay guesses, not RL figures.
 - **The Magnus force is ours, not RL's.** RocketSim/Bullet gives a spinning
   sphere no aerodynamic force; RL balls do curve, so this is kept as a small
   deliberate extra. Rocket League also caps ball spin at 6 rad/s, which bounds
@@ -254,14 +258,10 @@ What is still approximate, deliberately:
   RL's real steer curve and wheelbase, but a two-wheel approximation of a
   four-wheel vehicle that ignores slip, so the radii are a good first cut rather
   than exactly RL's. Tyre grip and the engine/brake forces are still tuned.
-- **The car is bespoke, and the vehicle is a bicycle model.** RL drives a
-  `btRaycastVehicle` with four wheels, suspension and tyre slip. Steering uses
-  RL's real steer curve and wheelbase, but a two-wheel approximation of a
-  four-wheel vehicle that ignores slip, so the radii are a good first cut rather
-  than exactly RL's. Tyre grip and the engine/brake forces are still tuned.
-- **Attitude is free in the air, snapped upright on landing.** Our car has no
-  suspension or auto-roll, so whatever way up a flipped car lands, it is set back
-  to a yaw-only attitude. Wall/ceiling driving therefore does not work yet.
+- **Attitude is free in the air.** Our car has no suspension or auto-roll, so a
+  car that lands badly (inverted, or sideways off a wall) is set back to a
+  yaw-only attitude rather than settling. Wall and ceiling driving does work, but
+  through the point-contact, glue-to-the-surface model below, not RL's wheels.
 - **The world frame is left-handed.** The body frame here is `(forward, right,
 up)` with right = `forward x up`, which is left-handed, whereas RL's is
   right-handed. The air-control and flip torque _axes_ were therefore derived to
@@ -294,11 +294,41 @@ Small surface area, but the choices are deliberate:
   drive RL's angular-acceleration torque with damping, so a jump can be aimed or
   turned into a shot. Boost and the (small) air throttle still work.
 
+## Driving on walls and the ceiling
+
+A signature mechanic, and the one that most obviously needs more than a box and a
+ground plane:
+
+- **The arena is an SDF, and its joins are rounded.** `Arena::inside_distance`
+  is the `max` of a rounded pillar (the walls, vertical corners chamfered) and a
+  filleted floor and ceiling. `Arena::normal_at` is the (inward) gradient, so the
+  normal turns continuously from up to sideways to down as the car crosses a
+  join: no face to wedge against, and no discontinuity to bump over.
+- **A grounded car is glued to its surface.** `Car::step_grounded` runs the whole
+  driving model in the surface's own frame: `up` is the surface normal, the steer
+  axis is that normal (so turning works on a wall just as on the floor), and
+  gravity only counts along the slope - none on the floor or ceiling, a full pull
+  down a vertical wall. `Car::align_up_to` rotates the car _and its velocity_
+  onto the new normal at each join, so speed carries from the floor up a wall and
+  over onto the ceiling rather than stopping dead.
+- **Landing is orientation-aware.** Arriving wheels-down for a surface lands on
+  it; arriving sideways or inverted bounces (`CAR_SURFACE_RESTITUTION`), and on
+  the floor it snaps the car back upright so it can settle.
+- **Overhanging surfaces cannot hold the car.** A surface can only push, never
+  pull, so on the ceiling (and the upper part of the rim fillet) gravity would
+  peel the car off. It stays only while it is moving faster than
+  `CAR_STICK_SPEED` (a floor or a wall has no such requirement), so coasting on
+  the roof sheds speed and drops the car back down.
+- **What is simplified.** The contact is a point at the car's centre held
+  `CAR_HALF_HEIGHT` off the surface, not four wheels, so there is no suspension
+  or tyre model pushing the car into a wall. The floor-to-wall transition leans
+  on the small `FLOOR_FILLET` at the base rather than a wheel catching the wall,
+  and the wheels do not visually rotate.
+
 ## Not implemented yet
 
-Wall/ceiling driving (a signature mechanic, and a real change to the car model),
-car-car collisions, demolitions, goals and kickoff, multiple cars, and the actual
-network layer.
+Car-car collisions, demolitions, goals and kickoff, multiple cars, and the
+actual network layer.
 
 The useful next step for the determinism story is a _parity harness_: record
 input streams plus state hashes from a reference build, then assert them in CI.
