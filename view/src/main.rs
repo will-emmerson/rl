@@ -34,9 +34,7 @@ const CAMERA_HEIGHT: f32 = 2.6;
 /// Where the camera escapes to when a wall blocks the chase position.
 const CAMERA_SQUEEZE_HEIGHT: f32 = 5.0;
 const CAMERA_SQUEEZE_INSET: f32 = 2.5;
-/// How far the aim point may lean from the car towards the ball, and how high
-/// above the car it sits.
-const CAMERA_AIM_LEAN: f32 = 6.0;
+/// How high above the car the straight-ahead car-cam aim point sits.
 const CAMERA_AIM_HEIGHT: f32 = 0.6;
 /// How far left/right the look control swivels the camera, in radians.
 const CAMERA_LOOK_YAW: f32 = 1.5;
@@ -49,6 +47,10 @@ const CAMERA_LOOK_PITCH: f32 = 0.9;
 /// the car in frame - the view can never tip past the car into the ground.
 const CAMERA_PITCH_MIN: f32 = 0.10;
 const CAMERA_PITCH_MAX: f32 = 1.35;
+/// Ball cam sits *lower* than car cam (a shallow orbit angle): looking out at a
+/// far ball from a high boom drops the near car off the bottom of the view, so
+/// ball cam uses a low boom that keeps both the car and the ball in frame.
+const CAMERA_BALL_PITCH: f32 = 0.20;
 /// Vertical look is inverted: pushing the stick up looks down (and so raises the
 /// camera into the overview). Flip to `false` for the standard mapping.
 const CAMERA_LOOK_INVERT_Y: bool = true;
@@ -82,6 +84,12 @@ enum Mode {
 /// `GamepadButton` / `GamepadAxis` each physical control produces.
 #[derive(Resource, Default)]
 struct GamepadDebug(bool);
+
+/// Ball cam toggle. On (the default, as in Rocket League) the chase aim leans
+/// toward the ball; off it looks straight ahead along the car. Toggled with `Y`
+/// on the pad or `C` on the keyboard.
+#[derive(Resource)]
+struct BallCam(bool);
 
 #[derive(Component)]
 enum Vis {
@@ -121,12 +129,14 @@ fn main() {
         .insert_resource(Sim(SimWorld::new()))
         .insert_resource(mode)
         .insert_resource(GamepadDebug(gamepad_debug))
+        .insert_resource(BallCam(true))
         .insert_resource(Time::<Fixed>::from_hz(rl::TICK_HZ as f64))
         .add_systems(Startup, setup_scene)
         .add_systems(FixedUpdate, step_simulation)
         .add_systems(
             Update,
             (
+                toggle_camera_mode,
                 reset_on_key,
                 report_gamepads,
                 report_gamepad_events,
@@ -428,6 +438,13 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
     // keyboard's full-on. Button layout matches Rocket League: A jumps, B boosts
     // and X is the handbrake. The pad's *stick* axes carry steer and air pitch
     // (throttle is the triggers), which is how RL binds it.
+    //
+    // NOTE: a driver-default (unmapped) X-Box pad gets gilrs' built-in mapping,
+    // where evdev's `BTN_NORTH`/`BTN_WEST` are the aliases of `BTN_X`/`BTN_Y`.
+    // So the *physical X* button arrives as `North` and the *physical Y* as
+    // `West`. Drift is therefore `North` (physical X, as the README says) and
+    // the camera toggle is `West` (physical Y). On an SDL-mapped pad these two
+    // are the other way round.
     let (pad_throttle, pad_steer, pad_pitch, pad_boost, pad_drift, pad_jump) = match gamepad {
         Some(pad) => (
             trigger(pad, GamepadAxis::RightZ, GamepadButton::RightTrigger2)
@@ -438,7 +455,7 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
             // up, so the sign flips.
             -pad.get(GamepadAxis::LeftStickY).unwrap_or(0.0) as f64,
             pad.get(GamepadButton::East).unwrap_or(0.0) > 0.5,
-            pad.get(GamepadButton::West).unwrap_or(0.0) > 0.5,
+            pad.get(GamepadButton::North).unwrap_or(0.0) > 0.5,
             pad.get(GamepadButton::South).unwrap_or(0.0) > 0.5,
         ),
         None => (0.0, 0.0, 0.0, false, false, false),
@@ -560,6 +577,21 @@ fn capture_input(tick: u64) -> SimInput {
         SimInput::new(-1.0, 0.0, false, false, false)
     } else {
         SimInput::new(0.0, 0.0, false, false, false)
+    }
+}
+
+/// `Y` on the pad (or `C`) toggles between ball cam and straight-ahead car cam.
+/// `West` is the *physical Y* button on a driver-default pad - see `read_input`.
+fn toggle_camera_mode(
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    mut ball_cam: ResMut<BallCam>,
+) {
+    let pad_toggle = gamepads
+        .iter()
+        .any(|pad| pad.just_pressed(GamepadButton::West));
+    if pad_toggle || keys.just_pressed(KeyCode::KeyC) {
+        ball_cam.0 = !ball_cam.0;
     }
 }
 
@@ -698,9 +730,19 @@ fn resting_pitch() -> f32 {
 
 /// The orbit angle for an (already inverted) vertical look input, clamped to the
 /// safe range. Push up raises the camera towards a top-down view; pull down
-/// lowers it towards a flat one.
-fn pitch_for_look(look_y: f32) -> f32 {
-    (resting_pitch() - look_y * CAMERA_LOOK_PITCH).clamp(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX)
+/// lowers it towards a flat one. `base` is the resting angle for the mode
+/// (`resting_pitch` for car cam, `CAMERA_BALL_PITCH` for ball cam).
+fn pitch_for_look(base: f32, look_y: f32) -> f32 {
+    (base - look_y * CAMERA_LOOK_PITCH).clamp(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX)
+}
+
+/// The camera's resting orbit angle for the current mode.
+fn camera_resting_pitch(ball_cam: bool) -> f32 {
+    if ball_cam {
+        CAMERA_BALL_PITCH
+    } else {
+        resting_pitch()
+    }
 }
 
 /// The camera's offsets from the car: where it sits (`boom`) and the point it
@@ -721,10 +763,12 @@ fn camera_frame(forward: Vec3, yaw: f32, pitch: f32) -> (Vec3, Vec3) {
     (boom, aim)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn chase_camera(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
     sim: Res<Sim>,
+    ball_cam: Res<BallCam>,
     time: Res<Time>,
     mut query: Query<&mut Transform, With<ChaseCam>>,
     mut look_yaw: Local<f32>,
@@ -750,15 +794,36 @@ fn chase_camera(
     *behind_last = behind;
     let snap = behind != was_behind;
 
-    // Smooth the look *angle*, not the camera position: easing the angle swings
-    // the camera *around* the car rather than cutting through it.
+    // In ball cam the boom orbits to the far side of the car from the ball, so
+    // the camera looks *through* the car at the ball and the car stays in the
+    // lower frame. Car cam keeps the boom straight behind the car.
+    let to_ball = (ball_pos - car_pos).with_y(0.0);
+    let ball_yaw = if ball_cam.0 && to_ball.length_squared() > 0.25 {
+        let n = to_ball.normalize();
+        // Signed yaw from the car heading to the ball, about +Y.
+        (forward.z * n.x - forward.x * n.z).atan2(forward.x * n.x + forward.z * n.z)
+    } else {
+        0.0
+    };
+
+    // Smooth the yaw *angle*, not the camera position: easing the angle swings
+    // the camera *around* the car rather than cutting through it. Ease by the
+    // shortest way round, so the ball passing behind the car does not spin the
+    // camera the long way.
     let smooth = if snap {
         1.0
     } else {
         1.0 - (-CAMERA_LOOK_RESPONSE * time.delta_secs()).exp()
     };
-    *look_yaw += (look_yaw_offset(look_x, behind) - *look_yaw) * smooth;
-    let (boom, aim_offset) = camera_frame(forward, *look_yaw, pitch_for_look(look_y as f32));
+    let target_yaw = look_yaw_offset(look_x, behind) + ball_yaw;
+    let mut delta = target_yaw - *look_yaw;
+    delta = (delta + PI).rem_euclid(std::f32::consts::TAU) - PI;
+    *look_yaw += delta * smooth;
+    let (boom, aim_offset) = camera_frame(
+        forward,
+        *look_yaw,
+        pitch_for_look(camera_resting_pitch(ball_cam.0), look_y as f32),
+    );
 
     // Pull the camera in along the line of sight rather than clamping it to
     // the wall plane. A car backed against a wall has *no* room behind it, and
@@ -793,27 +858,31 @@ fn chase_camera(
     // interpolation can never leave the arena. The clamp is belt and braces.
     let desired = clamp_inside(desired, CAMERA_WALL_MARGIN);
 
-    // Lean the aim towards the ball normally, square up on the car when the
-    // camera has been forced overhead, and square up while the player is looking
-    // around, so a swivel keeps the car centred rather than dragging the aim back
-    // towards the ball.
+    // Where the camera looks. Ball cam frames the ball; car cam (or while the
+    // look controls are in use, or once a wall has pushed the camera overhead)
+    // squares up on the car, so a swivel keeps the car centred instead of
+    // dragging the aim off toward the ball.
     //
-    // This is a clamped offset from the car, not a weighted average of the two
-    // positions. Blending the raw positions lets the aim point drift behind the
-    // camera whenever the ball is, and the camera then stares at the floor with
-    // the car somewhere off screen.
-    // Looking behind always keeps the car centred, whatever the stick is doing.
+    // This is an absolute aim point, not a weighted average of the car and ball
+    // positions: blending the raw positions lets the aim drift behind the camera
+    // whenever the ball is, and the camera then stares at the floor with the car
+    // off screen.
     let look_amount = if behind {
         1.0
     } else {
         (look_x.abs().max(look_y.abs()) as f32).clamp(0.0, 1.0)
     };
-    let lean_factor = 0.35 * (1.0 - squeeze) * (1.0 - look_amount);
-    let lean = (ball_pos - car_pos)
-        .with_y(0.0)
-        .clamp_length_max(CAMERA_AIM_LEAN)
-        * lean_factor;
-    let aim = car_pos + lean + aim_offset;
+    // Ball cam frames the ball (the car sits between the camera and the ball);
+    // car cam, look-behind, a swivel, or a wall squeeze square up on the car.
+    let frame_ball = ball_cam.0 && !behind && squeeze < 0.001 && look_amount < 0.5;
+    let car_aim = car_pos + aim_offset;
+    let aim = if frame_ball {
+        // Aim at the ball so it stays framed; the low ball-cam boom keeps the
+        // car in the bottom of the view.
+        ball_pos
+    } else {
+        car_aim
+    };
 
     // Ease the camera into place to damp jitter, except on a look-behind flip,
     // where the whole point is to jump straight to the other side of the car.
@@ -843,15 +912,21 @@ fn wall_clearance(p: Vec3) -> f32 {
     (ARENA_HALF_X - p.x.abs()).min(ARENA_HALF_Z - p.z.abs())
 }
 
-fn update_hud(sim: Res<Sim>, hud: Single<Entity, With<HudText>>, mut writer: TextUiWriter) {
+fn update_hud(
+    sim: Res<Sim>,
+    ball_cam: Res<BallCam>,
+    hud: Single<Entity, With<HudText>>,
+    mut writer: TextUiWriter,
+) {
     let entity = *hud;
     let car = &sim.0.car;
     let ball = &sim.0.ball;
     *writer.text(entity, 1) = format!(
-        "speed {:>5.1} m/s   boost {:>5.1}   tick {:>6}\n",
+        "speed {:>5.1} m/s   boost {:>5.1}   tick {:>6}   cam {}\n",
         car.speed(),
         car.boost,
-        sim.0.tick
+        sim.0.tick,
+        if ball_cam.0 { "ball" } else { "car" }
     );
     *writer.text(entity, 2) = format!(
         "ball {:>5.1} m/s   height {:>5.2} m   spin {:>5.1} rad/s\n",
@@ -991,7 +1066,11 @@ mod tests {
         // top-down view; pull down drops it flatter. Either way the aim stays on
         // the car, so it can never stare past it into the ground.
         let forward = Vec3::new(0.0, 0.0, 1.0);
-        let height = |look_y: f32| camera_frame(forward, 0.0, pitch_for_look(look_y)).0.y;
+        let height = |look_y: f32| {
+            camera_frame(forward, 0.0, pitch_for_look(resting_pitch(), look_y))
+                .0
+                .y
+        };
 
         assert!(
             height(-1.0) > height(0.0),
@@ -1012,13 +1091,13 @@ mod tests {
             height(-5.0) > 0.0,
             "clamped push-up must stay above the car"
         );
-        assert!((pitch_for_look(-5.0) - CAMERA_PITCH_MAX).abs() < 1e-6);
-        assert!((pitch_for_look(5.0) - CAMERA_PITCH_MIN).abs() < 1e-6);
+        assert!((pitch_for_look(resting_pitch(), -5.0) - CAMERA_PITCH_MAX).abs() < 1e-6);
+        assert!((pitch_for_look(resting_pitch(), 5.0) - CAMERA_PITCH_MIN).abs() < 1e-6);
 
         // Throughout the range the aim sits just above the car, never down at the
         // ground.
         for look_y in [-1.0, -0.5, 0.0, 0.5, 1.0] {
-            let (_, aim) = camera_frame(forward, 0.0, pitch_for_look(look_y));
+            let (_, aim) = camera_frame(forward, 0.0, pitch_for_look(resting_pitch(), look_y));
             assert!(
                 (aim - Vec3::Y * CAMERA_AIM_HEIGHT).length() < 1e-6,
                 "aim drifted off the car at look_y {look_y}: {aim:?}"

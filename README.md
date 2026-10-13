@@ -30,6 +30,7 @@ dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 | `space`                   | `B`               | boost              |
 | `shift`                   | `X`               | drift (handbrake)  |
 | `Q` / `E`                 | hold `X` + stick  | air roll           |
+| `C`                       | `Y`               | camera (ball/car)  |
 | `R`                       | `start`           | reset car and ball |
 | `esc`                     | -                 | quit               |
 
@@ -47,8 +48,9 @@ clicking the right stick in (`R3`) looks behind you; everything springs back whe
 released. (If your pad reports nothing, see the gamepad section under "A note on
 Bevy's features" below.)
 
-The camera trails the car and leans its aim toward the ball. This needs a GPU
-and a window; it was developed on Vulkan.
+The camera trails the car and, in ball cam (the default), keeps the ball framed;
+`Y` (or `C`) switches to a straight-ahead car cam. This needs a GPU and a window;
+it was developed on Vulkan.
 
 ### From Zed
 
@@ -173,3 +175,10 @@ cargo run -p rl_view -- --gamepad-debug        # log every button/axis change li
 One thing the default mapping does that surprises people: it exposes the X-Box
 analogue triggers as the _axes_ `LeftZ`/`RightZ` (evdev ABS_Z/ABS_RZ), not as
 trigger buttons. The viewer reads either, so both mapped and unmapped pads work.
+
+A second surprise: evdev names the physical **X** button `BTN_NORTH` and the
+physical **Y** button `BTN_WEST` (those are aliases for `BTN_X`/`BTN_Y`), so on a
+driver-default pad the face buttons arrive swapped — the physical X as `North`
+and the physical Y as `West`. The viewer maps drift to `North` and the camera
+toggle to `West` so the _physical_ buttons match the table above (on an
+SDL-mapped pad the two would be the other way round).
