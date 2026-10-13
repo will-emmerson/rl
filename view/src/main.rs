@@ -14,9 +14,11 @@ use std::f32::consts::PI;
 
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
+use bevy::camera::Hdr;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::gamepad::{RawGamepadAxisChangedEvent, RawGamepadButtonChangedEvent};
 use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
@@ -120,7 +122,9 @@ struct BallCam(bool);
 enum Vis {
     Car,
     Ball,
-    /// A boost pad, indexed into `World::boost_pads`.
+    /// A boost pad's glowing part, indexed into `World::boost_pads`. Hidden while
+    /// the pad is on cooldown. The small pads' translucent base disc has no `Vis`
+    /// at all, so it stays on the pitch whether or not the boost is available.
     BoostPad(usize),
 }
 
@@ -240,31 +244,76 @@ fn setup_scene(
     // `sync_visuals`).
     let pad_big_mesh = meshes.add(Sphere::new(0.8).mesh().uv(24, 18));
     let pad_small_mesh = meshes.add(Cylinder::new(0.55, 0.08));
+    // The small pad is two pieces: a faint translucent disc (the part you can
+    // see the pitch grid through) plus a small opaque core that blooms. They have
+    // to be separate meshes because one material cannot be both - a surface that
+    // blooms is near-white and hides whatever is behind it, whatever its alpha.
+    // The core is opaque so it takes part in the opaque pass and the translucent
+    // disc then depth-tests and blends over it, leaving an annulus of see-through
+    // disc around a glowing middle.
+    let pad_small_core_mesh = meshes.add(Cylinder::new(0.22, 0.1));
     let pad_big_mat = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 0.72, 0.15, 0.55),
-        emissive: LinearRgba::rgb(0.35, 0.20, 0.0),
+        base_color: Color::srgba(1.0, 0.72, 0.15, 0.4),
+        // Emissive is what makes the orb glow: it is set well above the bloom
+        // threshold below, so the pad blooms where nothing lit does. The orb is
+        // blended, so the emissive has to be strong to survive `alpha < 1` and
+        // still throw a halo, while staying weak enough that the pitch shows
+        // through it.
+        emissive: LinearRgba::rgb(14.0, 9.5, 2.0),
+        alpha_mode: AlphaMode::Blend,
+        perceptual_roughness: 1.0,
+        // Both cap faces of the sphere are drawn, so the far wall of the orb
+        // shows through the near one and the sphere reads as a volume, not a
+        // flat disc.
+        cull_mode: None,
+        ..default()
+    });
+    let pad_small_mat = materials.add(StandardMaterial {
+        // Kept faint so it reads as translucent, with the pitch grid showing
+        // straight through it. All of the small pad's glow comes from the core
+        // below, not from here.
+        base_color: Color::srgba(1.0, 0.85, 0.28, 0.35),
+        emissive: LinearRgba::rgb(0.5, 0.36, 0.08),
         alpha_mode: AlphaMode::Blend,
         perceptual_roughness: 1.0,
         ..default()
     });
-    let pad_small_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.85, 0.25),
+    let pad_small_core_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.85, 0.45),
+        // Above the bloom threshold, so the core throws the halo the disc cannot.
+        // Kept modest on purpose: a hotter core washes the grid out of the ring.
+        emissive: LinearRgba::rgb(10.0, 6.7, 1.7),
         perceptual_roughness: 1.0,
         ..default()
     });
     for (i, pad) in sim.0.boost_pads.iter().enumerate() {
-        let (mesh, material, y) = if pad.is_big {
-            (pad_big_mesh.clone(), pad_big_mat.clone(), pad.pos.y as f32)
+        if pad.is_big {
+            // The orb *is* the pad, so the whole thing goes on cooldown.
+            commands.spawn((
+                Mesh3d(pad_big_mesh.clone()),
+                MeshMaterial3d(pad_big_mat.clone()),
+                Transform::from_xyz(pad.pos.x as f32, pad.pos.y as f32, pad.pos.z as f32),
+                Vis::BoostPad(i),
+            ));
         } else {
-            // Disc sits on the floor (half its height above y = 0).
-            (pad_small_mesh.clone(), pad_small_mat.clone(), 0.04)
-        };
-        commands.spawn((
-            Mesh3d(mesh),
-            MeshMaterial3d(material),
-            Transform::from_xyz(pad.pos.x as f32, y, pad.pos.z as f32),
-            Vis::BoostPad(i),
-        ));
+            // The translucent disc is permanent scenery: it carries no `Vis`, so
+            // `sync_visuals` never hides it and the marking stays put. Disc sits
+            // on the floor (half its height above y = 0).
+            commands.spawn((
+                Mesh3d(pad_small_mesh.clone()),
+                MeshMaterial3d(pad_small_mat.clone()),
+                Transform::from_xyz(pad.pos.x as f32, 0.04, pad.pos.z as f32),
+            ));
+            // Only the glow comes and goes. Poking just above the disc so it is
+            // not coplanar; shares the pad index, so `sync_visuals` hides it on
+            // cooldown.
+            commands.spawn((
+                Mesh3d(pad_small_core_mesh.clone()),
+                MeshMaterial3d(pad_small_core_mat.clone()),
+                Transform::from_xyz(pad.pos.x as f32, 0.05, pad.pos.z as f32),
+                Vis::BoostPad(i),
+            ));
+        }
     }
 
     // --- car ---
@@ -462,8 +511,34 @@ fn setup_scene(
     ));
 
     // --- camera ---
+    // HDR plus bloom, so the emissive boost pads glow.
+    //
+    // The prefilter threshold is the whole trick, and it has to sit *above*
+    // everything else in the scene. HDR linear values here are already exposure-
+    // scaled (the camera uses the default `Exposure`, EV100 9.7), so a lit white
+    // surface is only a couple of units - the ball peaks around 2-3 - while an
+    // unlit wall is well under 1. A threshold near 1 therefore caught the ball,
+    // the car body and the walls too, and the additive composite smeared the
+    // whole frame into a glow. At 6.0 only the big orbs clear it once blended
+    // (`alpha * emissive` is ~5.6, just inside the knee below); the small discs
+    // are held under the threshold on purpose so they stay translucent (see
+    // `pad_small_mat`). The soft knee reaches down to
+    // `threshold * (1 - softness)` = 3.0, still clear of the ball.
     commands.spawn((
         Camera3d::default(),
+        Hdr,
+        Bloom {
+            intensity: 0.4,
+            prefilter: BloomPrefilter {
+                threshold: 6.0,
+                threshold_softness: 0.5,
+            },
+            // Additive, so the pads *flare* rather than merely brighten. This is
+            // the recommended composite mode once a non-energy-conserving
+            // prefilter is used.
+            composite_mode: BloomCompositeMode::Additive,
+            ..Bloom::NATURAL
+        },
         Transform::from_xyz(0.0, 3.2, -22.0).looking_at(Vec3::new(0.0, 0.8, 0.0), Vec3::Y),
         ChaseCam,
     ));
@@ -1206,7 +1281,8 @@ fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis, &mut Visi
             }
             Vis::BoostPad(index) => {
                 let pad = &sim.0.boost_pads[*index];
-                // Hidden while on cooldown, so a taken pad leaves nothing behind.
+                // Hidden while on cooldown, so only the glow leaves when the pad
+                // is taken (the small pads' disc is not tagged, so it stays).
                 *visibility = if pad.available() {
                     Visibility::Inherited
                 } else {
