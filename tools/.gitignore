@@ -1,0 +1,7 @@
+# Large / machine-specific artefacts from running rlacd.py, and Python's cache;
+# none of it belongs in the repo.
+rl_dump.bin
+*.maps
+collision_meshes/
+__pycache__/
+*.pyc

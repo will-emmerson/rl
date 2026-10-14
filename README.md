@@ -1,15 +1,18 @@
 # rl
 
-A hand-rolled, deterministic Rocket League style physics simulation with two
-front ends: a dependency-free terminal demo, and a Bevy 3D viewer.
+A Rocket League-like game: a Bevy 3D viewer running
+**[RocketSim](https://github.com/ZealanL/RocketSim)** (the pure-Rust v3) for
+physics, plus `rl` — a hand-rolled, dependency-free Rocket League simulation kept
+as a deterministic reference and the terminal demo.
 
 ![rl_view in action](docs/screenshot.png)
 
-_The Bevy viewer at tick 251: the car driving into the ball mid-launch._
+_The Bevy viewer at tick 250: the car driving into the ball in front of the goal._
 
-See **[docs/PHYSICS.md](docs/PHYSICS.md)** for why the physics are hand-rolled
-rather than run on a general engine, plus honest caveats about determinism and
-performance.
+See **[docs/PHYSICS.md](docs/PHYSICS.md)** for the hand-rolled `rl` simulation —
+why it was written by hand, what it models, and honest caveats about determinism
+and performance. It is no longer the game's physics; see below for the current
+setup.
 
 ## Play it in 3D (Bevy)
 
@@ -20,6 +23,34 @@ cargo run --release -p rl_view   # smoother, but the first run rebuilds Bevy
 
 The dev profile is set up to be playable (this crate at `opt-level = 1`, all
 dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
+
+### RocketSim physics
+
+The viewer's physics come from
+**[RocketSim v3](https://github.com/ZealanL/RocketSim/tree/v3-rust)**, a
+pure-Rust rewrite of RocketSim, pinned in `view/Cargo.toml` to a git revision
+(it is not published on crates.io yet). RocketSim collides the ball against
+Rocket League's _actual_ arena mesh, loaded once from `./collision_meshes/` at
+startup, so the viewer needs those files to run:
+
+```sh
+# one-time: dump RL's arena collision meshes, then put the `.cmf` files in
+# RL/collision_meshes/soccar/ (next to the workspace root):
+#
+#   Linux / Proton:  sudo python3 tools/rlacd.py    # this repo's port; see the
+#                                                   # header of tools/rlacd.py
+#   Windows:         https://github.com/ZealanL/RLArenaCollisionDumper
+```
+
+Without them the viewer exits immediately with a message saying so. RocketSim
+reports positions in "uu" (1 uu = 1 cm, so /100 for metres), Z-up, `+X` forward;
+`view/src/sim.rs` rotates that into the viewer's Y-up frame and is the only place
+that knows about RocketSim. The drawn arena is RocketSim's own collision mesh, so
+the visible surface _is_ the surface you collide with.
+
+The hand-rolled `rl` crate is still in the workspace and still tested, but it is
+now only a reference: the viewer runs RocketSim and draws RocketSim's mesh. `rl`
+now supplies just a few cosmetic constants (ball/car mesh sizes, goal frame).
 
 | Key                       | Gamepad           | Action             |
 | ------------------------- | ----------------- | ------------------ |
@@ -55,22 +86,18 @@ straight-ahead car cam. The shell is a see-through cage, so a wall play is filme
 from outside it, through the wall. This needs a GPU and a window; it was developed
 on Vulkan.
 
-The arena is drawn as its actual collision surface, with a repeating 2 m grid
-(and a heavier 10 m major grid) on every face, so you can read distances and see
-the chamfered corners and the rounded wall-to-ceiling joins. Every face is drawn
-one-sided, facing inward, so from outside the shell reads as a cage you can see
-through — which is what lets the camera leave it (see above). Both ends carry a
-full-size Soccar goal — a 17.86 m × 6.43 m mouth cut into the end wall with a
-curved net scoop behind it (blue at -Z, orange at +Z) — and the ball scores when
-it crosses the line, with the score on the HUD. The recess's corners are rounded,
-so you can drive in at the bottom, ride the curved net up the back and back out
-over the lip. The ball is a proper
-football (black pentagons and white hexagons), so its spin reads, and the car is a
-sedan-shaped mesh sized to the Octane hitbox, with wheels that roll and steer. The
-collision box is unchanged: the roof sits on the hitbox ceiling, so a ball balanced
-on the car rests on the roof rather than on the lower bonnet. You can drive up the
-walls and across the ceiling — the surface only pushes, never pulls, so the ceiling
-will not hold you once you slow down.
+The arena is drawn straight from RocketSim's own collision mesh — the very
+geometry the ball and car collide with — so what you see is what you hit. A
+repeating 2 m grid (with a heavier 10 m major grid) is projected onto every
+surface so you can read distances, including the rounded wall-to-ceiling joins.
+Every face is drawn one-sided, facing inward, so from outside the shell reads as
+a cage you can see through — which is what lets the camera leave it (see above).
+Both ends carry a full-size Soccar goal, carved into the mesh, with the goal frame
+in team colours (blue at -Z, orange at +Z); the ball scores when it crosses the
+line, with the score on the HUD. The ball is a proper football (black pentagons
+and white hexagons), so its spin reads, and the car is a sedan-shaped mesh sized
+to the Octane hitbox, with wheels that roll and steer. You can drive up the walls
+and across the ceiling.
 
 ### From Zed
 

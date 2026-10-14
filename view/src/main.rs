@@ -28,7 +28,9 @@ use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 use rl::arena::{GOAL_HALF_WIDTH, GOAL_HEIGHT};
 use rl::ball::BALL_RADIUS;
 use rl::car::{CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH, CAR_WHEELBASE};
-use rl::{Input as SimInput, World as SimWorld};
+
+mod sim;
+use sim::Input as SimInput;
 
 /// Arena dimensions, matching `rl::Arena::default()`: the goal line, frame and net
 /// sit at `ARENA_HALF_Z`.
@@ -43,10 +45,6 @@ const GRID_CELLS: u32 = 5;
 /// Texture resolution per tile, and the pixels per minor cell.
 const GRID_TEXELS: u32 = 500;
 const GRID_CELL_PX: u32 = GRID_TEXELS / GRID_CELLS;
-/// Size of one quad of the collision-surface mesh, in metres. Small enough to
-/// render the fillets smoothly; the grid lines come from the texture, not the
-/// mesh, so this does not set the grid spacing.
-const ARENA_MESH_CELL: f32 = 1.0;
 
 /// Visual wheel radius, in metres. A fraction of the hitbox half height, so the
 /// tyre reaches the hitbox floor.
@@ -98,7 +96,7 @@ const CAMERA_LOOK_RESPONSE: f32 = 8.0;
 // ---------------------------------------------------------------------------
 
 #[derive(Resource)]
-struct Sim(SimWorld);
+struct Sim(sim::Sim);
 
 /// How the app was started.
 #[derive(Resource)]
@@ -233,7 +231,7 @@ fn main() {
 
     App::new()
         .add_plugins(DefaultPlugins)
-        .insert_resource(Sim(SimWorld::new()))
+        .insert_resource(Sim(sim::Sim::new()))
         .insert_resource(mode)
         .insert_resource(GamepadDebug(gamepad_debug))
         .insert_resource(BallCam(true))
@@ -320,22 +318,22 @@ fn setup_scene(
     mode: Res<Mode>,
 ) {
     // --- arena ---
-    // The arena is drawn as its actual collision surface: a mesh found by
-    // walking the arena SDF out from its centre, so the chamfered corners and
-    // filleted joins the car drives on are exactly what you see. A repeating
-    // grid texture makes the curve - and the scale - readable. (Vertex colours
-    // pick out the pitch green from the grey walls.)
+    // The arena is drawn from RocketSim's own collision mesh (`sim::
+    // arena_collision_mesh`), so the visible surface *is* the surface the ball
+    // and car collide with - the real RL arena, not an approximation. A
+    // repeating grid texture makes the scale readable, and vertex colours pick
+    // out the pitch green from the grey walls.
     commands.spawn((
         Mesh3d(meshes.add(arena_surface_mesh())),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::WHITE,
             base_color_texture: Some(images.add(arena_grid_texture())),
             perceptual_roughness: 0.85,
-            // The shell is a cage the camera can see through from outside: draw
-            // only the inward-facing side, so the camera may leave the arena (see
-            // `chase_camera`) and still watch the car through the wall. From
-            // inside that is the side you see; from outside the walls vanish.
-            cull_mode: Some(Face::Front),
+            // The shell is a cage the camera can see through from outside: the
+            // mesh is wound so its front faces inward, so back-face culling hides
+            // it from outside and the camera may leave the arena (see
+            // `chase_camera`) and still watch the car through the wall.
+            cull_mode: Some(Face::Back),
             ..default()
         })),
     ));
@@ -402,13 +400,14 @@ fn setup_scene(
         perceptual_roughness: 1.0,
         ..default()
     });
-    for (i, pad) in sim.0.boost_pads.iter().enumerate() {
+    for i in 0..sim.0.num_pads() {
+        let pad = sim.0.pad(i);
         if pad.is_big {
             // The orb *is* the pad, so the whole thing goes on cooldown.
             commands.spawn((
                 Mesh3d(pad_big_mesh.clone()),
                 MeshMaterial3d(pad_big_mat.clone()),
-                Transform::from_xyz(pad.pos.x as f32, pad.pos.y as f32, pad.pos.z as f32),
+                Transform::from_xyz(pad.pos.x, pad.pos.y, pad.pos.z),
                 Vis::BoostPad(i),
             ));
         } else {
@@ -418,7 +417,7 @@ fn setup_scene(
             commands.spawn((
                 Mesh3d(pad_small_mesh.clone()),
                 MeshMaterial3d(pad_small_mat.clone()),
-                Transform::from_xyz(pad.pos.x as f32, 0.04, pad.pos.z as f32),
+                Transform::from_xyz(pad.pos.x, 0.04, pad.pos.z),
             ));
             // Only the glow comes and goes. Poking just above the disc so it is
             // not coplanar; shares the pad index, so `sync_visuals` hides it on
@@ -426,17 +425,17 @@ fn setup_scene(
             commands.spawn((
                 Mesh3d(pad_small_core_mesh.clone()),
                 MeshMaterial3d(pad_small_core_mat.clone()),
-                Transform::from_xyz(pad.pos.x as f32, 0.05, pad.pos.z as f32),
+                Transform::from_xyz(pad.pos.x, 0.05, pad.pos.z),
                 Vis::BoostPad(i),
             ));
         }
     }
 
     // --- goals ---
-    // Soccar goal recesses in the two end walls: a team-coloured frame (posts and
-    // crossbar) around the opening, with a translucent net filling the box behind
-    // it. Sizes come from `rl::arena`; see that module for the sources. The mouth
-    // in the drawn shell is cut out in `arena_surface_mesh`.
+    // A team-coloured frame (posts and crossbar) at each goal line. The recess
+    // behind it - the mouth and the net scoop - is part of RocketSim's collision
+    // mesh, so `arena_surface_mesh` already draws it; only the coloured frame is
+    // added here. Sizes come from `rl::arena`.
     let goal_frame_blue = materials.add(StandardMaterial {
         base_color: Color::srgb(0.20, 0.45, 0.95),
         emissive: LinearRgba::rgb(0.10, 0.22, 0.50),
@@ -447,14 +446,6 @@ fn setup_scene(
         base_color: Color::srgb(1.00, 0.45, 0.12),
         emissive: LinearRgba::rgb(0.50, 0.20, 0.04),
         perceptual_roughness: 0.5,
-        ..default()
-    });
-    let goal_net = materials.add(StandardMaterial {
-        base_color: Color::srgba(0.88, 0.92, 1.0, 0.16),
-        alpha_mode: AlphaMode::Blend,
-        // Seen from both sides: the camera is inside the goal as often as not.
-        cull_mode: None,
-        perceptual_roughness: 1.0,
         ..default()
     });
     let w = GOAL_HALF_WIDTH as f32;
@@ -474,12 +465,6 @@ fn setup_scene(
             Mesh3d(meshes.add(Cuboid::new(2.0 * w + 0.16, 0.16, 0.16))),
             MeshMaterial3d(frame.clone()),
             Transform::from_xyz(0.0, h, z_line),
-        ));
-        // Net: the curved scoop, swept across the width (see `goal_net_mesh`).
-        commands.spawn((
-            Mesh3d(meshes.add(goal_net_mesh(sign))),
-            MeshMaterial3d(goal_net.clone()),
-            Transform::default(),
         ));
     }
 
@@ -739,293 +724,82 @@ fn setup_scene(
 // Arena surface and grid
 // ---------------------------------------------------------------------------
 
-/// One face of the arena's bounding box, used to seed the surface rays.
-struct BoxFace {
-    origin: Vec3,
-    u_dir: Vec3,
-    v_dir: Vec3,
-    u_len: f32,
-    v_len: f32,
-    nu: u32,
-    nv: u32,
-    /// A goal end wall: quads inside the goal mouth are skipped, so the opening
-    /// is an actual hole rather than a dented surface.
-    hole: bool,
-    /// Emit this face with reversed winding. The box face seeds below otherwise
-    /// give whichever winding they happened to; the shell is now drawn one-sided
-    /// (`cull_mode: Some(Face::Front)`), so every face's front must point *out* of
-    /// the arena - the faces that come out facing in are flipped.
-    flip: bool,
-}
-
-/// The arena's collision surface as a single triangle mesh, with the grid UV and
-/// the pitch-vs-wall colour baked into the vertices.
+/// The arena's collision surface as a single triangle mesh, read straight from
+/// RocketSim (`sim::arena_collision_mesh`) - the same geometry RocketSim collides
+/// against, so the drawn surface and the collision surface are one and the same.
+/// A grid UV and the pitch-vs-wall colour are baked into the vertices.
 ///
-/// Every vertex is placed by casting a ray from the arena centre through a point
-/// on the bounding box and bisecting the SDF to the surface. The shape is convex,
-/// so that is a clean one-to-one map onto the exact surface the car collides
-/// with - including the chamfered vertical corners and the filleted joins.
+/// The source triangles have no guaranteed winding, so each is oriented here so
+/// its front face looks inward (toward the arena centre); the vertex normals are
+/// the area-weighted average of those, and the grid UV comes from projecting the
+/// vertex onto whichever axis plane it faces most directly.
 fn arena_surface_mesh() -> Mesh {
-    let arena = rl::Arena::default();
-    let half_x = arena.half_x as f32;
-    let half_z = arena.half_z as f32;
-    let height = arena.height as f32;
-    let centre = Vec3::new(0.0, height * 0.5, 0.0);
+    let (verts, tris) = sim::arena_collision_mesh();
 
-    let cell = ARENA_MESH_CELL;
-    let nx = (2.0 * half_x / cell).round().max(1.0) as u32;
-    let nz = (2.0 * half_z / cell).round().max(1.0) as u32;
-    let ny = (height / cell).round().max(1.0) as u32;
-
-    // Floor, ceiling, then the four walls. The subdivision of each shared edge
-    // matches (same lengths along the same axes), so the pieces line up. The two
-    // end walls carry `hole`, so the goal openings are cut from the surface.
-    let faces = [
-        BoxFace {
-            origin: Vec3::new(-half_x, 0.0, -half_z),
-            u_dir: Vec3::X,
-            v_dir: Vec3::Z,
-            u_len: 2.0 * half_x,
-            v_len: 2.0 * half_z,
-            nu: nx,
-            nv: nz,
-            hole: false,
-            flip: false,
-        },
-        BoxFace {
-            origin: Vec3::new(-half_x, height, -half_z),
-            u_dir: Vec3::X,
-            v_dir: Vec3::Z,
-            u_len: 2.0 * half_x,
-            v_len: 2.0 * half_z,
-            nu: nx,
-            nv: nz,
-            hole: false,
-            flip: true,
-        },
-        BoxFace {
-            origin: Vec3::new(half_x, 0.0, -half_z),
-            u_dir: Vec3::Z,
-            v_dir: Vec3::Y,
-            u_len: 2.0 * half_z,
-            v_len: height,
-            nu: nz,
-            nv: ny,
-            hole: false,
-            flip: true,
-        },
-        BoxFace {
-            origin: Vec3::new(-half_x, 0.0, -half_z),
-            u_dir: Vec3::Z,
-            v_dir: Vec3::Y,
-            u_len: 2.0 * half_z,
-            v_len: height,
-            nu: nz,
-            nv: ny,
-            hole: false,
-            flip: false,
-        },
-        BoxFace {
-            origin: Vec3::new(-half_x, 0.0, half_z),
-            u_dir: Vec3::X,
-            v_dir: Vec3::Y,
-            u_len: 2.0 * half_x,
-            v_len: height,
-            nu: nx,
-            nv: ny,
-            hole: true,
-            flip: false,
-        },
-        BoxFace {
-            origin: Vec3::new(-half_x, 0.0, -half_z),
-            u_dir: Vec3::X,
-            v_dir: Vec3::Y,
-            u_len: 2.0 * half_x,
-            v_len: height,
-            nu: nx,
-            nv: ny,
-            hole: true,
-            flip: true,
-        },
-    ];
+    // A point inside the shell, used to orient every face inward.
+    let mut lo = Vec3::splat(f32::MAX);
+    let mut hi = Vec3::splat(f32::MIN);
+    for v in &verts {
+        lo = lo.min(*v);
+        hi = hi.max(*v);
+    }
+    let centre = (lo + hi) * 0.5;
 
     let floor_color = linear_rgba(0.17, 0.40, 0.29);
     let wall_color = linear_rgba(0.60, 0.63, 0.70);
 
-    let mut positions = Vec::new();
-    let mut normals = Vec::new();
-    let mut colors = Vec::new();
-    let mut uvs = Vec::new();
-    let mut indices = Vec::new();
+    let mut normals = vec![Vec3::ZERO; verts.len()];
+    let mut indices = Vec::with_capacity(tris.len() * 3);
+    for t in &tris {
+        let (ia, ib, ic) = (t[0] as usize, t[1] as usize, t[2] as usize);
+        let (a, b, c) = (verts[ia], verts[ib], verts[ic]);
+        let n = (b - a).cross(c - a);
+        let inward = centre - (a + b + c) / 3.0;
+        let flip = n.dot(inward) < 0.0;
+        let face = if flip { -n } else { n };
+        let (i1, i2) = if flip { (ic, ib) } else { (ib, ic) };
+        indices.extend_from_slice(&[ia as u32, i1 as u32, i2 as u32]);
+        normals[ia] += face;
+        normals[ib] += face;
+        normals[ic] += face;
+    }
 
-    for face in &faces {
-        let base = positions.len() as u32;
-        for j in 0..=face.nv {
-            for i in 0..=face.nu {
-                let u = face.u_len * i as f32 / face.nu as f32;
-                let v = face.v_len * j as f32 / face.nv as f32;
-                let box_point = face.origin + face.u_dir * u + face.v_dir * v;
-                let surface = project_to_surface(&arena, centre, (box_point - centre).normalize());
-                positions.push(surface.to_array());
+    let mut normal_out = Vec::with_capacity(verts.len());
+    let mut uvs = Vec::with_capacity(verts.len());
+    let mut colors = Vec::with_capacity(verts.len());
+    for (v, n) in verts.iter().zip(&normals) {
+        let n = n.normalize_or_zero();
+        normal_out.push(n.to_array());
 
-                let n = arena.shell_normal_at(rl::Vec3::new(
-                    surface.x as f64,
-                    surface.y as f64,
-                    surface.z as f64,
-                ));
-                normals.push([n.x as f32, n.y as f32, n.z as f32]);
+        // Grid UV: project onto the plane the vertex faces most directly.
+        let an = n.abs();
+        let (u, w) = if an.y >= an.x && an.y >= an.z {
+            (v.x, v.z)
+        } else if an.x >= an.z {
+            (v.z, v.y)
+        } else {
+            (v.x, v.y)
+        };
+        uvs.push([u / GRID_TILE, w / GRID_TILE]);
 
-                // Green where the surface faces up (the pitch and its base
-                // fillet), grey on the walls and ceiling.
-                let t = ((n.y as f32 - 0.3) / 0.5).clamp(0.0, 1.0);
-                colors.push(lerp_rgba(wall_color, floor_color, t));
-
-                // Grid UVs in world units, so the texture tiles at a fixed
-                // scale no matter which face it is on.
-                uvs.push([
-                    box_point.dot(face.u_dir) / GRID_TILE,
-                    box_point.dot(face.v_dir) / GRID_TILE,
-                ]);
-            }
-        }
-        let row = face.nu + 1;
-        for j in 0..face.nv {
-            for i in 0..face.nu {
-                if face.hole {
-                    // Cut the goal opening: skip any quad whose centre is inside
-                    // the mouth, so the end wall has a hole the goal sits in.
-                    let u = face.u_len * (i as f32 + 0.5) / face.nu as f32;
-                    let v = face.v_len * (j as f32 + 0.5) / face.nv as f32;
-                    let p = face.origin + face.u_dir * u + face.v_dir * v;
-                    if p.x.abs() <= GOAL_HALF_WIDTH as f32 && p.y <= GOAL_HEIGHT as f32 {
-                        continue;
-                    }
-                }
-                let a = base + j * row + i;
-                let b = a + 1;
-                let c = a + row;
-                let d = c + 1;
-                if face.flip {
-                    indices.extend_from_slice(&[a, c, b, b, c, d]);
-                } else {
-                    indices.extend_from_slice(&[a, b, c, b, d, c]);
-                }
-            }
-        }
+        // Green where the surface faces up (the pitch and its base fillet), grey
+        // on the walls and ceiling.
+        let t = ((n.y - 0.3) / 0.5).clamp(0.0, 1.0);
+        colors.push(lerp_rgba(wall_color, floor_color, t));
     }
 
     Mesh::new(
         PrimitiveTopology::TriangleList,
         RenderAssetUsages::default(),
     )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        verts.iter().map(Vec3::to_array).collect::<Vec<_>>(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normal_out)
     .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
     .with_inserted_indices(Indices::U32(indices))
-}
-
-/// The curved goal net, as a triangle mesh.
-///
-/// The profile in the depth/height plane is read straight off the *collision*
-/// field (`rl::arena::inside_distance`) - walked out from the goal line at each
-/// height to the first surface - so the drawn scoop, the flat back and the graded
-/// corners (`arena::GOAL_FILLET`) match what the car collides with. The profile is
-/// swept across the goal's width and capped at each post; the mouth itself is left
-/// open. `sign` is -1 for the -Z (blue) goal and +1 for +Z (orange).
-fn goal_net_mesh(sign: f32) -> Mesh {
-    use rl::arena::GOAL_DEPTH;
-    let top = GOAL_HEIGHT as f32;
-    let half_w = GOAL_HALF_WIDTH as f32;
-    let z0 = ARENA_HALF_Z;
-    let arena = rl::Arena::default();
-
-    // Profile as (depth, height) pairs: up the mouth floor, up the back boundary,
-    // then forward along the roof to the mouth top.
-    let steps = 40;
-    let mut profile: Vec<[f32; 2]> = vec![[0.0, 0.0]];
-    for i in 0..=steps {
-        let h = top * i as f32 / steps as f32;
-        let mut d = 0.0_f32;
-        while d <= GOAL_DEPTH as f32 + 0.5 {
-            let p = rl::Vec3::new(0.0, h as f64, (z0 + d) as f64);
-            if arena.inside_distance(p) > 0.0 {
-                break;
-            }
-            d += 0.02;
-        }
-        profile.push([d, h]);
-    }
-    profile.push([0.0, top]);
-
-    let at = |x: f32, d: f32, h: f32| Vec3::new(x, h, sign * (z0 + d));
-    // A point inside the cavity, used to orient every face's normal inward.
-    let inside = Vec3::new(0.0, 3.0, sign * (z0 + 3.0));
-
-    let mut positions: Vec<[f32; 3]> = Vec::new();
-    let mut normals: Vec<[f32; 3]> = Vec::new();
-    let mut tri = |a: Vec3, b: Vec3, c: Vec3| {
-        let n = (b - a).cross(c - a).normalize_or_zero();
-        let centroid = (a + b + c) / 3.0;
-        let n = if n.dot(inside - centroid) < 0.0 {
-            -n
-        } else {
-            n
-        };
-        for p in [a, b, c] {
-            positions.push(p.to_array());
-            normals.push(n.to_array());
-        }
-    };
-
-    // The swept scoop walls.
-    for seg in profile.windows(2) {
-        let a = at(-half_w, seg[0][0], seg[0][1]);
-        let b = at(half_w, seg[0][0], seg[0][1]);
-        let c = at(half_w, seg[1][0], seg[1][1]);
-        let d = at(-half_w, seg[1][0], seg[1][1]);
-        tri(a, b, c);
-        tri(a, c, d);
-    }
-    // Side caps at the posts (the mouth edge is left open).
-    for x in [-half_w, half_w] {
-        let origin = at(x, 0.0, 0.0);
-        for seg in profile.windows(2).skip(1) {
-            tri(
-                origin,
-                at(x, seg[0][0], seg[0][1]),
-                at(x, seg[1][0], seg[1][1]),
-            );
-        }
-    }
-
-    Mesh::new(
-        PrimitiveTopology::TriangleList,
-        RenderAssetUsages::default(),
-    )
-    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
-}
-
-/// March a ray from inside the arena out to the collision surface. The surface
-/// lies inside the bounding box, so any point past the box corner is outside;
-/// the shape is convex, so a plain bisection finds the crossing.
-fn project_to_surface(arena: &rl::Arena, centre: Vec3, direction: Vec3) -> Vec3 {
-    // Longer than the distance from the centre to any box corner (~66 m).
-    const OUTSIDE: f32 = 80.0;
-    let mut lo = 0.0_f32;
-    let mut hi = OUTSIDE;
-    for _ in 0..30 {
-        let mid = 0.5 * (lo + hi);
-        let p = centre + direction * mid;
-        let d = arena.shell_inside_distance(rl::Vec3::new(p.x as f64, p.y as f64, p.z as f64));
-        if d < 0.0 {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    centre + direction * (0.5 * (lo + hi))
 }
 
 /// A repeating grid: white background (so the vertex colour shows through) with a
@@ -1437,7 +1211,7 @@ fn step_simulation(
         Mode::Play => read_input(&keys, gamepads.iter().next()),
         // Self-driving, so a capture is reproducible rather than dependent on
         // the frame rate. See `capture_input` for the schedule.
-        Mode::Capture { .. } => capture_input(sim.0.tick),
+        Mode::Capture { .. } => capture_input(sim.0.tick()),
     };
     last_steer.0 = input.steer;
     sim.0.step(&input);
@@ -1538,7 +1312,7 @@ fn reset_on_key(keys: Res<ButtonInput<KeyCode>>, gamepads: Query<&Gamepad>, mut 
         .iter()
         .any(|pad| pad.just_pressed(GamepadButton::Start));
     if keys.just_pressed(KeyCode::KeyR) || pad_reset {
-        sim.0 = SimWorld::new();
+        sim.0.reset();
     }
 }
 
@@ -1550,34 +1324,23 @@ fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis, &mut Visi
     for (mut transform, vis, mut visibility) in &mut query {
         match vis {
             Vis::Car => {
-                let car = &sim.0.car;
-                let f = Vec3::new(
-                    car.forward.x as f32,
-                    car.forward.y as f32,
-                    car.forward.z as f32,
-                );
-                let u = Vec3::new(car.up.x as f32, car.up.y as f32, car.up.z as f32);
-                transform.translation =
-                    Vec3::new(car.pos.x as f32, car.pos.y as f32, car.pos.z as f32);
+                let car = sim.0.car();
+                let (f, u) = (car.forward, car.up);
+                transform.translation = car.pos;
                 // Full 3D attitude, so flips and air control are visible. The
                 // basis columns are (right, up, forward).
                 transform.rotation = Quat::from_mat3(&Mat3::from_cols(u.cross(f), u, f));
             }
             Vis::Ball => {
-                let ball = &sim.0.ball;
-                transform.translation =
-                    Vec3::new(ball.pos.x as f32, ball.pos.y as f32, ball.pos.z as f32);
+                let ball = sim.0.ball();
+                transform.translation = ball.pos;
                 // Rolling looks wrong without spin, and the angle is free.
-                let spin = ball.spin;
-                transform.rotate(Quat::from_scaled_axis(
-                    Vec3::new(spin.x as f32, spin.y as f32, spin.z as f32) * (1.0 / 60.0),
-                ));
+                transform.rotate(Quat::from_scaled_axis(ball.spin * (1.0 / 60.0)));
             }
             Vis::BoostPad(index) => {
-                let pad = &sim.0.boost_pads[*index];
                 // Hidden while on cooldown, so only the glow leaves when the pad
                 // is taken (the small pads' disc is not tagged, so it stays).
-                *visibility = if pad.available() {
+                *visibility = if sim.0.pad(*index).available {
                     Visibility::Inherited
                 } else {
                     Visibility::Hidden
@@ -1597,7 +1360,7 @@ fn spin_wheels(
     mut rolled: Local<f32>,
     mut wheels: Query<(&mut Transform, &Wheel)>,
 ) {
-    let speed = sim.0.car.forward_speed() as f32;
+    let speed = sim.0.car().forward_speed;
     *rolled = (*rolled + speed * time.delta_secs() / WHEEL_RADIUS) % std::f32::consts::TAU;
     let steer_angle = steer.0 as f32 * MAX_WHEEL_STEER;
     for (mut transform, wheel) in &mut wheels {
@@ -1711,33 +1474,22 @@ fn chase_camera(
     mut look_yaw: Local<f32>,
     mut behind_last: Local<bool>,
 ) {
-    let car = sim.0.car.pos;
-    let ball = sim.0.ball.pos;
+    let car = sim.0.car();
 
     // Follow the car's *full* forward axis, not just its horizontal part, so the
     // camera trails it up a wall and over onto the ceiling. On the flat ground the
     // two are the same, because a grounded car's forward is horizontal.
-    let forward = Vec3::new(
-        sim.0.car.forward.x as f32,
-        sim.0.car.forward.y as f32,
-        sim.0.car.forward.z as f32,
-    )
-    .normalize_or_zero();
+    let forward = car.forward.normalize_or_zero();
     // The car's up axis is the surface normal on the ground, a wall's normal on a
     // wall, and straight down on the ceiling. That is the frame the camera boom
     // is built in (see `camera_frame`).
-    let car_up = Vec3::new(
-        sim.0.car.up.x as f32,
-        sim.0.car.up.y as f32,
-        sim.0.car.up.z as f32,
-    );
-    let car_up = if car_up.length_squared() > 0.5 {
-        car_up.normalize()
+    let car_up = if car.up.length_squared() > 0.5 {
+        car.up.normalize()
     } else {
         Vec3::Y
     };
-    let car_pos = Vec3::new(car.x as f32, car.y as f32, car.z as f32);
-    let ball_pos = Vec3::new(ball.x as f32, ball.y as f32, ball.z as f32);
+    let car_pos = car.pos;
+    let ball_pos = sim.0.ball().pos;
 
     let pad = gamepads.iter().next();
     let behind = look_behind(pad);
@@ -1851,22 +1603,20 @@ fn update_hud(
     mut writer: TextUiWriter,
 ) {
     let entity = *hud;
-    let car = &sim.0.car;
-    let ball = &sim.0.ball;
-    *writer.text(entity, 1) = format!(
-        "BLUE {:>2} - {:<2} ORANGE\n",
-        sim.0.score[0], sim.0.score[1]
-    );
+    let car = sim.0.car();
+    let ball = sim.0.ball();
+    let score = sim.0.score();
+    *writer.text(entity, 1) = format!("BLUE {:>2} - {:<2} ORANGE\n", score[0], score[1]);
     *writer.text(entity, 2) = format!(
         "speed {:>5.1} m/s   boost {:>5.1}   tick {:>6}   cam {}\n",
-        car.speed(),
+        car.speed,
         car.boost,
-        sim.0.tick,
+        sim.0.tick(),
         if ball_cam.0 { "ball" } else { "car" }
     );
     *writer.text(entity, 3) = format!(
         "ball {:>5.1} m/s   height {:>5.2} m   spin {:>5.1} rad/s\n",
-        ball.vel.length(),
+        ball.speed,
         ball.pos.y,
         ball.spin.length()
     );
@@ -1905,14 +1655,14 @@ fn screenshot_driver(
     // - and the simulation never runs at all.
     let ready = match free_cam {
         Some(_) => *elapsed >= FREE_SHOT_MIN_FRAMES && time.elapsed_secs() >= FREE_SHOT_MIN_SECS,
-        None => sim.0.tick >= *capture_at_tick,
+        None => sim.0.tick() >= *capture_at_tick,
     };
 
     if !*captured && ready {
         commands
             .spawn(Screenshot::primary_window())
             .observe(save_to_disk(path.clone()));
-        info!("capturing screenshot to {path} (tick {})", sim.0.tick);
+        info!("capturing screenshot to {path} (tick {})", sim.0.tick());
         *captured = true;
     }
 

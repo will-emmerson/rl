@@ -7,6 +7,14 @@ description = "Bevy 3D viewer for the rl simulation"
 [dependencies]
 rl = { path = ".." }
 
+# The physics. Pure-Rust RocketSim v3 ("a Rust library for simulating Rocket
+# League games"), pinned to the `v3-rust` branch head rather than the branch
+# name so it can't move under us. It is not on crates.io yet.
+#
+# At runtime it loads RL's arena collision meshes from `./collision_meshes/`
+# (see `view/src/sim.rs`); those are NOT in the repo.
+rocketsim = { git = "https://github.com/ZealanL/RocketSim", rev = "6cf55d33d070ff611a09564885dac230f66fd2f6" }
+
 # Feature set is spelled out rather than using bevy's convenient `3d`/`ui`
 # meta-features, because those pull in `default_platform`, which includes
 # `bevy_audio` (needs alsa). Nothing here makes noise, so dropping it keeps the

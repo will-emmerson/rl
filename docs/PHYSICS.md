@@ -1,3 +1,9 @@
+> **Current status.** `rl` is no longer the game's physics. The `rl_view` viewer
+> runs on [RocketSim](https://github.com/ZealanL/RocketSim) v3 (pure Rust) and
+> draws RocketSim's own collision mesh; `rl` is kept as the hand-rolled,
+> deterministic reference simulation (and the terminal demo). Read this document
+> as a description of _`rl`_, not of how the game behaves today.
+
 # Why hand-roll the physics?
 
 Short version: for _this_ game a physics engine is mostly overhead, and the one

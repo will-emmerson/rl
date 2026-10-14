@@ -5,22 +5,31 @@ rule changes.
 
 ## What this is
 
-A Rocket League-style prototype. The active code is a hand-rolled,
-dependency-free simulation with a Bevy viewer:
+A Rocket League-style game. The active code is a Bevy viewer running
+**[RocketSim](https://github.com/ZealanL/RocketSim)** (the pure-Rust v3) for
+physics, plus `rl`, a hand-rolled deterministic simulation kept as a reference:
 
-- `src/` — `rl`: the deterministic simulation (arena + ball + car + boost pads). No game
-  engine, no dependencies.
-- `view/` — `rl_view`: a Bevy 3D viewer that reads `rl` and draws it.
-- `tests/` — physics behaviour and determinism tests.
+- `view/` — `rl_view`: the Bevy 3D viewer. Its physics and its drawn arena both
+  come from RocketSim; `view/src/sim.rs` is the only place that knows about it.
+- `src/` — `rl`: a hand-rolled, dependency-free Rocket League simulation (arena +
+  ball + car + boost pads). Deterministic; the terminal demo runs on it. It is no
+  longer the game's physics.
+- `tools/rlacd.py` — a Linux/Proton port of RLArenaCollisionDumper: dumps RL's
+  arena collision meshes, which RocketSim needs at runtime (see below).
+- `tests/` — `rl`'s physics behaviour and determinism tests.
 
 An earlier Godot 4 prototype was removed once the Rust implementation became the
 one we are building. `docs/PHYSICS.md` still cites it as the motivation for
-hand-rolling the physics.
+hand-rolling `rl`'s physics.
 
 Start with `docs/PHYSICS.md` (why hand-rolled, and its honest caveats) and
 `README.md` (how to run it).
 
 ## Determinism is the point — don't break it
+
+These rules apply to `rl`, the hand-rolled reference simulation. The viewer's
+physics is RocketSim, which is deterministic by design but is not covered by
+them.
 
 `rl` must produce a bit-identical state stream for a given input stream, so
 client-side prediction and replays can work. Inside the simulation step:
@@ -97,6 +106,11 @@ cargo clippy --workspace --all-targets # kept clean
 - Linux needs **`libudev-dev`** (gamepad via `bevy_gilrs`). Audio/ALSA is
   deliberately excluded; Bevy features are listed explicitly in
   `view/Cargo.toml`.
+- The viewer's physics is **RocketSim v3** (a git dependency in `view/Cargo.toml`;
+  see `view/src/sim.rs`). It needs RL's dumped arena meshes in
+  `RL/collision_meshes/soccar/` at runtime or it exits with a message; dump them
+  with `tools/rlacd.py` (Linux/Proton) or RLArenaCollisionDumper (Windows). `rl`
+  itself stays dependency-free.
 - Project tasks are defined in `.zed/tasks.json`.
 
 **To see your work, render a PNG** — both forms exit on their own:
