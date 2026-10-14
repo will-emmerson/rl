@@ -75,6 +75,15 @@ pub const GOAL_NET_CENTER_HEIGHT: f64 = 2.59;
 /// line - see [`Arena::ball_in_goal`].
 pub const GOAL_SCORE_BASE_Z: f64 = 51.2425;
 
+/// Radius of the fillet rounding the goal recess's concave corners, in metres.
+/// The recess is the mouth rectangle united with the net scoop, which leaves a
+/// sharp corner where the scoop's top meets the flat back wall and where the back
+/// wall meets the roof. A car is a point contact held `CAR_HALF_HEIGHT` off the
+/// surface, so it follows smooth joins (the arena's own corners are filleted too)
+/// but jams on a sharp one; rounding them `GOAL_FILLET` lets a car ride the net up
+/// and out. Not a RocketSim figure - a gameplay fix, like `CORNER_RADIUS`.
+pub const GOAL_FILLET: f64 = 0.8;
+
 /// Which end a goal is at. The `-Z` goal is blue's (Rocket League's blue goal is
 /// at `-Y`, the direction the car spawns facing); `+Z` is orange's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -219,7 +228,8 @@ impl Arena {
 
         // Rectangular part: the net's flat back at `GOAL_NET_CENTER_DEPTH`, the
         // floor at y = 0 and the roof at GOAL_HEIGHT. The mouth face is open, so
-        // it is deliberately not a constraint here.
+        // it is deliberately not a constraint here. The back/roof corner is
+        // filleted (`smax`) so a car can roll up the back onto the roof.
         let back = self.half_z + GOAL_NET_CENTER_DEPTH;
         let bz = az - back;
         let by = (-p.y).max(p.y - GOAL_HEIGHT);
@@ -229,8 +239,8 @@ impl Arena {
             Vec3::new(0.0, 1.0, 0.0)
         };
         let rect = max2(
-            max2((qx, qx_grad), (bz, Vec3::new(0.0, 0.0, sz))),
-            (by, by_grad),
+            (qx, qx_grad),
+            smax((bz, Vec3::new(0.0, 0.0, sz)), (by, by_grad), GOAL_FILLET),
         );
 
         // Net scoop: distance to the circle, kept inside the lateral walls.
@@ -245,12 +255,9 @@ impl Arena {
         };
         let scoop = max2((rad, rad_grad), (qx, qx_grad));
 
-        // Playable region = rectangle ∪ scoop.
-        if scoop.0 <= rect.0 {
-            scoop
-        } else {
-            rect
-        }
+        // Playable region = rectangle ∪ scoop, with the scoop-to-back-wall seam
+        // filleted (`smin`) so riding the curve up onto the back wall is smooth.
+        smin(rect, scoop, GOAL_FILLET)
     }
 
     /// Rounded-rectangle distance in the x/z plane: the walls with their four
@@ -384,6 +391,26 @@ fn max3(a: (f64, Vec3), b: (f64, Vec3), c: (f64, Vec3)) -> (f64, Vec3) {
         best = c;
     }
     best
+}
+
+/// `min` of two fields (their union), with the concave corner where they meet
+/// rounded off over a radius `k`. The sharp corner a plain `min` leaves is what a
+/// point-contact car jams on. Polynomial, so it is deterministic and libm-free.
+fn smin(a: (f64, Vec3), b: (f64, Vec3), k: f64) -> (f64, Vec3) {
+    let h = (0.5 + 0.5 * (b.0 - a.0) / k).clamp(0.0, 1.0);
+    let value = b.0 + (a.0 - b.0) * h - k * h * (1.0 - h);
+    let grad = b.1 + (a.1 - b.1) * h;
+    (value, grad)
+}
+
+/// `max` of two fields (their intersection), with the convex corner filled in
+/// over a radius `k`. The [`smin`] counterpart - here the fillet replaces the
+/// sharp corner a plain `max` leaves. Polynomial, so it is deterministic.
+fn smax(a: (f64, Vec3), b: (f64, Vec3), k: f64) -> (f64, Vec3) {
+    let h = (0.5 + 0.5 * (a.0 - b.0) / k).clamp(0.0, 1.0);
+    let value = b.0 + (a.0 - b.0) * h + k * h * (1.0 - h);
+    let grad = b.1 + (a.1 - b.1) * h;
+    (value, grad)
 }
 
 #[cfg(test)]

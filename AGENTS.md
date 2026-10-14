@@ -65,7 +65,12 @@ page that RocketSim's own comments cite, with the score line from RocketSim's
 the goal region of RocketSim's soccar mesh gives the net's curved profile
 (`arena::GOAL_NET_*`). The goals are carved into the arena SDF (see
 `Arena::goal_field`) — the viewer draws the shell, cuts the same openings, and
-adds the frame and the swept net scoop.
+adds the frame and the swept net scoop. The recess's concave corners (scoop to
+back wall, back wall to roof) are filleted with `arena::GOAL_FILLET` — a gameplay
+fix, not a RocketSim figure, exactly like `CORNER_RADIUS`: a point-contact car
+follows smooth joins but jams on a sharp one, and without the fillet a car rolling
+up the curve could not get back out over the lip. The net mesh samples the same
+field, so the drawn scoop keeps the fillet.
 
 The car's _handling_ is now largely ported from RocketSim: steering uses RL's
 `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model
@@ -133,9 +138,17 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
 
 ## Traps already paid for
 
-- **Chase camera:** don't clamp it to the wall plane (it collapses onto the car),
-  and don't aim at a weighted average of car/ball positions (it ends up facing
-  the floor). See the comments in `view/src/main.rs`.
+- **Chase camera:** the arena is a see-through cage, so the camera is _not_
+  clipped to its walls — a car on a wall gets its full boom even when that puts the
+  camera outside the shell, and the one-sided shell (see below) keeps the car
+  visible through the wall. It is kept above the pitch (`CAMERA_FLOOR_MARGIN`) but
+  free to leave through the walls _and_ the roof, so ball cam can film a car on the
+  ceiling from above it. Ball cam points the boom straight away from the ball in
+  _full 3D_ (`ball_cam_angle`); measuring the bearing only in the car's tangent
+  plane (the old `ball_bearing`) kept the boom in the wall plane and left the car
+  behind the camera on a wall. Still: don't clamp the camera to the wall plane (it
+  collapses onto the car), and don't aim at a weighted average of car/ball positions
+  (it ends up facing the floor). See the comments in `view/src/main.rs`.
 - **Car turning:** never derive yaw rate from a lateral-acceleration budget — it
   rises as `1/v` and pivots the car on the spot. The rate now comes from RL's
   steer-angle curve as `omega = v * tan(steer) / wheelbase`, which is
@@ -157,7 +170,12 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
   far from the walls. `CORNER_RADIUS` / `FLOOR_FILLET` are gameplay guesses, not
   RocketSim figures. The viewer draws the arena by ray-projecting this same SDF
   (`arena_surface_mesh` in `view/src/main.rs`), so the drawn surface and the
-  collision surface stay in sync automatically.
+  collision surface stay in sync automatically. The shell is drawn one-sided
+  (`cull_mode: Some(Face::Front)`, every `BoxFace` wound front-outward via
+  `BoxFace::flip`), so from outside the cage the walls vanish and the camera can
+  watch the car through them. That replaced the old double-sided draw, whose
+  normal flipping left the interior ambient-only — the pitch is now directly
+  sunlit, and the ball/car cast shadows.
 - **A surface can only push.** A grounded car is glued on _except_ on an
   overhanging surface (`normal.y < 0`: the ceiling and the upper fillet), where
   gravity would peel it off, so it stays only above `CAR_STICK_SPEED`. Do not

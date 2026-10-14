@@ -22,7 +22,7 @@ use bevy::input::gamepad::{RawGamepadAxisChangedEvent, RawGamepadButtonChangedEv
 use bevy::mesh::{Indices, PrimitiveTopology};
 use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::prelude::*;
-use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
 use rl::arena::{GOAL_HALF_WIDTH, GOAL_HEIGHT};
@@ -30,10 +30,9 @@ use rl::ball::BALL_RADIUS;
 use rl::car::{CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH, CAR_WHEELBASE};
 use rl::{Input as SimInput, World as SimWorld};
 
-/// Arena dimensions, matching `rl::Arena::default()`.
-const ARENA_HALF_X: f32 = 40.96;
+/// Arena dimensions, matching `rl::Arena::default()`: the goal line, frame and net
+/// sit at `ARENA_HALF_Z`.
 const ARENA_HALF_Z: f32 = 51.20;
-const ARENA_HEIGHT: f32 = 20.48;
 
 /// World size of one tile of the arena grid texture, in metres. Inside a tile
 /// the minor lines are spaced `GRID_TILE / GRID_CELLS` apart, and the tile border
@@ -56,14 +55,14 @@ const WHEEL_RADIUS: f32 = 0.52 * CAR_HALF_HEIGHT as f32;
 /// angle is speed-dependent; this is a fixed stand-in.
 const MAX_WHEEL_STEER: f32 = 0.5;
 
-/// The camera never gets closer to a wall than this.
-const CAMERA_WALL_MARGIN: f32 = 0.8;
 /// Preferred chase position: this far behind, and this far above, the car.
 const CAMERA_DISTANCE: f32 = 5.5;
 const CAMERA_HEIGHT: f32 = 2.6;
-/// Where the camera escapes to when a wall blocks the chase position.
-const CAMERA_SQUEEZE_HEIGHT: f32 = 5.0;
-const CAMERA_SQUEEZE_INSET: f32 = 2.5;
+/// The camera may leave the arena through the walls *and* the roof - the shell is
+/// one-sided, so it can still see back in - but it never drops below the pitch,
+/// which would film the game from underneath. This is the margin it keeps off the
+/// floor.
+const CAMERA_FLOOR_MARGIN: f32 = 0.4;
 /// How high above the car the straight-ahead car-cam aim point sits.
 const CAMERA_AIM_HEIGHT: f32 = 0.6;
 /// How far left/right the look control swivels the camera, in radians.
@@ -81,6 +80,11 @@ const CAMERA_PITCH_MAX: f32 = 1.35;
 /// far ball from a high boom drops the near car off the bottom of the view, so
 /// ball cam uses a low boom that keeps both the car and the ball in frame.
 const CAMERA_BALL_PITCH: f32 = 0.20;
+/// Ball cam's orbit angle is allowed to swing *below* the tangent plane, because
+/// "away from the ball" can point out of the arena: on a wall the ball is inside,
+/// so the boom points outside the wall and the camera sits outside the cage, looking
+/// back in. Car cam's `CAMERA_PITCH_MIN` clamp, by contrast, keeps it above the car.
+const CAMERA_BALL_PITCH_MIN: f32 = -1.40;
 /// Vertical look is inverted: pushing the stick up looks down (and so raises the
 /// camera into the overview). Flip to `false` for the standard mapping.
 const CAMERA_LOOK_INVERT_Y: bool = true;
@@ -327,9 +331,11 @@ fn setup_scene(
             base_color: Color::WHITE,
             base_color_texture: Some(images.add(arena_grid_texture())),
             perceptual_roughness: 0.85,
-            // The camera sits inside the shell, so render both sides rather than
-            // relying on the mesh winding.
-            cull_mode: None,
+            // The shell is a cage the camera can see through from outside: draw
+            // only the inward-facing side, so the camera may leave the arena (see
+            // `chase_camera`) and still watch the car through the wall. From
+            // inside that is the side you see; from outside the walls vanish.
+            cull_mode: Some(Face::Front),
             ..default()
         })),
     ));
@@ -745,6 +751,11 @@ struct BoxFace {
     /// A goal end wall: quads inside the goal mouth are skipped, so the opening
     /// is an actual hole rather than a dented surface.
     hole: bool,
+    /// Emit this face with reversed winding. The box face seeds below otherwise
+    /// give whichever winding they happened to; the shell is now drawn one-sided
+    /// (`cull_mode: Some(Face::Front)`), so every face's front must point *out* of
+    /// the arena - the faces that come out facing in are flipped.
+    flip: bool,
 }
 
 /// The arena's collision surface as a single triangle mesh, with the grid UV and
@@ -779,6 +790,7 @@ fn arena_surface_mesh() -> Mesh {
             nu: nx,
             nv: nz,
             hole: false,
+            flip: false,
         },
         BoxFace {
             origin: Vec3::new(-half_x, height, -half_z),
@@ -789,6 +801,7 @@ fn arena_surface_mesh() -> Mesh {
             nu: nx,
             nv: nz,
             hole: false,
+            flip: true,
         },
         BoxFace {
             origin: Vec3::new(half_x, 0.0, -half_z),
@@ -799,6 +812,7 @@ fn arena_surface_mesh() -> Mesh {
             nu: nz,
             nv: ny,
             hole: false,
+            flip: true,
         },
         BoxFace {
             origin: Vec3::new(-half_x, 0.0, -half_z),
@@ -809,6 +823,7 @@ fn arena_surface_mesh() -> Mesh {
             nu: nz,
             nv: ny,
             hole: false,
+            flip: false,
         },
         BoxFace {
             origin: Vec3::new(-half_x, 0.0, half_z),
@@ -819,6 +834,7 @@ fn arena_surface_mesh() -> Mesh {
             nu: nx,
             nv: ny,
             hole: true,
+            flip: false,
         },
         BoxFace {
             origin: Vec3::new(-half_x, 0.0, -half_z),
@@ -829,6 +845,7 @@ fn arena_surface_mesh() -> Mesh {
             nu: nx,
             nv: ny,
             hole: true,
+            flip: true,
         },
     ];
 
@@ -888,7 +905,11 @@ fn arena_surface_mesh() -> Mesh {
                 let b = a + 1;
                 let c = a + row;
                 let d = c + 1;
-                indices.extend_from_slice(&[a, b, c, b, d, c]);
+                if face.flip {
+                    indices.extend_from_slice(&[a, c, b, b, c, d]);
+                } else {
+                    indices.extend_from_slice(&[a, b, c, b, d, c]);
+                }
             }
         }
     }
@@ -906,31 +927,35 @@ fn arena_surface_mesh() -> Mesh {
 
 /// The curved goal net, as a triangle mesh.
 ///
-/// The net is the same semicircular scoop the collision field uses
-/// (`rl::arena::goal_field`): a profile in the depth/height plane swept across
-/// the goal's width, capped at each post. The profile runs from the mouth floor,
-/// around the scoop arc, and up the back to the roof; the mouth itself is left
+/// The profile in the depth/height plane is read straight off the *collision*
+/// field (`rl::arena::inside_distance`) - walked out from the goal line at each
+/// height to the first surface - so the drawn scoop, the flat back and the graded
+/// corners (`arena::GOAL_FILLET`) match what the car collides with. The profile is
+/// swept across the goal's width and capped at each post; the mouth itself is left
 /// open. `sign` is -1 for the -Z (blue) goal and +1 for +Z (orange).
 fn goal_net_mesh(sign: f32) -> Mesh {
-    use rl::arena::{GOAL_NET_CENTER_DEPTH, GOAL_NET_CENTER_HEIGHT, GOAL_NET_RADIUS};
-    let dc = GOAL_NET_CENTER_DEPTH as f32;
-    let hc = GOAL_NET_CENTER_HEIGHT as f32;
-    let r = GOAL_NET_RADIUS as f32;
+    use rl::arena::GOAL_DEPTH;
     let top = GOAL_HEIGHT as f32;
     let half_w = GOAL_HALF_WIDTH as f32;
     let z0 = ARENA_HALF_Z;
+    let arena = rl::Arena::default();
 
-    // Profile as (depth, height) pairs: mouth floor, then the scoop arc, then the
-    // flat back up to the roof and forward to the mouth top.
+    // Profile as (depth, height) pairs: up the mouth floor, up the back boundary,
+    // then forward along the roof to the mouth top.
+    let steps = 40;
     let mut profile: Vec<[f32; 2]> = vec![[0.0, 0.0]];
-    let steps = 24;
-    let th0 = -(hc / r).clamp(-1.0, 1.0).asin(); // angle where the arc meets y=0
-    let th1 = std::f32::consts::FRAC_PI_2;
     for i in 0..=steps {
-        let t = th0 + (th1 - th0) * i as f32 / steps as f32;
-        profile.push([dc + r * t.cos(), hc + r * t.sin()]);
+        let h = top * i as f32 / steps as f32;
+        let mut d = 0.0_f32;
+        while d <= GOAL_DEPTH as f32 + 0.5 {
+            let p = rl::Vec3::new(0.0, h as f64, (z0 + d) as f64);
+            if arena.inside_distance(p) > 0.0 {
+                break;
+            }
+            d += 0.02;
+        }
+        profile.push([d, h]);
     }
-    profile.push([dc, top]);
     profile.push([0.0, top]);
 
     let at = |x: f32, d: f32, h: f32| Vec3::new(x, h, sign * (z0 + d));
@@ -1481,8 +1506,8 @@ fn report_gamepad_events(
 ///
 /// Two interesting moments fall out of it: around tick 250 the car is mid-drive
 /// with the ball in front (the shot in the README), and by tick 1200 it has
-/// driven into one wall and reversed back into the other, which squeezes the
-/// camera against a wall - the case that used to stick it to the car.
+/// driven into one wall and reversed back into the other - a wall play the camera
+/// now films from outside the see-through cage.
 fn capture_input(tick: u64) -> SimInput {
     if tick < 420 {
         SimInput::new(1.0, 0.0, false, false, false)
@@ -1581,44 +1606,6 @@ fn spin_wheels(
     }
 }
 
-/// Keep a point inside the arena, leaving `margin` clearance from every face.
-fn clamp_inside(p: Vec3, margin: f32) -> Vec3 {
-    Vec3::new(
-        p.x.clamp(-ARENA_HALF_X + margin, ARENA_HALF_X - margin),
-        p.y.clamp(margin, ARENA_HEIGHT - margin),
-        p.z.clamp(-ARENA_HALF_Z + margin, ARENA_HALF_Z - margin),
-    )
-}
-
-/// How much of the segment `from -> to` stays inside the arena, as a fraction.
-///
-/// Assumes `from` is already inside, in which case the arena's bounding box
-/// makes this just clipping against three axis-aligned slabs. The result is where
-/// a camera on a boom from `from` towards `to` would hit a wall.
-fn free_fraction(from: Vec3, to: Vec3, margin: f32) -> f32 {
-    let min = [-ARENA_HALF_X + margin, margin, -ARENA_HALF_Z + margin];
-    let max = [
-        ARENA_HALF_X - margin,
-        ARENA_HEIGHT - margin,
-        ARENA_HALF_Z - margin,
-    ];
-    let p = from.to_array();
-    let d = (to - from).to_array();
-
-    let mut t = 1.0_f32;
-    for axis in 0..3 {
-        if d[axis].abs() > 1e-6 {
-            let limit = if d[axis] > 0.0 {
-                (max[axis] - p[axis]) / d[axis]
-            } else {
-                (min[axis] - p[axis]) / d[axis]
-            };
-            t = t.min(limit);
-        }
-    }
-    t.clamp(0.0, 1.0)
-}
-
 /// Look input as two scalars in `-1..=1`, merged from the pad's right stick and
 /// the keyboard (`I`/`K` pitch, `J`/`L` swivel). `x` is positive to the right;
 /// `y` is the pitch input, positive to look up. The vertical axis is inverted
@@ -1669,15 +1656,6 @@ fn pitch_for_look(base: f32, look_y: f32) -> f32 {
     (base - look_y * CAMERA_LOOK_PITCH).clamp(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX)
 }
 
-/// The camera's resting orbit angle for the current mode.
-fn camera_resting_pitch(ball_cam: bool) -> f32 {
-    if ball_cam {
-        CAMERA_BALL_PITCH
-    } else {
-        resting_pitch()
-    }
-}
-
 /// The camera's offsets from the car: where it sits (`boom`) and the point it
 /// looks at (`aim`), from a yaw offset (`look_yaw_offset`) and an orbit angle
 /// (`pitch`, in radians above the car's own up axis).
@@ -1696,23 +1674,30 @@ fn camera_frame(forward: Vec3, up: Vec3, yaw: f32, pitch: f32) -> (Vec3, Vec3) {
     (boom, aim)
 }
 
-/// Signed yaw, about the car's `up` axis, from the car's forward to the ball -
-/// the angle ball cam swings the boom to put the ball behind the car, and hence
-/// in front of the camera.
+/// Ball cam's resting boom: the yaw (about the car's `up`) and pitch that point
+/// the boom straight *away from the ball*, so the camera sits on the far side of
+/// the car from the ball and looks through the car at it.
 ///
-/// The bearing is measured in the car's *tangent plane* (the surface it is on),
-/// which is the horizontal plane on the ground and the wall plane on a wall. That
-/// is what keeps ball cam working once the car's forward goes vertical: a purely
-/// horizontal bearing would be degenerate on a wall. Returns `0` when the ball is
-/// (nearly) directly above/below the car's up axis, where there is no bearing to
-/// speak of.
-fn ball_bearing(forward: Vec3, up: Vec3, to_ball: Vec3) -> f32 {
-    let flat = to_ball - up * to_ball.dot(up);
-    if flat.length_squared() <= 0.25 {
-        return 0.0;
-    }
-    let n = flat.normalize();
-    up.dot(forward.cross(n)).atan2(forward.dot(n))
+/// "Away from the ball" is measured in full 3D, not only in the car's tangent
+/// plane. On the floor it puts the camera behind the car; on a wall it lifts the
+/// boom clean out of the arena, so the camera sits *outside* the wall and looks
+/// back in through the see-through cage with the car in front of the ball. The
+/// tangent-plane bearing the car uses elsewhere would keep the boom inside the
+/// wall plane and never get there. `CAMERA_BALL_PITCH` is folded in so the boom
+/// still lifts off a flat floor, where "away from the ball" is level.
+fn ball_cam_angle(car_up: Vec3, forward: Vec3, to_ball: Vec3) -> (f32, f32) {
+    let away = (-to_ball).normalize_or_zero();
+    let along_up = away.dot(car_up).clamp(-1.0, 1.0);
+    let tangent = away - car_up * along_up;
+    let yaw = if tangent.length_squared() > 1e-6 {
+        let n = tangent.normalize();
+        let back = -forward;
+        car_up.dot(back.cross(n)).atan2(back.dot(n))
+    } else {
+        // Directly off the surface: no bearing to speak of, so trail the car.
+        0.0
+    };
+    (yaw, along_up.asin() + CAMERA_BALL_PITCH)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1766,14 +1751,15 @@ fn chase_camera(
     *behind_last = behind;
     let snap = behind != was_behind;
 
-    // In ball cam the boom orbits to the far side of the car from the ball, so
-    // the camera looks *through* the car at the ball and the car stays in the
-    // lower frame. Car cam keeps the boom straight behind the car.
+    // The boom's resting direction. In ball cam it points straight away from the
+    // ball (so the camera looks *through* the car at it, and on a wall sits outside
+    // the wall doing so); car cam keeps the boom behind the car, trailing its
+    // heading. See `ball_cam_angle` / `camera_frame`.
     let to_ball = ball_pos - car_pos;
-    let ball_yaw = if ball_cam.0 {
-        ball_bearing(forward, car_up, to_ball)
+    let (resting_yaw, resting_pitch) = if ball_cam.0 {
+        ball_cam_angle(car_up, forward, to_ball)
     } else {
-        0.0
+        (0.0, resting_pitch())
     };
 
     // Smooth the yaw *angle*, not the camera position: easing the angle swings
@@ -1785,54 +1771,32 @@ fn chase_camera(
     } else {
         1.0 - (-CAMERA_LOOK_RESPONSE * time.delta_secs()).exp()
     };
-    let target_yaw = look_yaw_offset(look_x, behind) + ball_yaw;
+    let target_yaw = look_yaw_offset(look_x, behind) + resting_yaw;
     let mut delta = target_yaw - *look_yaw;
     delta = (delta + PI).rem_euclid(std::f32::consts::TAU) - PI;
     *look_yaw += delta * smooth;
-    let (boom, aim_offset) = camera_frame(
-        forward,
-        car_up,
-        *look_yaw,
-        pitch_for_look(camera_resting_pitch(ball_cam.0), look_y as f32),
-    );
+    let pitch = if ball_cam.0 {
+        // Ball cam may swing below the tangent plane (out of the arena); see
+        // `CAMERA_BALL_PITCH_MIN`.
+        (resting_pitch - look_y as f32 * CAMERA_LOOK_PITCH)
+            .clamp(CAMERA_BALL_PITCH_MIN, CAMERA_PITCH_MAX)
+    } else {
+        pitch_for_look(resting_pitch, look_y as f32)
+    };
+    let (boom, aim_offset) = camera_frame(forward, car_up, *look_yaw, pitch);
 
-    // Pull the camera in along the line of sight rather than clamping it to
-    // the wall plane. A car backed against a wall has *no* room behind it, and
-    // clamping put the camera on top of the car, which is what made it feel
-    // stuck. Clipping a boom from the car finds the farthest position that is
-    // actually clear.
-    let pivot = clamp_inside(car_pos + car_up * 1.2, CAMERA_WALL_MARGIN);
-    let wanted = car_pos + boom;
-    let reach = free_fraction(pivot, wanted, CAMERA_WALL_MARGIN);
-    let mut desired = pivot.lerp(wanted, reach);
-
-    let squeeze = 1.0 - reach;
-    if squeeze > 0.001 {
-        // No room behind the car, so rise and step *sideways* along the wall.
-        // Sideways rather than inwards, because a car backed against a wall is
-        // usually facing the middle — stepping that way puts the car behind the
-        // camera. Sideways rather than straight up because `look_at` then has
-        // no usable up vector.
-        let side = car_up.cross(forward).normalize_or_zero();
-        let step = if wall_clearance(car_pos + side * CAMERA_SQUEEZE_INSET)
-            >= wall_clearance(car_pos - side * CAMERA_SQUEEZE_INSET)
-        {
-            side
-        } else {
-            -side
-        };
-        let escape = car_pos + car_up * CAMERA_SQUEEZE_HEIGHT + step * CAMERA_SQUEEZE_INSET;
-        desired = desired.lerp(escape, squeeze);
-    }
-
-    // Both the current position and the target are inside a convex box, so the
-    // interpolation can never leave the arena. The clamp is belt and braces.
-    let desired = clamp_inside(desired, CAMERA_WALL_MARGIN);
+    // The arena is a see-through cage - its shell is drawn one-sided (see
+    // `arena_surface_mesh`) - so the camera is free to sit outside it and look
+    // back in through the wall or the roof. That is what keeps the car in view
+    // when it drives up a wall or across the ceiling, instead of the boom stopping
+    // dead against the shell as it used to. The only guard is the floor, which the
+    // camera never drops below.
+    let mut desired = car_pos + boom;
+    desired.y = desired.y.max(CAMERA_FLOOR_MARGIN);
 
     // Where the camera looks. Ball cam frames the ball; car cam (or while the
-    // look controls are in use, or once a wall has pushed the camera overhead)
-    // squares up on the car, so a swivel keeps the car centred instead of
-    // dragging the aim off toward the ball.
+    // look controls are in use) squares up on the car, so a swivel keeps the car
+    // centred instead of dragging the aim off toward the ball.
     //
     // This is an absolute aim point, not a weighted average of the car and ball
     // positions: blending the raw positions lets the aim drift behind the camera
@@ -1844,8 +1808,8 @@ fn chase_camera(
         (look_x.abs().max(look_y.abs()) as f32).clamp(0.0, 1.0)
     };
     // Ball cam frames the ball (the car sits between the camera and the ball);
-    // car cam, look-behind, a swivel, or a wall squeeze square up on the car.
-    let frame_ball = ball_cam.0 && !behind && squeeze < 0.001 && look_amount < 0.5;
+    // car cam, look-behind, or a swivel square up on the car.
+    let frame_ball = ball_cam.0 && !behind && look_amount < 0.5;
     let car_aim = car_pos + aim_offset;
     let aim = if frame_ball {
         // Aim at the ball so it stays framed; the low ball-cam boom keeps the
@@ -1878,11 +1842,6 @@ fn chase_camera(
         };
         transform.look_at(aim, up);
     }
-}
-
-/// Shortest distance from a point to any of the four walls.
-fn wall_clearance(p: Vec3) -> f32 {
-    (ARENA_HALF_X - p.x.abs()).min(ARENA_HALF_Z - p.z.abs())
 }
 
 fn update_hud(
@@ -1971,35 +1930,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn clamp_inside_leaves_the_wall_margin() {
-        let p = clamp_inside(Vec3::new(100.0, -5.0, -100.0), CAMERA_WALL_MARGIN);
-        assert!((p.x - (ARENA_HALF_X - CAMERA_WALL_MARGIN)).abs() < 1e-6);
-        assert!((p.y - CAMERA_WALL_MARGIN).abs() < 1e-6);
-        assert!((p.z - (-ARENA_HALF_Z + CAMERA_WALL_MARGIN)).abs() < 1e-6);
-    }
-
-    #[test]
-    fn open_ice_gives_the_camera_its_full_boom() {
-        let pivot = clamp_inside(Vec3::new(0.0, 1.2, 0.0), CAMERA_WALL_MARGIN);
-        let wanted = Vec3::new(0.0, 2.6, -CAMERA_DISTANCE);
-        assert!((free_fraction(pivot, wanted, CAMERA_WALL_MARGIN) - 1.0).abs() < 1e-6);
-    }
-
-    #[test]
-    fn a_wall_behind_the_car_blocks_the_boom() {
-        // Backed against the -Z wall facing away, so the preferred position is
-        // outside the arena. This is the case that used to pin the camera to
-        // the wall (and therefore onto the car itself).
+    fn the_boom_is_not_clipped_against_the_arena() {
+        // The arena is a see-through cage, so a car backed against a wall gets
+        // its full boom even though that puts the camera outside the arena: the
+        // shell is drawn one-sided and the car stays visible through it.
         let car = Vec3::new(0.0, 0.18, -(ARENA_HALF_Z - 0.6));
-        let pivot = clamp_inside(car + Vec3::Y * 1.2, CAMERA_WALL_MARGIN);
-        let wanted = car - Vec3::new(0.0, 0.0, 1.0) * CAMERA_DISTANCE + Vec3::Y * CAMERA_HEIGHT;
-
-        let reach = free_fraction(pivot, wanted, CAMERA_WALL_MARGIN);
-        assert!(reach < 0.1, "boom should be blocked, got {reach}");
-
-        // And whatever it does, it must stay inside the arena.
-        let blocked = clamp_inside(pivot.lerp(wanted, reach), CAMERA_WALL_MARGIN);
-        assert!(blocked.z >= -ARENA_HALF_Z + CAMERA_WALL_MARGIN - 1e-6);
+        let (boom, _) = camera_frame(Vec3::new(0.0, 0.0, 1.0), Vec3::Y, 0.0, resting_pitch());
+        let desired = car + boom;
+        assert!(
+            desired.z < -ARENA_HALF_Z,
+            "the camera should sit outside the wall, got {desired:?}"
+        );
     }
 
     #[test]
@@ -2140,25 +2081,40 @@ mod tests {
     }
 
     #[test]
-    fn ball_bearing_tracks_the_ball_on_a_wall() {
+    fn ball_cam_swings_the_boom_outside_the_wall() {
+        // Car high on the +X wall, ball in-field. Ball cam puts the camera on the
+        // far side of the car from the ball - *outside* the wall - so the car is in
+        // front of the ball looking back in through the cage.
+        let car_up = Vec3::new(-1.0, 0.0, 0.0);
         let forward = Vec3::new(0.0, 1.0, 0.0);
-        let up = Vec3::new(-1.0, 0.0, 0.0);
-        // Ball 10 m down the wall from the car: a solid bearing, not zero.
-        let bearing = ball_bearing(forward, up, Vec3::new(0.0, 0.0, -10.0));
-        assert!(bearing.abs() > 0.5, "bearing {bearing}");
-        // Directly off the wall (along the car's up) there is no bearing.
-        assert_eq!(ball_bearing(forward, up, Vec3::new(-10.0, 0.0, 0.0)), 0.0);
-
-        // On the ground it matches the old horizontal formula exactly.
-        let g_forward = Vec3::new(0.0, 0.0, 1.0);
-        let n = Vec3::new(1.0, 0.0, 0.0);
-        let expected =
-            (g_forward.z * n.x - g_forward.x * n.z).atan2(g_forward.x * n.x + g_forward.z * n.z);
-        let got = ball_bearing(g_forward, Vec3::Y, Vec3::new(10.0, 3.0, 0.0));
+        let half_x = rl::Arena::default().half_x as f32;
+        let car = Vec3::new(half_x - 0.2, 8.0, 0.0);
+        let ball = Vec3::new(20.0, 2.0, 3.0);
+        let (yaw, pitch) = ball_cam_angle(car_up, forward, ball - car);
+        let (boom, _) = camera_frame(forward, car_up, yaw, pitch);
+        let camera = car + boom;
         assert!(
-            (got - expected).abs() < 1e-6,
-            "got {got}, expected {expected}"
+            camera.x > half_x,
+            "the camera should sit outside the +X wall, got {camera:?}"
         );
+        assert!(
+            boom.dot(ball - car) < 0.0,
+            "the boom should point away from the ball: {boom:?}"
+        );
+    }
+
+    #[test]
+    fn ball_cam_on_the_floor_still_trails_the_car() {
+        // Ball ahead on the ground: the boom stays behind and above the car, i.e.
+        // the plain resting chase offset.
+        let forward = Vec3::new(0.0, 0.0, 1.0);
+        let car = Vec3::new(0.0, 0.2, 0.0);
+        let ball = Vec3::new(0.0, 0.2, 10.0);
+        let (yaw, pitch) = ball_cam_angle(Vec3::Y, forward, ball - car);
+        let (boom, _) = camera_frame(forward, Vec3::Y, yaw, pitch);
+        assert!(boom.z < -1.0, "boom should be behind the car: {boom:?}");
+        assert!(boom.y > 1.0, "boom should be above the car: {boom:?}");
+        assert!(yaw.abs() < 1e-4, "yaw {yaw}");
     }
 
     #[test]

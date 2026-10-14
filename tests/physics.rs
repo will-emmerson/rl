@@ -779,6 +779,41 @@ fn a_car_drives_up_the_goal_scoop() {
 }
 
 #[test]
+fn the_goal_scoop_carries_the_car_back_out_at_any_speed() {
+    // In at the bottom of the mouth, up the curved back and back out over the lip -
+    // at any entry speed. Before the recess's corners were filleted (`GOAL_FILLET`)
+    // a car rolling up the back jammed where the scoop meets the flat back wall and
+    // the flat wall meets the roof.
+    for speed in [5.0, 9.0, 13.0] {
+        let mut world = World::new();
+        let half_z = world.arena.half_z;
+        world.car.pos = Vec3::new(0.0, CAR_HALF_HEIGHT, half_z - 3.0);
+        world.car.forward = Vec3::new(0.0, 0.0, 1.0);
+        world.car.up = Vec3::UP;
+        world.car.velocity = Vec3::new(0.0, 0.0, speed);
+        let drive = Input::new(1.0, 0.0, false, false, false);
+        let mut peak = 0.0_f64;
+        let mut went_in = false;
+        let mut out = false;
+        for _ in 0..400 {
+            world.step(&drive);
+            peak = peak.max(world.car.pos.y);
+            let behind = world.car.pos.z - half_z;
+            if behind > 2.0 {
+                went_in = true;
+            }
+            if went_in && behind < -1.0 {
+                out = true;
+                break;
+            }
+        }
+        assert!(went_in, "speed {speed}: the car never entered the goal");
+        assert!(peak > 2.0, "speed {speed}: the car never climbed the scoop");
+        assert!(out, "speed {speed}: the car jammed in the goal");
+    }
+}
+
+#[test]
 fn ball_scores_in_the_goal_and_returns_to_kickoff() {
     let mut world = World::new();
     let half_z = world.arena.half_z;
