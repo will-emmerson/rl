@@ -112,21 +112,91 @@ fn yaw_rate_for_speed(speed: f64) -> f64 {
 }
 
 #[test]
-fn car_accelerates_then_saturates() {
+fn throttle_tops_out_below_boost() {
+    // RL gates engine torque by `DRIVE_SPEED_TORQUE_FACTOR_CURVE`, which hits
+    // zero at 1410 uu/s: throttle alone saturates near 14.1 m/s, and boost is
+    // what carries the car up to the CAR_MAX_SPEED hard clamp.
     let mut world = World::new();
     let drive = Input::new(1.0, 0.0, false, false, false);
     for _ in 0..120 {
         world.step(&drive);
     }
     let after_1s = world.car.speed();
-    assert!((7.0..=9.0).contains(&after_1s), "got {after_1s} after 1 s");
+    assert!((5.5..=7.0).contains(&after_1s), "got {after_1s} after 1 s");
 
-    let mut peak: f64 = 0.0;
-    for _ in 0..400 {
+    let mut throttle_peak: f64 = 0.0;
+    for _ in 0..600 {
         world.step(&drive);
-        peak = peak.max(world.car.speed());
+        throttle_peak = throttle_peak.max(world.car.speed());
     }
-    assert!((peak - CAR_MAX_SPEED).abs() < 0.05, "peaked at {peak}");
+    assert!(
+        throttle_peak > 13.5 && throttle_peak < 14.2,
+        "throttle-only peak {throttle_peak} should sit at the 1410 uu/s ceiling"
+    );
+
+    // Boost is the only thing that reaches the 23 m/s clamp.
+    let boost = Input::new(1.0, 0.0, true, false, false);
+    let mut boost_peak: f64 = 0.0;
+    for _ in 0..600 {
+        world.step(&boost);
+        boost_peak = boost_peak.max(world.car.speed());
+    }
+    assert!(
+        (boost_peak - CAR_MAX_SPEED).abs() < 0.05,
+        "boosted peak {boost_peak}"
+    );
+}
+
+#[test]
+fn coasting_brakes_the_car_to_a_stop() {
+    // Releasing the throttle coasts with RL's `COASTING_BRAKE_FACTOR` and then a
+    // full stop below `STOPPING_FORWARD_VEL`, rather than rolling forever.
+    let mut world = World::new();
+    let drive = Input::new(1.0, 0.0, false, false, false);
+    for _ in 0..360 {
+        world.step(&drive);
+    }
+    assert!(
+        world.car.speed() > 8.0,
+        "should be rolling: {}",
+        world.car.speed()
+    );
+
+    let idle = Input::default();
+    let mut stopped = false;
+    for _ in 0..1200 {
+        world.step(&idle);
+        if world.car.speed() < 0.01 {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "never coasted to a stop: {}", world.car.speed());
+}
+
+#[test]
+fn reversing_brakes_first_then_backs_up() {
+    // A throttle against the direction of travel is RL's full brake until the
+    // car stops, and only then reverse.
+    let mut world = World::new();
+    world.car.velocity = world.car.heading() * 10.0;
+    let reverse = Input::new(-1.0, 0.0, false, false, false);
+
+    let mut braked = false;
+    for _ in 0..600 {
+        let before = world.car.forward_speed();
+        world.step(&reverse);
+        let after = world.car.forward_speed();
+        if before > 1.0 && after < before {
+            braked = true;
+        }
+    }
+    assert!(braked, "reverse input should have braked first");
+    assert!(
+        world.car.forward_speed() < -2.0,
+        "should end up reversing: {}",
+        world.car.forward_speed()
+    );
 }
 
 #[test]
@@ -420,6 +490,30 @@ fn flip_needs_directional_input() {
     assert!(!world.car.has_flipped, "...not a flip");
 }
 
+#[test]
+fn flip_dodge_stays_horizontal_when_pitched() {
+    // RL flattens the dodge to the ground plane, so a flip adds no vertical
+    // velocity even if the car is pitched when it fires.
+    let mut world = airborne_world();
+    let e = std::f64::consts::FRAC_1_SQRT_2;
+    world.car.forward = Vec3::new(0.0, e, e); // nose up ~45 deg
+    world.car.up = Vec3::new(0.0, e, -e);
+    world.car.velocity = Vec3::ZERO;
+
+    let mut input = Input::new(1.0, 0.0, false, false, true);
+    input.pitch = -1.0; // stick forward: a frontflip dodge
+    world.step(&input);
+
+    assert!(world.car.has_flipped, "should have flipped");
+    // Only gravity (GRAVITY * DT) and the tiny air throttle are vertical; the
+    // dodge itself is flat. With a 3D dodge this would jump by several m/s.
+    assert!(
+        (world.car.velocity.y - GRAVITY * DT).abs() < 0.05,
+        "dodge should be horizontal, velocity = {:?}",
+        world.car.velocity
+    );
+}
+
 // --- Curved arena: driving on walls and the ceiling ---
 
 /// Aim the car at the +X wall and drive flat out, returning the world.
@@ -539,6 +633,34 @@ fn car_slides_down_a_wall_when_it_stops() {
         "did not slide back to the floor: pos {:?} up {:?}",
         world.car.pos,
         world.car.up
+    );
+}
+
+#[test]
+fn wall_grip_depends_on_the_throttle() {
+    // NON_STICKY_FRICTION_FACTOR_CURVE: on a vertical wall, lateral grip is a
+    // tenth of the floor's unless the car is throttling (or boosting) - the
+    // "non-sticky" contact that lets a car slide down a wall it is not powering
+    // against. Same sideways push on the same wall, only the throttle differs.
+    let a = Arena::default();
+    let lateral_left = |throttle: f64| {
+        let mut w = World::new();
+        w.car.pos = Vec3::new(a.half_x - CAR_HALF_HEIGHT, 12.0, 0.0);
+        w.car.up = Vec3::new(-1.0, 0.0, 0.0);
+        w.car.forward = Vec3::new(0.0, 1.0, 0.0);
+        w.car.velocity = Vec3::new(0.0, 0.0, 2.0); // across the wall
+        w.car.airborne = false;
+        for _ in 0..10 {
+            w.step(&Input::new(throttle, 0.0, false, false, false));
+        }
+        w.car.velocity.dot(Vec3::new(0.0, 0.0, 1.0)).abs()
+    };
+    let coasting = lateral_left(0.0);
+    let powering = lateral_left(1.0);
+    assert!(coasting > 0.0, "should still be sliding: {coasting}");
+    assert!(
+        powering < coasting,
+        "throttle should grip better on a wall: powering {powering}, coasting {coasting}"
     );
 }
 

@@ -36,7 +36,10 @@ pub const CAR_WHEELBASE: f64 = 0.85;
 
 /// Engine acceleration is not a RocketSim constant — RL drives the car through
 /// a `btRaycastVehicle` wheel torque (`THROTTLE_TORQUE_AMOUNT`), not a linear
-/// acceleration. This stays a tuned-for-feel value.
+/// acceleration, so this *magnitude* stays tuned for feel. It is gated, though,
+/// by RL's real `DRIVE_SPEED_TORQUE_FACTOR_CURVE` (see
+/// `drive_speed_torque_factor`), so throttle alone saturates near 1410 uu/s
+/// (~14.1 m/s) as it does in the game.
 pub const CAR_ENGINE_ACCEL: f64 = 8.0;
 /// `CAR_MAX_SPEED = 2300 uu/s`. Rocket League clamps the car's *total* speed to
 /// this every tick, so it is a hard ceiling (see `Car::clamp_limits`). The
@@ -48,19 +51,38 @@ pub const CAR_MAX_ANG_SPEED: f64 = 5.5;
 pub const CAR_BOOST_ACCEL_GROUND: f64 = 9.916_666_666_666_666;
 /// `BOOST_ACCEL_AIR = 3175/3 uu/s^2`. Boost pulls slightly harder in the air.
 pub const CAR_BOOST_ACCEL_AIR: f64 = 10.583_333_333_333_332;
-/// Rocket League has no separate boosted speed cap — boost accelerates up to
-/// `CAR_MAX_SPEED` like everything else.
+/// Rocket League has no separate boosted speed cap: boost accelerates up to the
+/// same `CAR_MAX_SPEED` hard clamp. Boost is the *only* way to reach it —
+/// throttle alone is gated by `DRIVE_SPEED_TORQUE_FACTOR_CURVE` to ~1410 uu/s.
 pub const CAR_MAX_BOOST_SPEED: f64 = CAR_MAX_SPEED;
 pub const CAR_OVERSPEED_DECEL: f64 = 2.0;
-pub const CAR_REVERSE_ACCEL: f64 = 6.0;
-pub const CAR_MAX_REVERSE_SPEED: f64 = 10.0;
 pub const CAR_BRAKE_DECEL: f64 = 18.0;
+/// `THROTTLE_DEADZONE = 0.001`: a throttle below this magnitude counts as no
+/// throttle at all, so the car is coasting.
+pub const CAR_THROTTLE_DEADZONE: f64 = 0.001;
+/// `STOPPING_FORWARD_VEL = 25 uu/s`: while coasting, below this forward speed
+/// the full brake is applied, so the car comes to a clean stop rather than
+/// creeping.
+pub const CAR_STOPPING_FORWARD_SPEED: f64 = 0.25;
+/// `COASTING_BRAKE_FACTOR = 0.15`: the fraction of full brake applied while
+/// coasting (throttle released but still rolling).
+pub const CAR_COASTING_BRAKE_FACTOR: f64 = 0.15;
+/// `BRAKING_NO_THROTTLE_SPEED_THRESH = 0.01 uu/s`: above this, braking kills the
+/// throttle, so engine and brake never pull against each other.
+pub const CAR_BRAKING_NO_THROTTLE_SPEED_THRESH: f64 = 0.0001;
 
-/// Lateral velocity retained per tick. High grip keeps the velocity glued to
-/// the heading; the handbrake keeps more of it, which is what makes a drift.
+/// The two ends of the lateral-grip mapping. `CAR_GRIP_KEEP` is the velocity
+/// retained per tick at full lateral friction; `CAR_DRIFT_KEEP` is the (higher)
+/// retention at zero friction. RL's `LAT_FRICTION_CURVE`,
+/// `NON_STICKY_FRICTION_FACTOR_CURVE` and the handbrake curves pick a value in
+/// between (`grip_keep`); these two only set the range. The velocity mapping is
+/// ours — RL resolves grip with per-wheel friction impulses, not a retention
+/// factor — so the endpoints stay tuned for feel.
 pub const CAR_GRIP_KEEP: f64 = 0.90;
 pub const CAR_DRIFT_KEEP: f64 = 0.985;
-pub const CAR_ROLLING_KEEP: f64 = 0.995;
+/// `HANDBRAKE_LAT_FRICTION_FACTOR_CURVE`: the handbrake scales lateral friction
+/// down to this, blended in by the analog `handbrake_val`.
+pub const HANDBRAKE_LAT_FRICTION_FACTOR: f64 = 0.1;
 
 /// Restitution for a car *bouncing* off a surface it is not landing on - a
 /// sideways wall hit, or the floor while inverted. Not a RocketSim figure: RL
@@ -371,18 +393,61 @@ impl Car {
         v_forward += g_tangent.dot(f) * dt;
         v_lateral += g_tangent.dot(r) * dt;
 
-        // --- longitudinal ---
+        // --- longitudinal (throttle / brake / coast) ---
+        // RL's `_UpdateWheels` splits wheel torque into an engine force and a
+        // brake force. The engine is gated by `DRIVE_SPEED_TORQUE_FACTOR_CURVE`
+        // (zero at 1410 uu/s, so throttle alone saturates near 14.1 m/s); a
+        // throttle opposite the direction of travel, or a released throttle,
+        // applies the brake instead; and holding boost counts as full throttle.
         let boosting = input.boost && self.boost > 0.0;
-        if input.throttle > 0.0 {
-            v_forward += CAR_ENGINE_ACCEL * input.throttle * dt;
-        } else if input.throttle < 0.0 {
-            if v_forward > 0.5 {
-                v_forward = (v_forward - CAR_BRAKE_DECEL * dt).max(0.0);
-            } else {
-                v_forward -= CAR_REVERSE_ACCEL * -input.throttle * dt;
-            }
+        let real_throttle = if boosting { 1.0 } else { input.throttle };
+        // Off throttle and off boost the contact is "non-sticky": the same curve
+        // that cuts lateral grip on a wall also cuts the brake, so a car parked
+        // on a wall slides instead of its brakes holding it. RL brakes through
+        // the tyre; this traction scale is our stand-in for that.
+        let sticky = real_throttle != 0.0;
+        let traction = if sticky {
+            1.0
         } else {
-            v_forward *= CAR_ROLLING_KEEP;
+            non_sticky_friction_factor(up.y)
+        };
+
+        let drive_scale = drive_speed_torque_factor(speed_uu);
+        let mut engine_throttle = real_throttle;
+        let mut brake = 0.0;
+        if !input.handbrake {
+            if real_throttle.abs() >= CAR_THROTTLE_DEADZONE {
+                if speed_uu > CAR_STOPPING_FORWARD_SPEED * 100.0
+                    && (real_throttle >= 0.0) != (v_forward >= 0.0)
+                {
+                    // Driving against the direction of travel: full brake, and
+                    // kill the engine so the two never fight.
+                    brake = 1.0;
+                    if speed_uu > CAR_BRAKING_NO_THROTTLE_SPEED_THRESH * 100.0 {
+                        engine_throttle = 0.0;
+                    }
+                }
+            } else {
+                // Coasting: no engine, a gentle brake - a full stop when slow.
+                engine_throttle = 0.0;
+                brake = if speed_uu < CAR_STOPPING_FORWARD_SPEED * 100.0 {
+                    1.0
+                } else {
+                    CAR_COASTING_BRAKE_FACTOR
+                };
+            }
+        }
+
+        v_forward += CAR_ENGINE_ACCEL * engine_throttle * drive_scale * dt;
+        if brake > 0.0 {
+            // The brake only decelerates, and stops at zero rather than driving
+            // the car backwards through it.
+            let decel = CAR_BRAKE_DECEL * brake * traction * dt;
+            v_forward = if v_forward.abs() <= decel {
+                0.0
+            } else {
+                v_forward - v_forward.signum() * decel
+            };
         }
 
         if boosting {
@@ -398,11 +463,39 @@ impl Car {
         } else {
             CAR_MAX_SPEED
         };
-        v_forward = v_forward.clamp(-CAR_MAX_REVERSE_SPEED, cap);
+        // RL clamps total speed to `CAR_MAX_SPEED` in both directions; the reverse
+        // limit is the same torque curve, so it emerges rather than being a
+        // separate constant.
+        v_forward = v_forward.clamp(-CAR_MAX_SPEED, cap);
 
         // --- lateral grip ---
-        // Grip blends towards the looser drift value as the powerslide builds.
-        let keep = CAR_GRIP_KEEP + (CAR_DRIFT_KEEP - CAR_GRIP_KEEP) * self.handbrake_val;
+        // RL has no single grip constant: each wheel's lateral friction is
+        // scaled by `LAT_FRICTION_CURVE` (it falls as the contact point slides
+        // more sideways), by the handbrake curves, and — whenever the car is
+        // neither throttling nor boosting ("non-sticky") — by
+        // `NON_STICKY_FRICTION_FACTOR_CURVE`, which is why a car with no throttle
+        // has almost no grip on a vertical wall. Our contact is a velocity-level
+        // point, so the friction value maps to a per-tick retention between
+        // `CAR_DRIFT_KEEP` (no friction) and `CAR_GRIP_KEEP` (full friction).
+        let lateral_speed_uu = v_lateral.abs() * 100.0;
+        let longitudinal_speed_uu = v_forward.abs() * 100.0;
+        // Fraction of the contact speed that is sideways; below a small deadzone
+        // it counts as no slip at all.
+        let slip_ratio = if lateral_speed_uu > 5.0 {
+            lateral_speed_uu / (longitudinal_speed_uu + lateral_speed_uu)
+        } else {
+            0.0
+        };
+        let mut lat_friction = lat_friction_curve(slip_ratio);
+        if self.handbrake_val > 0.0 {
+            // HANDBRAKE_LAT_FRICTION_FACTOR_CURVE is a flat 0.1, blended in by
+            // the analog handbrake value.
+            lat_friction *= (HANDBRAKE_LAT_FRICTION_FACTOR - 1.0) * self.handbrake_val + 1.0;
+        }
+        // Off throttle and off boost, grip scales down with how vertical the
+        // surface is (the same `traction` factor that scales braking above).
+        lat_friction *= traction;
+        let keep = CAR_DRIFT_KEEP + (CAR_GRIP_KEEP - CAR_DRIFT_KEEP) * lat_friction;
         v_lateral *= keep;
 
         self.velocity = f * v_forward + r * v_lateral;
@@ -649,10 +742,20 @@ impl Car {
             dodge_vel.x *= CAR_FLIP_BACKWARD_IMPULSE_SCALE_X;
         }
 
-        // Push along the car's own forward/right axes, so a flip launched off a
-        // wall aims the same way it would from the floor. On the ground those
-        // axes are already horizontal, so this matches the old flattened dodge.
-        self.velocity += self.forward * dodge_vel.x + self.right() * dodge_vel.y;
+        // RL flattens the dodge to the ground plane (`GetForwardDir().To2D()` and
+        // a right vector spun from it), so a flip always adds *horizontal*
+        // velocity even if the car is pitched or rolled the moment it fires.
+        // For a level car this is exactly `self.forward` / `self.right()`.
+        let flat_forward = {
+            let f = Vec3::new(self.forward.x, 0.0, self.forward.z);
+            if f.length_squared() > 1e-12 {
+                f.normalized()
+            } else {
+                Vec3::new(0.0, 0.0, 1.0)
+            }
+        };
+        let flat_right = flat_forward.cross(Vec3::UP);
+        self.velocity += flat_forward * dodge_vel.x + flat_right * dodge_vel.y;
     }
 
     /// Integrate the body attitude from the angular velocity and re-orthonormalise.
@@ -866,6 +969,34 @@ fn powerslide_steer_angle_from_speed(speed_uu: f64) -> f64 {
     piecewise_linear(&POINTS, speed_uu)
 }
 
+/// Rocket League's `DRIVE_SPEED_TORQUE_FACTOR_CURVE`: the wheel-torque scale as
+/// a function of forward speed (uu/s). It is 1 at a standstill and reaches zero
+/// at 1410 uu/s, so throttle alone cannot push the car past ~14.1 m/s. Reaching
+/// `CAR_MAX_SPEED` (2300 uu/s) needs boost. RL applies this to a wheel torque;
+/// our engine term is a linear acceleration, so the same curve gates it.
+fn drive_speed_torque_factor(speed_uu: f64) -> f64 {
+    const POINTS: [(f64, f64); 3] = [(0.0, 1.0), (1400.0, 0.1), (1410.0, 0.0)];
+    piecewise_linear(&POINTS, speed_uu)
+}
+
+/// Rocket League's `LAT_FRICTION_CURVE`: lateral friction as a function of the
+/// fraction of the contact velocity that is sideways (0 = rolling straight,
+/// 1 = pure lateral slide). Grip falls from full to 0.2 as the car slides, so a
+/// hard slide loses traction the way it does in RL.
+fn lat_friction_curve(slip_ratio: f64) -> f64 {
+    const POINTS: [(f64, f64); 2] = [(0.0, 1.0), (1.0, 0.2)];
+    piecewise_linear(&POINTS, slip_ratio)
+}
+
+/// Rocket League's `NON_STICKY_FRICTION_FACTOR_CURVE`: with no throttle input
+/// (and no boost) friction is scaled by how vertical the surface is — full grip
+/// on the floor, a tenth of it on a vertical wall, half at 45 degrees. The input
+/// is the contact normal's up component (RL's `contactNormalWS.z()`).
+fn non_sticky_friction_factor(normal_up: f64) -> f64 {
+    const POINTS: [(f64, f64); 3] = [(0.0, 0.1), (0.7075, 0.5), (1.0, 1.0)];
+    piecewise_linear(&POINTS, normal_up)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -877,6 +1008,30 @@ mod tests {
         assert!((steer_angle_from_speed(3000.0) - 0.03454).abs() < 1e-12);
         // Clamped beyond the final knot.
         assert!((steer_angle_from_speed(9000.0) - 0.03454).abs() < 1e-12);
+    }
+
+    #[test]
+    fn friction_curves_match_the_rocketsim_knots() {
+        // LAT_FRICTION_CURVE: full grip rolling, 0.2 in a pure slide.
+        assert!((lat_friction_curve(0.0) - 1.0).abs() < 1e-12);
+        assert!((lat_friction_curve(0.5) - 0.6).abs() < 1e-12);
+        assert!((lat_friction_curve(1.0) - 0.2).abs() < 1e-12);
+
+        // NON_STICKY_FRICTION_FACTOR_CURVE: 0.1 flat-on, 0.5 at 45 deg, 1.0 up.
+        assert!((non_sticky_friction_factor(0.0) - 0.1).abs() < 1e-12);
+        assert!((non_sticky_friction_factor(0.7075) - 0.5).abs() < 1e-12);
+        assert!((non_sticky_friction_factor(1.0) - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn drive_torque_curve_matches_the_rocketsim_knots() {
+        assert!((drive_speed_torque_factor(0.0) - 1.0).abs() < 1e-12);
+        assert!((drive_speed_torque_factor(1400.0) - 0.1).abs() < 1e-12);
+        assert!((drive_speed_torque_factor(1410.0) - 0.0).abs() < 1e-12);
+        // Midpoint of the first segment.
+        assert!((drive_speed_torque_factor(700.0) - 0.55).abs() < 1e-12);
+        // Zero engine force beyond the final knot: no throttle past ~14.1 m/s.
+        assert_eq!(drive_speed_torque_factor(2300.0), 0.0);
     }
 
     #[test]

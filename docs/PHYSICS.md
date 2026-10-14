@@ -177,22 +177,25 @@ does and doesn't mean:
 
 ## Model summary
 
-| Piece    | Model                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Arena    | Rounded box as a signed-distance field (chamfered vertical corners, filleted wall/floor and wall/ceiling joins), 81.92 x 102.40 x 20.48 m (RocketSim `ARENA_EXTENT_X/Y`, `ARENA_HEIGHT`); not RL's collision mesh                                                                                                                                                                                                                                                                                                                                                            |
-| Ball     | Sphere, `r = 0.9125`, `m = 30`. Gravity, Bullet-style linear drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin. Speed and spin are hard-capped at 60 m/s and 6 rad/s                                                                                                                                                                                                                                                                                                                                                                      |
-| Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.205 x 0.867 x 0.387 (real Octane, per RocketSim), `m = 180`. Steering from RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model (`omega = v * tan(steer) / wheelbase`); analog powerslide; boost meter; jump = immediate impulse + held force, then a double jump _or_ a flip; full 3D air attitude with air control; total speed clamped to 23 m/s, angular speed to 5.5 rad/s. The driving model runs in the current _surface's_ frame, so the car drives on the floor, up the walls and across the ceiling |
-| Boost    | 34 pads (6 big, 28 small) at RL's positions; big gives 100 boost / 10 s cooldown, small 12 / 4 s. Taken by driving over a pad near the floor                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| Goal     | A full-size Soccar goal at each end: a 17.8551 x 6.42775 m mouth, carved into the arena SDF. The net is a semicircular scoop (radius ~2.70 m) swept across the width, so a car can drive in low and ride the curve out the top. The ball scores when its centre passes RocketSim's `SOCCAR_GOAL_SCORE_BASE_THRESHOLD_Y` plus the ball radius (fully over the line), then resets to the centre spot                                                                                                                                                                           |
-| Car-ball | Sphere vs OBB closest-point, inelastic impulse (`e = 0`) with relative velocity at contact (car rotation included), plus Rocket League's extra hit impulse, equal-and-opposite reaction                                                                                                                                                                                                                                                                                                                                                                                      |
+| Piece    | Model                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| -------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Arena    | Rounded box as a signed-distance field (chamfered vertical corners, filleted wall/floor and wall/ceiling joins), 81.92 x 102.40 x 20.48 m (RocketSim `ARENA_EXTENT_X/Y`, `ARENA_HEIGHT`); not RL's collision mesh                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Ball     | Sphere, `r = 0.9125`, `m = 30`. Gravity, Bullet-style linear drag, Magnus from spin, Coulomb friction at contacts that converts sliding into spin. Speed and spin are hard-capped at 60 m/s and 6 rad/s                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| Car      | Bespoke driving model, _not_ a rigid body. Box hitbox 1.205 x 0.867 x 0.387 (real Octane, per RocketSim), `m = 180`. Steering from RL's `STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model (`omega = v * tan(steer) / wheelbase`); analog powerslide; RL's throttle/brake/coast split; boost meter; jump = immediate impulse + held force, then a double jump _or_ a flip; full 3D air attitude with air control; throttle gated by RL's `DRIVE_SPEED_TORQUE_FACTOR_CURVE` (throttle alone tops out near 14.1 m/s, boost reaches the 23 m/s hard clamp), angular speed to 5.5 rad/s. Lateral grip comes from RL's `LAT_FRICTION_CURVE`, `NON_STICKY_FRICTION_FACTOR_CURVE` and the handbrake curve (off-throttle grip falls on vertical surfaces), mapped to a per-tick velocity retention. The driving model runs in the current _surface's_ frame, so the car drives on the floor, up the walls and across the ceiling |
+| Boost    | 34 pads (6 big, 28 small) at RL's positions; big gives 100 boost / 10 s cooldown, small 12 / 4 s. Taken by driving over a pad near the floor                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| Goal     | A full-size Soccar goal at each end: a 17.8551 x 6.42775 m mouth, carved into the arena SDF. The net is a semicircular scoop (radius ~2.70 m) swept across the width, so a car can drive in low and ride the curve out the top. The ball scores when its centre passes RocketSim's `SOCCAR_GOAL_SCORE_BASE_THRESHOLD_Y` plus the ball radius (fully over the line), then resets to the centre spot                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| Car-ball | Sphere vs OBB closest-point, inelastic impulse (`e = 0`) with relative velocity at contact (car rotation included), plus Rocket League's extra hit impulse, equal-and-opposite reaction                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 
 Constants are community-sourced Rocket League figures converted to SI, now
 sourced from RocketSim rather than memory. They are still _approximations_ of a
-closed-source game: the steering curve and jump are ported from RL, but the tyre
-grip (`CAR_GRIP_KEEP` / `CAR_DRIFT_KEEP`) and the engine/brake forces
-(`CAR_ENGINE_ACCEL`, `CAR_BRAKE_DECEL`) are tuned for feel, not
-reverse-engineered. Matching RL exactly would need a parity harness against
-recorded ticks, which is a separate project.
+closed-source game: the steering curve and jump are ported from RL, but the grip
+_range_ (`CAR_GRIP_KEEP` / `CAR_DRIFT_KEEP`) and the brake force
+(`CAR_BRAKE_DECEL`) are tuned for feel, not reverse-engineered (the curves that
+pick a value inside that range — `LAT_FRICTION_CURVE`,
+`NON_STICKY_FRICTION_FACTOR_CURVE`, the handbrake curve — are RL's). The engine
+force's magnitude is tuned too, but its speed gate is RL's real
+`DRIVE_SPEED_TORQUE_FACTOR_CURVE`. Matching RL exactly would need a parity harness
+against recorded ticks, which is a separate project.
 
 ## Parity with Rocket League
 
@@ -217,9 +220,19 @@ What that changed:
 - **Car.** Boost acceleration split into ground/air (`2975/3` and `3175/3`
   uu/s^2), boost drain `100/3` per second, and the real Octane hitbox, which is
   slightly larger than the widely-shared figure. Total speed is clamped to
-  `CAR_MAX_SPEED = 2300 uu/s` every tick. Steering now uses RL's
-  `STEER_ANGLE_FROM_SPEED_CURVE` (max front-wheel angle vs speed) through a
-  bicycle model with the Octane wheelbase: `omega = v * tan(steer) / 0.85`. The
+  `CAR_MAX_SPEED = 2300 uu/s` every tick. Engine force is gated by RL's
+  `DRIVE_SPEED_TORQUE_FACTOR_CURVE` (1.0 at rest, 0 at 1410 uu/s), so throttle
+  alone saturates near 14.1 m/s and boost is what reaches the clamp. Lateral grip
+  uses RL's `LAT_FRICTION_CURVE` (which falls as the contact slides more
+  sideways), `NON_STICKY_FRICTION_FACTOR_CURVE` (off-throttle, grip scales with
+  how vertical the surface is) and `HANDBRAKE_LAT_FRICTION_FACTOR_CURVE`, mapped
+  onto a per-tick retention between `CAR_GRIP_KEEP` and `CAR_DRIFT_KEEP`. The
+  throttle/brake split is RL's `_UpdateWheels`: a throttle against the direction
+  of travel brakes (and cuts the engine) before reversing, a released throttle
+  coasts (`COASTING_BRAKE_FACTOR`, a full stop below `STOPPING_FORWARD_VEL`), and
+  boost counts as full throttle. Steering
+  now uses RL's `STEER_ANGLE_FROM_SPEED_CURVE` (max front-wheel angle vs speed)
+  through a bicycle model with the Octane wheelbase: `omega = v * tan(steer) / 0.85`. The
   turn radius grows from ~1.4 m at a crawl to ~13 m at top speed. Powerslide is
   the analog 0..1 value RL uses, ramping in and out, and it widens the usable
   steer angle via `POWERSLIDE_STEER_ANGLE_FROM_SPEED_CURVE`.
@@ -229,7 +242,9 @@ What that changed:
   0.025-0.2 s window (a tap peaks ~0.8 m, a hold ~2.5 m); then a double jump _or_
   a flip within `DOUBLEJUMP_MAX_DELAY = 1.25 s`. Air control is RL's pitch/yaw/roll
   torque (`CAR_AIR_CONTROL_TORQUE`) with its damping, and a flip applies the
-  dodge impulse (`FLIP_INITIAL_VEL_SCALE`) plus the fixed-time flip torque.
+  dodge impulse (`FLIP_INITIAL_VEL_SCALE`) plus the fixed-time flip torque. The
+  dodge is flattened to the ground plane as RL does (`To2D`), so a flip from a
+  pitched car still moves horizontally.
 - **Boost pads.** The 34 Soccar pads sit at RL's `LOCS_BIG_SOCCAR` /
   `LOCS_SMALL_SOCCAR` positions: the 6 big pads give the full 100 boost with a
   10 s cooldown (`COOLDOWN_BIG`) and the 28 small give 12 with 4 s. Boost is
@@ -264,7 +279,12 @@ What is still approximate, deliberately:
   `btRaycastVehicle` with four wheels, suspension and tyre slip. Steering uses
   RL's real steer curve and wheelbase, but a two-wheel approximation of a
   four-wheel vehicle that ignores slip, so the radii are a good first cut rather
-  than exactly RL's. Tyre grip and the engine/brake forces are still tuned.
+  than exactly RL's. The grip and brake magnitudes are still tuned, and the map
+  from RL's friction value to a velocity retention is ours (RL resolves grip with
+  per-wheel impulses, not a retention factor), and coasting/braking is a chassis
+  deceleration scaled by that traction rather than friction-limited wheel torque;
+  the engine force is gated by RL's
+  real `DRIVE_SPEED_TORQUE_FACTOR_CURVE`, but its magnitude is tuned too.
 - **Attitude is free in the air.** Our car has no suspension or auto-roll, so a
   car that lands badly (inverted, or sideways off a wall) is set back to a
   yaw-only attitude rather than settling. Wall and ceiling driving does work, but
