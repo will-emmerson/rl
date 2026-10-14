@@ -35,7 +35,7 @@
 //! `RLArenaCollisionDumper`; without them [`Sim::new`] panics with instructions.
 
 use bevy::math::Vec3;
-use rocketsim::{Arena, CarBodyConfig, CarControls, GameMode, Team};
+use rocketsim::{Arena, ArenaConfig, CarBodyConfig, CarControls, GameMode, Team};
 
 /// RocketSim length unit (uu = 1 cm) to metres.
 const UU_TO_M: f32 = 1.0 / 100.0;
@@ -43,6 +43,35 @@ const UU_TO_M: f32 = 1.0 / 100.0;
 /// Metres per RocketSim Bullet unit. The raw collision-mesh vertices are in
 /// Bullet units, where 1 BT = 0.5 m (5120 uu = 102.4 BT = 51.2 m).
 const BT_TO_M: f32 = 0.5;
+
+// --- Cosmetic constants ---------------------------------------------------
+//
+// These size the viewer's meshes. They are RocketSim's values (the physics is
+// RocketSim), so there is one source of truth; the RocketSim constant each one
+// comes from is named in its doc comment. Units are metres.
+
+/// Soccar tick rate: RocketSim `consts::TICK_RATE` (120 Hz).
+pub const TICK_HZ: f64 = 120.0;
+
+/// Soccar ball radius: RocketSim `consts::ball::RADIUS_SOCCAR` = 91.25 uu.
+pub const BALL_RADIUS: f32 = 0.9125;
+
+/// Soccar goal: half the mouth width and the crossbar height, from RocketSim
+/// `consts::goal::SOCCAR_GOAL_HALF_WIDTH` (892.755 uu) and `SOCCAR_GOAL_HEIGHT`
+/// (642.775 uu).
+pub const GOAL_HALF_WIDTH: f32 = 8.92755;
+pub const GOAL_HEIGHT: f32 = 6.42775;
+
+/// Octane hitbox half-extents: RocketSim `CarBodyConfig::OCTANE.hitbox_size`
+/// (120.507 x 86.6994 x 38.6591 uu). These size the *visual* car mesh; collision
+/// uses RocketSim's hitbox directly.
+pub const CAR_HALF_LENGTH: f32 = 0.602535;
+pub const CAR_HALF_WIDTH: f32 = 0.433_497;
+pub const CAR_HALF_HEIGHT: f32 = 0.193_295_5;
+
+/// Octane wheelbase, from RocketSim's front/back wheel offsets (51.25 and
+/// -33.75 uu, i.e. 85 uu = 0.85 m apart). Visual wheel placement only.
+pub const CAR_WHEELBASE: f32 = 0.85;
 
 /// RocketSim position (uu) -> viewer position (metres). See the module docs.
 fn pos_view(x: f32, y: f32, z: f32) -> Vec3 {
@@ -55,8 +84,8 @@ fn dir_view(x: f32, y: f32, z: f32) -> Vec3 {
     Vec3::new(-x, z, y)
 }
 
-/// Player input, in the viewer's own terms. Mirrors the shape of the old
-/// `rl::Input` so `read_input` stays easy to follow.
+/// Player input, in the viewer's own terms; `main.rs` fills this from keyboard
+/// and pad and [`step`] folds it into RocketSim's `CarControls`.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Input {
     /// -1 brake/reverse .. +1 accelerate.
@@ -167,7 +196,10 @@ impl Sim {
             );
         }
 
-        let mut arena = Arena::new(GameMode::Soccar);
+        // Fixed RNG seed: RocketSim draws kickoffs/respawns from it, and an
+        // unseeded arena makes the whole run - and so the self-driving capture -
+        // vary from launch to launch.
+        let mut arena = Arena::new_with_config(ArenaConfig::new(GameMode::Soccar).with_rng_seed(0));
         let car = arena.add_car(Team::Blue, CarBodyConfig::OCTANE);
         arena.reset_to_random_kickoff(None);
 

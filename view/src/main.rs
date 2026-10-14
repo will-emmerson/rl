@@ -1,9 +1,8 @@
-//! Bevy 3D viewer for `rl`.
+//! Bevy 3D viewer for the RocketSim simulation in `sim.rs`.
 //!
-//! The simulation is untouched and engine-free: this crate owns the render
-//! scene, feeds input into `rl::World`, and copies the resulting state onto
-//! transforms. Nothing here can affect the physics, so the determinism
-//! guarantees in `docs/PHYSICS.md` still hold with the viewer attached.
+//! This crate owns the render scene, feeds input into the simulation, and copies
+//! the resulting state onto transforms; nothing in the draw path feeds back into
+//! the physics.
 //!
 //! Run it:
 //!   cargo run -p rl_view                          # play (dev profile is playable)
@@ -25,15 +24,14 @@ use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
 
-use rl::arena::{GOAL_HALF_WIDTH, GOAL_HEIGHT};
-use rl::ball::BALL_RADIUS;
-use rl::car::{CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH, CAR_WHEELBASE};
-
 mod sim;
-use sim::Input as SimInput;
+use sim::{
+    Input as SimInput, BALL_RADIUS, CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH,
+    CAR_WHEELBASE, GOAL_HALF_WIDTH, GOAL_HEIGHT,
+};
 
-/// Arena dimensions, matching `rl::Arena::default()`: the goal line, frame and net
-/// sit at `ARENA_HALF_Z`.
+/// Arena dimensions, matching RocketSim's soccar arena: the goal line, frame and
+/// net sit at `ARENA_HALF_Z`.
 const ARENA_HALF_Z: f32 = 51.20;
 
 /// World size of one tile of the arena grid texture, in metres. Inside a tile
@@ -48,7 +46,7 @@ const GRID_CELL_PX: u32 = GRID_TEXELS / GRID_CELLS;
 
 /// Visual wheel radius, in metres. A fraction of the hitbox half height, so the
 /// tyre reaches the hitbox floor.
-const WHEEL_RADIUS: f32 = 0.52 * CAR_HALF_HEIGHT as f32;
+const WHEEL_RADIUS: f32 = 0.52 * CAR_HALF_HEIGHT;
 /// Full-lock angle for the visual front wheels, in radians. RL's real front-wheel
 /// angle is speed-dependent; this is a fixed stand-in.
 const MAX_WHEEL_STEER: f32 = 0.5;
@@ -236,7 +234,7 @@ fn main() {
         .insert_resource(GamepadDebug(gamepad_debug))
         .insert_resource(BallCam(true))
         .init_resource::<LastSteer>()
-        .insert_resource(Time::<Fixed>::from_hz(rl::TICK_HZ as f64))
+        .insert_resource(Time::<Fixed>::from_hz(sim::TICK_HZ))
         .add_systems(Startup, setup_scene)
         .add_systems(FixedUpdate, step_simulation.run_if(simulating))
         .add_systems(
@@ -342,7 +340,7 @@ fn setup_scene(
     // A football (truncated icosahedron): the black pentagons are what make the
     // spin readable, and it reads as a ball rather than a wireframe globe.
     commands.spawn((
-        Mesh3d(meshes.add(soccer_ball_mesh(BALL_RADIUS as f32))),
+        Mesh3d(meshes.add(soccer_ball_mesh(BALL_RADIUS))),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::WHITE,
             perceptual_roughness: 0.35,
@@ -435,7 +433,7 @@ fn setup_scene(
     // A team-coloured frame (posts and crossbar) at each goal line. The recess
     // behind it - the mouth and the net scoop - is part of RocketSim's collision
     // mesh, so `arena_surface_mesh` already draws it; only the coloured frame is
-    // added here. Sizes come from `rl::arena`.
+    // added here. Sizes come from RocketSim (`sim`).
     let goal_frame_blue = materials.add(StandardMaterial {
         base_color: Color::srgb(0.20, 0.45, 0.95),
         emissive: LinearRgba::rgb(0.10, 0.22, 0.50),
@@ -448,9 +446,9 @@ fn setup_scene(
         perceptual_roughness: 0.5,
         ..default()
     });
-    let w = GOAL_HALF_WIDTH as f32;
-    let h = GOAL_HEIGHT as f32;
-    // Blue defends -Z, orange +Z (matching `rl::arena::Goal`).
+    let w = GOAL_HALF_WIDTH;
+    let h = GOAL_HEIGHT;
+    // Blue defends -Z, orange +Z (matching the sim).
     for (sign, frame) in [(-1.0_f32, goal_frame_blue), (1.0_f32, goal_frame_orange)] {
         let z_line = sign * ARENA_HALF_Z;
         // Frame: two posts and a crossbar, at the goal line.
@@ -475,11 +473,7 @@ fn setup_scene(
     // reaches the hitbox ceiling, the nose and tail reach its ends, and the sill
     // sits clear of the ground with the wheels filling the arches. The collision
     // box is unchanged; this is only what you see.
-    let (hw, hh, hl) = (
-        CAR_HALF_WIDTH as f32,
-        CAR_HALF_HEIGHT as f32,
-        CAR_HALF_LENGTH as f32,
-    );
+    let (hw, hh, hl) = (CAR_HALF_WIDTH, CAR_HALF_HEIGHT, CAR_HALF_LENGTH);
     let body_color = linear_rgba(0.10, 0.60, 0.95);
     let glass_color = linear_rgba(0.04, 0.09, 0.15);
     let underside_color = linear_rgba(0.07, 0.07, 0.08);
@@ -579,7 +573,7 @@ fn setup_scene(
         // what make the rotation visible. They sit flush with the body sides, on
         // the sim's wheelbase.
         let front_axle = 0.46_f32;
-        let rear_axle = front_axle - CAR_WHEELBASE as f32;
+        let rear_axle = front_axle - CAR_WHEELBASE;
         let wheel_w = 0.24 * hw;
         for (x, z, steers) in [
             (-0.72 * hw, front_axle, true),
@@ -1837,7 +1831,7 @@ mod tests {
         // front of the ball looking back in through the cage.
         let car_up = Vec3::new(-1.0, 0.0, 0.0);
         let forward = Vec3::new(0.0, 1.0, 0.0);
-        let half_x = rl::Arena::default().half_x as f32;
+        let half_x = 40.96_f32; // RocketSim soccar half-width (4096 uu)
         let car = Vec3::new(half_x - 0.2, 8.0, 0.0);
         let ball = Vec3::new(20.0, 2.0, 3.0);
         let (yaw, pitch) = ball_cam_angle(car_up, forward, ball - car);

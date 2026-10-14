@@ -2,10 +2,9 @@
 name = "rl_view"
 version = "0.1.0"
 edition = "2021"
-description = "Bevy 3D viewer for the rl simulation"
+description = "Bevy 3D viewer running RocketSim for physics"
 
 [dependencies]
-rl = { path = ".." }
 
 # The physics. Pure-Rust RocketSim v3 ("a Rust library for simulating Rocket
 # League games"), pinned to the `v3-rust` branch head rather than the branch

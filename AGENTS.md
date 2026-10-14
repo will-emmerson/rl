@@ -5,92 +5,35 @@ rule changes.
 
 ## What this is
 
-A Rocket League-style game. The active code is a Bevy viewer running
+A Rocket League-like game: a Bevy 3D viewer (`rl_view`) that runs
 **[RocketSim](https://github.com/ZealanL/RocketSim)** (the pure-Rust v3) for
-physics, plus `rl`, a hand-rolled deterministic simulation kept as a reference:
+physics, and draws RocketSim's own arena collision mesh.
 
-- `view/` — `rl_view`: the Bevy 3D viewer. Its physics and its drawn arena both
-  come from RocketSim; `view/src/sim.rs` is the only place that knows about it.
-- `src/` — `rl`: a hand-rolled, dependency-free Rocket League simulation (arena +
-  ball + car + boost pads). Deterministic; the terminal demo runs on it. It is no
-  longer the game's physics.
+- `view/` — `rl_view`. `view/src/sim.rs` is the **only** place that knows about
+  RocketSim: it owns the `Arena`, converts RocketSim's frame and units into the
+  viewer's, exposes the car/ball/pads/score the scene reads, and builds the
+  collision mesh. `view/src/main.rs` is the scene, input, camera and HUD.
 - `tools/rlacd.py` — a Linux/Proton port of RLArenaCollisionDumper: dumps RL's
-  arena collision meshes, which RocketSim needs at runtime (see below).
-- `tests/` — `rl`'s physics behaviour and determinism tests.
+  arena collision meshes, which RocketSim needs at runtime (see below). Upstream
+  is Windows-only.
+- `docs/PHYSICS.md` — a write-up of the hand-rolled `rl` simulation that used to
+  be this repo's physics. **`rl` is retired**; the doc is kept as history.
 
-An earlier Godot 4 prototype was removed once the Rust implementation became the
-one we are building. `docs/PHYSICS.md` still cites it as the motivation for
-hand-rolling `rl`'s physics.
+The workspace is virtual; `view/` is the only crate.
 
-Start with `docs/PHYSICS.md` (why hand-rolled, and its honest caveats) and
-`README.md` (how to run it).
+## RocketSim is the reference
 
-## Determinism is the point — don't break it
+**[RocketSim](https://github.com/ZealanL/RocketSim) is the reference for Rocket
+League physics and dimensions** — use it (not memory or community lore) for both
+the numbers and the model. The viewer does not approximate the game: it _runs_
+RocketSim, and builds every constant it needs from RocketSim too.
 
-These rules apply to `rl`, the hand-rolled reference simulation. The viewer's
-physics is RocketSim, which is deterministic by design but is not covered by
-them.
-
-`rl` must produce a bit-identical state stream for a given input stream, so
-client-side prediction and replays can work. Inside the simulation step:
-
-- **No transcendentals.** `sin`/`cos`/`tan`/`powf`/`exp`/`ln` call platform libm
-  and are not portable across machines. Rotation goes through `math::rotate_y`
-  and `math::rotate_about`.
-  Otherwise only `+ - * /` and `sqrt`.
-- **No `mul_add`/FMA** — contraction is a real source of cross-target drift.
-- **No RNG, threads, wall-clock, or unordered-map iteration.**
-- **`DT` is a compile-time constant** (120 Hz). Never introduce a variable `dt`.
-- **New state must be hashed.** Add fields to `StateHasher` in `Car::hash_into` /
-  `Ball::hash_into`, and make sure `Clone` copies them, or divergence goes
-  undetected. (The car-ball extra-impulse cooldown is hashed this way.)
-- **`-0.0` is canonicalised** in the hash — keep it that way.
-- `rl` has **zero dependencies** by design. New crates go at most into
-  `view/`.
-
-The viewer must never feed back into the simulation: it reads `World` and writes
-transforms, nothing more. (The `sin`/`cos` ban is about the simulation step — the
-viewer is free to use trigonometry.)
-
-## Physics constants and dimensions come from RocketSim
-
-**[RocketSim](https://github.com/ZealanL/RocketSim) is the reference for
-Rocket League physics and dimensions** — use it (not memory or community lore)
-for both the numbers and the model.
-
-Gameplay constants (arena extents, ball radius/mass/friction, boost accel,
-hitbox size, car-ball restitution, and the car-ball _extra impulse_) are taken
-from **[RocketSim](https://github.com/ZealanL/RocketSim)**, not memory or
-community lore. Unreal units are centimetres, so the sim's SI values are the
-RocketSim number / 100. When you add or change one, cite the RocketSim name in
-its doc comment, as `arena.rs` / `ball.rs` / `car.rs` already do.
-
-Goal geometry (the mouth width/height and net depth, `arena::GOAL_*`) comes the
-same way, but is not in `RLConst.h`: RocketSim bakes the goal into its dumped
-arena collision mesh. So those numbers are taken from the RLBot
-[Useful Game Values](https://github.com/RLBot/RLBot/wiki/Useful-Game-Values)
-page that RocketSim's own comments cite, with the score line from RocketSim's
-`SOCCAR_GOAL_SCORE_BASE_THRESHOLD_Y`. The goal is not a box: fitting a circle to
-the goal region of RocketSim's soccar mesh gives the net's curved profile
-(`arena::GOAL_NET_*`). The goals are carved into the arena SDF (see
-`Arena::goal_field`) — the viewer draws the shell, cuts the same openings, and
-adds the frame and the swept net scoop. The recess's concave corners (scoop to
-back wall, back wall to roof) are filleted with `arena::GOAL_FILLET` — a gameplay
-fix, not a RocketSim figure, exactly like `CORNER_RADIUS`: a point-contact car
-follows smooth joins but jams on a sharp one, and without the fillet a car rolling
-up the curve could not get back out over the lip. The net mesh samples the same
-field, so the drawn scoop keeps the fillet.
-
-The car's _handling_ is now largely ported from RocketSim: steering uses RL's
-`STEER_ANGLE_FROM_SPEED_CURVE` through a bicycle model
-(`omega = v * tan(steer) / wheelbase`), the analog powerslide, the jump
-(`JUMP_IMMEDIATE_FORCE` + held `JUMP_ACCEL`), the mid-air air-control torque
-(`CAR_AIR_CONTROL_TORQUE`), and flips/dodges (`_UpdateDoubleJumpOrFlip`). What is
-_not_ reverse-engineered is the tyre grip (`CAR_GRIP_KEEP` / `CAR_DRIFT_KEEP`) and
-the engine/brake forces (`CAR_ENGINE_ACCEL`, `CAR_BRAKE_DECEL`); suspension, tyre
-slip and auto-roll are still not modelled. Wall and ceiling driving works anyway,
-via a rounded-arena SDF plus a "glue the car to the surface it is on" model (see
-`Car::step_grounded` / `resolve_arena`) — not RL's wheel model.
+Units are Unreal units (centimetres, `÷100` for metres). RocketSim's frame is
+right-handed, Z-up, `+X` forward, with the long axis on `Y`; the viewer's is
+Bevy's right-handed Y-up frame with the long axis on `Z`. `view/src/sim.rs`
+bridges them with a _rotation_, `view = (-x, z, y)` — not a mirror, so spin (a
+pseudovector) needs no sign flip. All of that lives in `sim.rs`; nothing else
+should know RocketSim's frame or units.
 
 ## Build / run / validate
 
@@ -104,13 +47,10 @@ cargo clippy --workspace --all-targets # kept clean
   **Don't default to `--release`**: it uses a separate target dir and rebuilds
   Bevy, which takes minutes.
 - Linux needs **`libudev-dev`** (gamepad via `bevy_gilrs`). Audio/ALSA is
-  deliberately excluded; Bevy features are listed explicitly in
-  `view/Cargo.toml`.
-- The viewer's physics is **RocketSim v3** (a git dependency in `view/Cargo.toml`;
-  see `view/src/sim.rs`). It needs RL's dumped arena meshes in
-  `RL/collision_meshes/soccar/` at runtime or it exits with a message; dump them
-  with `tools/rlacd.py` (Linux/Proton) or RLArenaCollisionDumper (Windows). `rl`
-  itself stays dependency-free.
+  deliberately excluded; Bevy features are listed explicitly in `view/Cargo.toml`.
+- The viewer needs RL's dumped arena meshes in `RL/collision_meshes/soccar/` at
+  runtime or it exits with a message. Dump them with `tools/rlacd.py`
+  (Linux/Proton) or RLArenaCollisionDumper (Windows).
 - Project tasks are defined in `.zed/tasks.json`.
 
 **To see your work, render a PNG** — both forms exit on their own:
@@ -123,8 +63,8 @@ cargo run -p rl_view -- --screenshot out.png --cam X,Y,Z --look X,Y,Z  # free ca
 - `--screenshot PATH [TICK]` drives the self-driving script to `TICK` (default
   **250**) and shoots the chase cam — a _dynamic_ pose. With no `PATH`,
   `screenshot.png` is used.
-- `--cam X,Y,Z` / `--look X,Y,Z` pin the camera at that eye point looking at
-  that target and **skip the sim**: instant, for eyeballing
+- `--cam X,Y,Z` / `--look X,Y,Z` pin the camera at that eye point looking at that
+  target and **skip the sim**: instant, for eyeballing
   geometry/materials/lighting from a chosen angle — but it only ever shows the
   kickoff scene (no dynamic pose). Either flag alone works (the other falls back
   to an overview default), and `TICK` is then ignored.
@@ -154,53 +94,33 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
 
 - **Chase camera:** the arena is a see-through cage, so the camera is _not_
   clipped to its walls — a car on a wall gets its full boom even when that puts the
-  camera outside the shell, and the one-sided shell (see below) keeps the car
-  visible through the wall. It is kept above the pitch (`CAMERA_FLOOR_MARGIN`) but
-  free to leave through the walls _and_ the roof, so ball cam can film a car on the
-  ceiling from above it. Ball cam points the boom straight away from the ball in
-  _full 3D_ (`ball_cam_angle`); measuring the bearing only in the car's tangent
-  plane (the old `ball_bearing`) kept the boom in the wall plane and left the car
-  behind the camera on a wall. Still: don't clamp the camera to the wall plane (it
-  collapses onto the car), and don't aim at a weighted average of car/ball positions
-  (it ends up facing the floor). See the comments in `view/src/main.rs`.
-- **Car turning:** never derive yaw rate from a lateral-acceleration budget — it
-  rises as `1/v` and pivots the car on the spot. The rate now comes from RL's
-  steer-angle curve as `omega = v * tan(steer) / wheelbase`, which is
-  proportional to `v`, so a standstill cannot pivot (`math::tan_small` keeps it
-  libm-free).
-- **Air control / flips: the world frame is left-handed.** The car's body frame
-  is `(forward, right, up)` with `right = forward x up`, which is left-handed,
-  whereas Rocket League's is right-handed. So RL's torque cross-products cannot
-  be copied verbatim — the `apply_air_control` / `start_flip` axes were derived
-  so the _behaviour_ matches (stick up = frontflip, stick left = yaw left, roll
-  right = roll right). The magnitudes and timings are still RL's constants.
-- **Attitude:** the car carries `forward` and `up` (orthonormal), integrated from
-  `ang_vel` and re-orthonormalised every step. If you touch that, keep it
-  orthonormal and hash every new field, or divergence hides.
-- **Arena is an SDF, not planes.** `Arena::inside_distance` is negative inside;
-  `Arena::normal_at` returns the _inward_ normal (the direction to push an object
-  out). It is a `max` of rounded terms, so its magnitude is only exact near a
-  surface — good enough for contacts, but do not lean on it as a true distance
-  far from the walls. `CORNER_RADIUS` / `FLOOR_FILLET` are gameplay guesses, not
-  RocketSim figures. The viewer draws the arena by ray-projecting this same SDF
-  (`arena_surface_mesh` in `view/src/main.rs`), so the drawn surface and the
-  collision surface stay in sync automatically. The shell is drawn one-sided
-  (`cull_mode: Some(Face::Front)`, every `BoxFace` wound front-outward via
-  `BoxFace::flip`), so from outside the cage the walls vanish and the camera can
-  watch the car through them. That replaced the old double-sided draw, whose
-  normal flipping left the interior ambient-only — the pitch is now directly
-  sunlit, and the ball/car cast shadows.
-- **A surface can only push.** A grounded car is glued on _except_ on an
-  overhanging surface (`normal.y < 0`: the ceiling and the upper fillet), where
-  gravity would peel it off, so it stays only above `CAR_STICK_SPEED`. Do not
-  "fix" a car parked on the ceiling — that it falls off is the point.
-- **Grounded car = glued to the surface.** `step_grounded` runs in the surface's
-  own frame and `align_up_to` rotates both attitude _and velocity_ onto the new
-  normal, which is what carries speed around the floor→wall→ceiling joins. Use
-  `rotate_about` / the cross-dot rotation there, never `acos`.
+  camera outside the shell, and the one-sided shell keeps the car visible through
+  the wall. It is kept above the pitch (`CAMERA_FLOOR_MARGIN`) but free to leave
+  through the walls _and_ the roof, so ball cam can film a car on the ceiling from
+  above it. Ball cam points the boom straight away from the ball in _full 3D_
+  (`ball_cam_angle`); measuring the bearing only in the car's tangent plane kept
+  the boom in the wall plane and left the car behind the camera on a wall. Still:
+  don't clamp the camera to the wall plane (it collapses onto the car), and don't
+  aim at a weighted average of car/ball positions (it ends up facing the floor).
+  See the comments in `view/src/main.rs`.
+- **The arena mesh is two sources, not one.** `sim::arena_collision_mesh` is
+  RocketSim's dumped `.cmf` triangles _plus_ four flat quads. The dumped meshes
+  carry only the _curved_ parts (corners, wall-to-floor/wall-to-ceiling fillets,
+  goal ends); RocketSim makes the flat floor, ceiling and long side walls from
+  static planes, so those must be added or the pitch/ceiling/side walls are holes
+  you see the background through. The mesh is wound inward and drawn with
+  `cull_mode: Some(Face::Back)`, so it is visible from inside and culled from
+  outside — that is what keeps the see-through cage.
+- **Seed RocketSim.** `ArenaConfig::with_rng_seed(0)` in `Sim::new`. Unseeded,
+  RocketSim draws from the RNG (per tick), so a run — and even the self-driving
+  capture — varies launch to launch.
+- **Air-control signs.** The viewer's input axes were tuned for the retired `rl`
+  (a left-handed frame). Air roll came out inverted against RocketSim and is
+  negated where input becomes `CarControls` in `sim.rs`. If pitch or yaw ever look
+  wrong, that is the place to fix it.
 - **Screenshots need a render warm-up.** The first ~second of 3D frames is the
   bare clear colour (pipeline compilation + window bring-up); a frame grabbed
-  before that is blank. The driven `--screenshot N` clears it by running to tick
-  N (~125 frames), and the free-cam path gates on `FREE_SHOT_MIN_FRAMES` +
+  before that is blank. The driven `--screenshot N` clears it by running to tick N
+  (~125 frames), and the free-cam path gates on `FREE_SHOT_MIN_FRAMES` +
   `FREE_SHOT_MIN_SECS`. Don't "speed up" a capture by grabbing an early frame.
   The sim isn't what's slow — the frames are.

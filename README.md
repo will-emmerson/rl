@@ -1,18 +1,17 @@
-# rl
+# RL
 
 A Rocket League-like game: a Bevy 3D viewer running
 **[RocketSim](https://github.com/ZealanL/RocketSim)** (the pure-Rust v3) for
-physics, plus `rl` — a hand-rolled, dependency-free Rocket League simulation kept
-as a deterministic reference and the terminal demo.
+physics, drawing RocketSim's own arena collision mesh.
 
 ![rl_view in action](docs/screenshot.png)
 
 _The Bevy viewer at tick 250: the car driving into the ball in front of the goal._
 
-See **[docs/PHYSICS.md](docs/PHYSICS.md)** for the hand-rolled `rl` simulation —
-why it was written by hand, what it models, and honest caveats about determinism
-and performance. It is no longer the game's physics; see below for the current
-setup.
+See **[docs/PHYSICS.md](docs/PHYSICS.md)** for the retired hand-rolled `rl`
+simulation — why it was written by hand, what it modelled, and honest caveats
+about determinism and performance. It is kept as a write-up; it is not the game's
+physics.
 
 ## Play it in 3D (Bevy)
 
@@ -48,9 +47,10 @@ reports positions in "uu" (1 uu = 1 cm, so /100 for metres), Z-up, `+X` forward;
 that knows about RocketSim. The drawn arena is RocketSim's own collision mesh, so
 the visible surface _is_ the surface you collide with.
 
-The hand-rolled `rl` crate is still in the workspace and still tested, but it is
-now only a reference: the viewer runs RocketSim and draws RocketSim's mesh. `rl`
-now supplies just a few cosmetic constants (ball/car mesh sizes, goal frame).
+The hand-rolled `rl` simulation that used to be the workspace root has been
+retired; `docs/PHYSICS.md` is kept as a write-up of it. The viewer gets its
+cosmetic constants (ball/car mesh sizes, goal frame) from RocketSim too, in
+`view/src/sim.rs`.
 
 | Key                       | Gamepad           | Action             |
 | ------------------------- | ----------------- | ------------------ |
@@ -111,14 +111,11 @@ and pick one, or `task: rerun` to repeat the last one.
 | `RL: play 3D (Bevy, release)`         | same, optimised (first run rebuilds Bevy: minutes) |
 | `RL: play 3D (Bevy, gamepad debug)`   | viewer, plus a log of every pad event              |
 | `RL: gamepad probe (mapping report)`  | how gilrs mapped the connected pad                 |
-| `RL: play terminal (scripted demo)`   | no-input animation, then exits                     |
-| `RL: play terminal (WASD)`            | interactive terminal demo                          |
 | `RL: run tests`                       | `cargo test --workspace`                           |
 | `RL: cargo check`                     | type-check the workspace on demand (see below)     |
 | `RL: clippy (workspace, all targets)` | lints                                              |
 | `RL: render screenshot (tick 250)`    | dump a frame to `docs/screenshot.png`              |
 | `RL: render free-cam shot (no sim)`   | instant shot from a fixed angle to `docs/shot.png` |
-| `RL: physics throughput bench`        | ticks/s                                            |
 
 To put one on a key, add to your `keymap.json`:
 
@@ -177,40 +174,24 @@ on its spot, the ball at centre), so it is for checking geometry, materials,
 lighting and camera framing, not a dynamic pose. The tick is ignored when
 `--cam`/`--look` are given.
 
-## Play it in the terminal
-
-```sh
-cargo run --release -p rl --bin play
-cargo run --release -p rl --bin play -- --interactive   # WASD drive, space boost, z drift, j jump
-```
-
-The terminal build is worth keeping around: it is the same `World::step`, with
-no engine or GPU in the way, so it is what the determinism tests drive.
-
 ## What this proves
 
-- **The simulation is engine-free.** `rl` has zero dependencies and no
-  rendering code. The Bevy viewer is a separate crate that reads state and
-  writes transforms; nothing in the draw path can feed back into the physics.
-- **Determinism is unaffected by the viewer.** `cargo test` still asserts
-  identical state hashes across runs and threads, with Bevy in the workspace.
-- **Headless is a first-class path.** `cargo test` runs the physics, the
-  terminal demo renders it, and the Bevy app can dump a frame without a human.
+- **The viewer is thin.** `rl_view` owns the render scene and reads simulation
+  state, writing transforms; nothing in the draw path feeds back into the physics.
+- **The arena is real.** The drawn surface is RocketSim's own collision mesh, so
+  what you see is what you hit.
+- **Headless still works.** `cargo test` runs, and the app can dump a frame
+  without a human (`--screenshot`).
 
 ## Layout
 
 ```
-Cargo.toml        workspace; `rl` is the root package
-src/              the simulation (no dependencies)
-  math.rs         Vec3, hashing, deterministic sin/cos for rotation
-  arena.rs        the arena (rounded box + goal mouths) as a signed-distance field
-  ball.rs         sphere: gravity, drag, Magnus, contact friction -> spin
-  car.rs          bespoke driving model (not a rigid body) + box hitbox
-  world.rs        120 Hz fixed step, input, state hash, snapshots
-  bin/play.rs     terminal front end (scripted + interactive)
-tests/            physics behaviour + determinism
-view/             Bevy 3D viewer (`rl_view`)
-docs/             physics write-up and the screenshot above
+Cargo.toml        virtual workspace; the game crate is `view`
+view/             the game: Bevy 3D viewer + RocketSim (`rl_view`)
+  src/main.rs     scene, input, camera, HUD
+  src/sim.rs      the RocketSim backend (the only place that knows about it)
+tools/rlacd.py    Linux/Proton arena-mesh dumper (a RLArenaCollisionDumper port)
+docs/             the retired-sim write-up (PHYSICS.md) and the screenshot above
 ```
 
 ## A note on Bevy's features

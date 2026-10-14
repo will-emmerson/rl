@@ -1,26 +1,9 @@
-[package]
-name = "rl"
-version = "0.1.0"
-edition = "2021"
-description = "Hand-rolled, deterministic Rocket League style physics simulation"
-license = "MIT"
-
-# Deliberately zero dependencies: the simulation core must be reproducible
-# from the standard library alone, with nothing that could vary per platform.
-[dependencies]
-
-[lib]
-name = "rl"
-path = "src/lib.rs"
-
-[[bin]]
-name = "play"
-path = "src/bin/play.rs"
-
+# `view/` is the game: a Bevy viewer running RocketSim for physics. The
+# hand-rolled `rl` simulation that used to be the root package has been retired;
+# `docs/PHYSICS.md` is kept as a write-up of it.
 [workspace]
-# `rl` stays dependency-free so the simulation core stays portable and
-# reproducible; the Bevy viewer is a separate crate that only reads it.
 members = ["view"]
+resolver = "2"
 
 [profile.release]
 opt-level = 3
@@ -34,7 +17,7 @@ opt-level = 1
 debug = "line-tables-only"
 
 # Dependencies (Bevy) are the bulk of the build, and their debug info is what
-# makes the binary ~580 MB and has the linker process hundreds of MB of DWARF on
+# makes the binary ~580 MB and the linker process hundreds of MB of DWARF on
 # every relink. They don't need it: drop it for deps only, so our own crates keep
 # their line tables. Cuts the binary to roughly a third.
 [profile.dev.package."*"]
