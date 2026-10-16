@@ -1,0 +1,230 @@
+# RL
+
+A Rocket League-like game: a Bevy 3D viewer running
+**[RocketSim](https://github.com/ZealanL/RocketSim)** (the pure-Rust v3) for
+physics, drawing RocketSim's own arena collision mesh.
+
+![rl_view in action](docs/screenshot.png)
+
+_The Bevy viewer at tick 250: the car driving into the ball in front of the goal._
+
+See **[docs/PHYSICS.md](docs/PHYSICS.md)** for the retired hand-rolled `rl`
+simulation — why it was written by hand, what it modelled, and honest caveats
+about determinism and performance. It is kept as a write-up; it is not the game's
+physics.
+
+## Play it in 3D (Bevy)
+
+```sh
+cargo run -p rl_view             # already built: starts in about a second
+cargo run --release -p rl_view   # smoother, but the first run rebuilds Bevy
+```
+
+The dev profile is set up to be playable (this crate at `opt-level = 1`, all
+dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
+
+### RocketSim physics
+
+The viewer's physics come from
+**[RocketSim v3](https://github.com/ZealanL/RocketSim/tree/v3-rust)**, a
+pure-Rust rewrite of RocketSim, pinned in `view/Cargo.toml` to a git revision
+(it is not published on crates.io yet). RocketSim collides the ball against
+Rocket League's _actual_ arena mesh, loaded once from `./collision_meshes/` at
+startup, so the viewer needs those files to run:
+
+```sh
+# one-time: dump RL's arena collision meshes, then put the `.cmf` files in
+# RL/collision_meshes/soccar/ (next to the workspace root):
+#
+#   Linux / Proton:  sudo python3 tools/rlacd.py    # this repo's port; see the
+#                                                   # header of tools/rlacd.py
+#   Windows:         https://github.com/ZealanL/RLArenaCollisionDumper
+```
+
+Without them the viewer exits immediately with a message saying so. RocketSim
+reports positions in "uu" (1 uu = 1 cm, so /100 for metres), Z-up, `+X` forward;
+`view/src/sim.rs` rotates that into the viewer's Y-up frame and is the only place
+that knows about RocketSim. The drawn arena is RocketSim's own collision mesh, so
+the visible surface _is_ the surface you collide with.
+
+The hand-rolled `rl` simulation that used to be the workspace root has been
+retired; `docs/PHYSICS.md` is kept as a write-up of it. The viewer gets its
+cosmetic constants (ball/car mesh sizes, goal frame) from RocketSim too, in
+`view/src/sim.rs`.
+
+| Key                       | Gamepad           | Action             |
+| ------------------------- | ----------------- | ------------------ |
+| `W` `A` `S` `D` or arrows | left stick        | drive              |
+| `I` `J` `K` `L`           | right stick       | look around        |
+| -                         | right stick click | look behind        |
+| `ctrl`                    | `A`               | jump               |
+| `space`                   | `B`               | boost              |
+| `shift`                   | `X`               | drift (handbrake)  |
+| `Q` / `E`                 | hold `X` + stick  | air roll           |
+| `C`                       | `Y`               | camera (ball/car)  |
+| `R`                       | `start`           | reset car and ball |
+| `esc`                     | -                 | quit               |
+
+Keyboard and pad are merged per axis, so either works and holding both does not
+cancel out. On the pad the triggers are analogue throttle: pull the right trigger
+to accelerate, the left to reverse. Boost (`space` / `B`) is replenished by the
+boost pads on the pitch — six big pads (full tank, shown as translucent orbs)
+and 28 small ones (flat discs). They cannot be taken at a full tank, and vanish
+while on cooldown. Jump (`ctrl` / `A`) is edge-triggered, and
+pressing it again while airborne gives a double jump — or, with the stick held
+off centre, a **flip**. The drive stick doubles as air control: stick up is a
+frontflip, stick left yaws left, and `Q`/`E` (or `X`/`B`-style drift + stick)
+rolls. The right stick (or `IJKL`) swivels the camera and pitches it, and
+clicking the right stick in (`R3`) looks behind you; everything springs back when
+released. (If your pad reports nothing, see the gamepad section under "A note on
+Bevy's features" below.)
+
+The camera trails the car and, in ball cam (the default), keeps the ball framed
+from the far side of the car — on a wall that swings the camera _outside_ the wall,
+looking back in with the car in front of the ball. `Y` (or `C`) switches to a
+straight-ahead car cam. The shell is a see-through cage, so a wall play is filmed
+from outside it, through the wall. This needs a GPU and a window; it was developed
+on Vulkan.
+
+The arena is drawn straight from RocketSim's own collision mesh — the very
+geometry the ball and car collide with — so what you see is what you hit. A
+repeating 2 m grid (with a heavier 10 m major grid) is projected onto every
+surface so you can read distances, including the rounded wall-to-ceiling joins.
+Every face is drawn one-sided, facing inward, so from outside the shell reads as
+a cage you can see through — which is what lets the camera leave it (see above).
+Both ends carry a full-size Soccar goal, carved into the mesh, with the goal frame
+in team colours (blue at -Z, orange at +Z); the ball scores when it crosses the
+line, with the score on the HUD. The ball is a proper football (black pentagons
+and white hexagons), so its spin reads, and the car is a sedan-shaped mesh sized
+to the Octane hitbox, with wheels that roll and steer. You can drive up the walls
+and across the ceiling.
+
+### From Zed
+
+`.zed/tasks.json` defines all of the commands below as project tasks, so you
+don't have to remember them. Run `task: spawn` (`cmd-shift-p` → "task: spawn")
+and pick one, or `task: rerun` to repeat the last one.
+
+| Task                                  | What it does                                       |
+| ------------------------------------- | -------------------------------------------------- |
+| `RL: play 3D (Bevy)`                  | the viewer                                         |
+| `RL: play 3D (Bevy, release)`         | same, optimised (first run rebuilds Bevy: minutes) |
+| `RL: play 3D (Bevy, gamepad debug)`   | viewer, plus a log of every pad event              |
+| `RL: gamepad probe (mapping report)`  | how gilrs mapped the connected pad                 |
+| `RL: run tests`                       | `cargo test --workspace`                           |
+| `RL: cargo check`                     | type-check the workspace on demand (see below)     |
+| `RL: clippy (workspace, all targets)` | lints                                              |
+| `RL: render screenshot (tick 250)`    | dump a frame to `docs/screenshot.png`              |
+| `RL: render free-cam shot (no sim)`   | instant shot from a fixed angle to `docs/shot.png` |
+
+To put one on a key, add to your `keymap.json`:
+
+```json
+{
+  "context": "Workspace",
+  "bindings": {
+    "alt-r": [
+      "task::Spawn",
+      { "task_name": "RL: play 3D (Bevy)", "reveal_target": "center" }
+    ]
+  }
+}
+```
+
+(Note `reveal_target` belongs in the keybinding, not the task definition.)
+
+### Why rust-analyzer is not allowed to check on save
+
+`.zed/settings.json` sets two rust-analyzer options for this project:
+
+- `checkOnSave: false` — by default rust-analyzer runs
+  `cargo check --workspace --all-targets` on every save. With Bevy in the
+  workspace that re-checks a large dependency tree on each save and pegs the CPU.
+- `cargo.targetDir: true` — rust-analyzer gets its own target directory
+  (`target/rust-analyzer`) instead of sharing `target/`. Cargo holds an
+  exclusive lock on the target directory while building, so without this
+  rust-analyzer's check and a `cargo build`/`cargo run` block each other: whichever
+  started second waits for the other's lock.
+
+Together these stop the auto-check churn and the lock contention. When you do want
+cargo's diagnostics, run the `RL: cargo check` task — its output is clickable.
+
+You can also have it render a single frame and exit, which is handy for CI or
+for eyeballing a change:
+
+```sh
+cargo run -p rl_view -- --screenshot shot.png 250
+#                                     path      tick to capture
+```
+
+That runs the self-driving script up to the tick and shoots the chase camera, so
+the pose is a _dynamic_ moment (tick 250 is the car mid-hit). If you just want to
+look at the scene from a chosen angle, pass `--cam` / `--look` instead: the
+simulation is skipped entirely and the shot is taken as soon as the renderer has
+warmed up.
+
+```sh
+cargo run -p rl_view -- --screenshot shot.png --cam 0,12,-30 --look 0,1,0
+#                                     path             eye x,y,z   aim x,y,z
+```
+
+Both `--cam` and `--look` are optional and fill each other from an overview
+default, so `--cam` alone works. This only shows the **starting** scene (the car
+on its spot, the ball at centre), so it is for checking geometry, materials,
+lighting and camera framing, not a dynamic pose. The tick is ignored when
+`--cam`/`--look` are given.
+
+## What this proves
+
+- **The viewer is thin.** `rl_view` owns the render scene and reads simulation
+  state, writing transforms; nothing in the draw path feeds back into the physics.
+- **The arena is real.** The drawn surface is RocketSim's own collision mesh, so
+  what you see is what you hit.
+- **Headless still works.** `cargo test` runs, and the app can dump a frame
+  without a human (`--screenshot`).
+
+## Layout
+
+```
+Cargo.toml        virtual workspace; the game crate is `view`
+view/             the game: Bevy 3D viewer + RocketSim (`rl_view`)
+  src/main.rs     scene, input, camera, HUD
+  src/sim.rs      the RocketSim backend (the only place that knows about it)
+tools/rlacd.py    Linux/Proton arena-mesh dumper (a RLArenaCollisionDumper port)
+docs/             the retired-sim write-up (PHYSICS.md) and the screenshot above
+```
+
+## A note on Bevy's features
+
+`view/Cargo.toml` spells out its Bevy features rather than using the `3d`/`ui`
+meta-features, because those pull in `default_platform`, which drags in
+`bevy_audio` (needs ALSA). Nothing here makes noise, so audio is left out and the
+viewer builds without it.
+
+Gamepad support _is_ included, via the `bevy_gilrs` feature. On Linux, gilrs needs
+`libudev`, so building the viewer requires one system package:
+
+```sh
+sudo apt-get install libudev-dev
+```
+
+A pad is mapped through gilrs' copy of the SDL controller database, keyed by
+device id. Popular pads are in that database; less common ones fall back to a
+built-in default that maps the raw evdev buttons and axes directly. Two tools
+cover the case where a pad is detected but its controls are wrong:
+
+```sh
+cargo run -p rl_view --example gamepad_probe   # what mapping was picked, no input needed
+cargo run -p rl_view -- --gamepad-debug        # log every button/axis change live
+```
+
+One thing the default mapping does that surprises people: it exposes the X-Box
+analogue triggers as the _axes_ `LeftZ`/`RightZ` (evdev ABS_Z/ABS_RZ), not as
+trigger buttons. The viewer reads either, so both mapped and unmapped pads work.
+
+A second surprise: evdev names the physical **X** button `BTN_NORTH` and the
+physical **Y** button `BTN_WEST` (those are aliases for `BTN_X`/`BTN_Y`), so on a
+driver-default pad the face buttons arrive swapped — the physical X as `North`
+and the physical Y as `West`. The viewer maps drift to `North` and the camera
+toggle to `West` so the _physical_ buttons match the table above (on an
+SDL-mapped pad the two would be the other way round).

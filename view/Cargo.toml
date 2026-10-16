@@ -1,0 +1,47 @@
+[package]
+name = "rl_view"
+version = "0.1.0"
+edition = "2021"
+description = "Bevy 3D viewer running RocketSim for physics"
+
+[dependencies]
+
+# The physics. Pure-Rust RocketSim v3 ("a Rust library for simulating Rocket
+# League games"), pinned to the `v3-rust` branch head rather than the branch
+# name so it can't move under us. It is not on crates.io yet.
+#
+# At runtime it loads RL's arena collision meshes from `./collision_meshes/`
+# (see `view/src/sim.rs`); those are NOT in the repo.
+rocketsim = { git = "https://github.com/ZealanL/RocketSim", rev = "6cf55d33d070ff611a09564885dac230f66fd2f6" }
+
+# Feature set is spelled out rather than using bevy's convenient `3d`/`ui`
+# meta-features, because those pull in `default_platform`, which includes
+# `bevy_audio` (needs alsa). Nothing here makes noise, so dropping it keeps the
+# build free of a system package. `bevy_gilrs` is listed explicitly because it
+# needs libudev-dev, which is the one system package this build does require:
+#
+#     sudo apt-get install libudev-dev
+#
+# Everything else in `default_platform` is either unneeded or pulled in anyway.
+[dependencies.bevy]
+version = "0.19"
+default-features = false
+features = [
+    "3d_bevy_render",  # pbr, meshes, materials, lights, core pipeline
+    "ui_bevy_render",  # renders the HUD text
+    "ui_api",          # Text / Node / TextUiWriter
+    "default_app",     # asset server, log, state, async executor
+    "bevy_winit",      # window + event loop
+    "bevy_gilrs",      # gamepad input (needs libudev-dev on Linux)
+    "x11",
+    "wayland",
+    "default_font",    # so Text works without shipping a font file
+    "multi_threaded",
+    "std",
+    "png",             # --screenshot
+]
+
+[dev-dependencies]
+# Only used by `examples/gamepad_probe.rs`, which reports how gilrs maps a pad.
+# The same version is already pulled in by `bevy_gilrs`, so this adds no build.
+gilrs = "0.11"

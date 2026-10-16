@@ -1,0 +1,25 @@
+# `view/` is the game: a Bevy viewer running RocketSim for physics. The
+# hand-rolled `rl` simulation that used to be the root package has been retired;
+# `docs/PHYSICS.md` is kept as a write-up of it.
+[workspace]
+members = ["view"]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+
+# Bevy is unusably slow unoptimised, but optimising all of it makes every
+# incremental build painful. This is the standard middle ground.
+[profile.dev]
+opt-level = 1
+# Line tables keep file:line in backtraces for our own crates without the bulk
+# of full debug info.
+debug = "line-tables-only"
+
+# Dependencies (Bevy) are the bulk of the build, and their debug info is what
+# makes the binary ~580 MB and the linker process hundreds of MB of DWARF on
+# every relink. They don't need it: drop it for deps only, so our own crates keep
+# their line tables. Cuts the binary to roughly a third.
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
