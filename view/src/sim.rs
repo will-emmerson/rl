@@ -92,8 +92,11 @@ pub struct Input {
     pub throttle: f64,
     /// -1 right .. +1 left.
     pub steer: f64,
+    /// -1 nose down .. +1 nose up.
     pub pitch: f64,
+    /// -1 right .. +1 left (also the dodge lean).
     pub yaw: f64,
+    /// -1 right .. +1 left (Q / E).
     pub roll: f64,
     pub boost: bool,
     pub handbrake: bool,
@@ -171,6 +174,28 @@ pub struct PadView {
     pub available: bool,
 }
 
+/// Fold the viewer's [`Input`] into RocketSim's `CarControls`.
+///
+/// Every axis passes straight through: the viewer's `Input` is already in
+/// RocketSim's terms. Measured with `examples/axis_probe.rs`, positive `steer`,
+/// `yaw` and `roll` all move/rotate the car to its **left**, and positive
+/// `pitch` is nose-up - so the viewer's `yaw` is built to keep `steer`'s sign and
+/// `pitch` as `-throttle`. The frame bridge is a rotation, so it preserves signs;
+/// there is no handedness flip to correct, and negating an axis here would only
+/// mirror it.
+fn controls_from(input: &Input) -> CarControls {
+    CarControls {
+        throttle: input.throttle as f32,
+        steer: input.steer as f32,
+        pitch: input.pitch as f32,
+        yaw: input.yaw as f32,
+        roll: input.roll as f32,
+        jump: input.jump,
+        boost: input.boost,
+        handbrake: input.handbrake,
+    }
+}
+
 /// The simulation: a RocketSim Soccar arena with one Blue car.
 pub struct Sim {
     arena: Arena,
@@ -212,21 +237,7 @@ impl Sim {
 
     /// Advance one tick (1/120 s), scoring and resetting on a goal.
     pub fn step(&mut self, input: &Input) {
-        self.arena.set_car_controls(
-            self.car,
-            CarControls {
-                throttle: input.throttle as f32,
-                steer: input.steer as f32,
-                pitch: input.pitch as f32,
-                yaw: input.yaw as f32,
-                // The viewer's roll axis (E rolls right) is opposite to
-                // RocketSim's `roll` sign, so negate it here.
-                roll: -input.roll as f32,
-                jump: input.jump,
-                boost: input.boost,
-                handbrake: input.handbrake,
-            },
-        );
+        self.arena.set_car_controls(self.car, controls_from(input));
         self.arena.step_tick();
 
         // RocketSim reports a goal but does not score it or reset itself, so we
@@ -388,4 +399,22 @@ pub fn arena_collision_mesh() -> (Vec<Vec3>, Vec<[u32; 3]>) {
         }
     }
     (positions, triangles)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn air_control_axes_pass_through_unnegated() {
+        // `controls_from` must not flip any axis: the viewer's `Input` is already
+        // in RocketSim's sign convention (measured by `examples/axis_probe.rs`,
+        // where positive steer/yaw/roll all go to the car's left). This would
+        // fail if a negation were reintroduced.
+        let input = Input::with_air(0.0, 0.0, 0.3, -0.6, 0.9, false, false, false);
+        let controls = controls_from(&input);
+        assert_eq!(controls.pitch, 0.3);
+        assert_eq!(controls.yaw, -0.6);
+        assert_eq!(controls.roll, 0.9);
+    }
 }

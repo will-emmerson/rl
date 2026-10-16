@@ -1134,8 +1134,9 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
         &[KeyCode::KeyA, KeyCode::ArrowLeft],
         &[KeyCode::KeyD, KeyCode::ArrowRight],
     );
-    // Air roll, on dedicated keys: E rolls right, Q rolls left.
-    let keyboard_roll = axis(keys, &[KeyCode::KeyE], &[KeyCode::KeyQ]);
+    // Air roll, on dedicated keys: Q rolls left, E rolls right (positive `roll`
+    // is left, the same sign convention as `steer` and `yaw`).
+    let keyboard_roll = axis(keys, &[KeyCode::KeyQ], &[KeyCode::KeyE]);
     let keyboard_jump = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
 
     // Triggers are analogue, so they give proportional throttle rather than the
@@ -1170,16 +1171,22 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
     let drift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) || pad_drift;
 
     // Air orientation. RL flies with the same stick it drives with: stick up is a
-    // frontflip (`pitch -1`) and stick left yaws left (`yaw = -steer`). On the
-    // keyboard the W/S keys double as pitch; the pad uses the left stick's
-    // vertical axis, which is why pitch is *not* taken from the throttle.
+    // frontflip (`pitch -1`) and stick left yaws left. On the keyboard the W/S
+    // keys double as pitch; the pad uses the left stick's vertical axis, which is
+    // why pitch is *not* taken from the throttle.
+    //
+    // `yaw` keeps `steer`'s sign, so the same key that steers left also yaws and
+    // dodges left: RocketSim's positive steer/yaw/roll all go to the car's left
+    // (measured by `examples/axis_probe.rs`), and the viewer's `steer` is already
+    // positive to the left.
     let keyboard_pitch = -keyboard_throttle;
     let pitch = strongest(keyboard_pitch, pad_pitch);
-    let yaw = -steer;
+    let yaw = steer;
 
     // On the pad, air roll is the handbrake/drift button plus the stick, as in
-    // Rocket League; the keyboard uses Q/E.
-    let pad_roll = if pad_drift { -pad_steer } else { 0.0 };
+    // Rocket League: drift + stick left rolls left (so it keeps `pad_steer`'s
+    // sign). The keyboard uses Q/E.
+    let pad_roll = if pad_drift { pad_steer } else { 0.0 };
     let roll = strongest(keyboard_roll, pad_roll);
 
     SimInput::with_air(
@@ -1878,7 +1885,9 @@ mod tests {
     #[test]
     fn the_drive_stick_doubles_as_air_control() {
         // Stick up (W) is throttle on the ground and a frontflip (pitch -1) in
-        // the air; stick left (A) is steer left and yaw left. Roll is Q/E.
+        // the air; stick left (A) is steer left *and* yaw left (yaw keeps
+        // steer's sign, so the dodge leans the way the stick points). Roll is
+        // Q/E.
         let press = |code| {
             let mut keys = ButtonInput::<KeyCode>::default();
             keys.press(code);
@@ -1892,10 +1901,16 @@ mod tests {
         assert!(down.throttle < -0.5 && down.pitch > 0.5, "S: {down:?}");
 
         let left = press(KeyCode::KeyA);
-        assert!(left.steer > 0.5 && left.yaw < -0.5, "A: {left:?}");
+        assert!(left.steer > 0.5 && left.yaw > 0.5, "A: {left:?}");
+
+        let right = press(KeyCode::KeyD);
+        assert!(right.steer < -0.5 && right.yaw < -0.5, "D: {right:?}");
+
+        let roll_left = press(KeyCode::KeyQ);
+        assert!(roll_left.roll > 0.5, "Q: {roll_left:?}");
 
         let roll_right = press(KeyCode::KeyE);
-        assert!(roll_right.roll > 0.5, "E: {roll_right:?}");
+        assert!(roll_right.roll < -0.5, "E: {roll_right:?}");
     }
 
     #[test]

@@ -114,10 +114,17 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
 - **Seed RocketSim.** `ArenaConfig::with_rng_seed(0)` in `Sim::new`. Unseeded,
   RocketSim draws from the RNG (per tick), so a run — and even the self-driving
   capture — varies launch to launch.
-- **Air-control signs.** The viewer's input axes were tuned for the retired `rl`
-  (a left-handed frame). Air roll came out inverted against RocketSim and is
-  negated where input becomes `CarControls` in `sim.rs`. If pitch or yaw ever look
-  wrong, that is the place to fix it.
+- **Input signs are measured, not reasoned.** `sim.rs::controls_from` passes the
+  viewer's `Input` straight into RocketSim's `CarControls` with **no** sign
+  changes, and that is correct. `examples/axis_probe.rs` measures RocketSim
+  directly — run it: positive `steer`, `yaw` and `roll` all move/rotate the car to
+  its **left**, and positive `pitch` is nose-up. That is why the viewer keeps
+  `yaw = steer` (same sign as steering, so a dodge leans the way the stick points)
+  and builds `pitch` as `-throttle` (stick-up = frontflip). The frame bridge is a
+  rotation, so signs survive it — negating a component in `controls_from` only
+  mirrors the axis and has bitten before. If an axis ever looks wrong, re-run the
+  probe and change the sign where the input is built (`read_input` in `main.rs`),
+  not here.
 - **Screenshots need a render warm-up.** The first ~second of 3D frames is the
   bare clear colour (pipeline compilation + window bring-up); a frame grabbed
   before that is blank. The driven `--screenshot N` clears it by running to tick N
