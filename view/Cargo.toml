@@ -6,6 +6,12 @@ description = "Bevy 3D viewer running RocketSim for physics"
 
 [dependencies]
 
+# Camera settings are loaded from `camera.toml` (see `CameraSettings` in main.rs).
+# TOML rather than YAML: it is the Rust-native config format, supports comments,
+# and does not need the deprecated `serde_yaml` crate.
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+
 # The physics. Pure-Rust RocketSim v3 ("a Rust library for simulating Rocket
 # League games"), pinned to the `v3-rust` branch head rather than the branch
 # name so it can't move under us. It is not on crates.io yet.

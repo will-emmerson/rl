@@ -1,0 +1,33 @@
+# Rocket League camera settings for rl_view. Edit and save while the viewer is
+# running: this file is hot-reloaded (checked every 5 seconds).
+#
+# Units are the viewer's: metres and degrees. Rocket League shows distance and
+# height in Unreal units, so multiply by 100 for the in-game numbers (270 uu is
+# 2.7 m). The defaults below are Rocket League's defaults.
+
+# Horizontal field of view, degrees (RL range 80-110).
+fov = 110.0
+
+# Boom: how far behind and above the car the camera sits, metres.
+# RL range 100-400 uu / 40-200 uu.
+distance = 2.7
+height = 1.0
+
+# View pitch, degrees, independent of the boom (RL range -15 to 5).
+# Negative looks down; the camera position does not move when this changes.
+angle = -4.0
+
+# How tightly the camera follows the car: 0 is loose, 1 is locked.
+stiffness = 0.5
+
+# Right-stick swivel rate (RL range 1-10) and the car/ball cam transition
+# speed (RL range 1-2).
+swivel_speed = 5.0
+transition_speed = 1.0
+
+# RL's "Invert Swivel" checkbox, for the horizontal axis.
+invert_swivel = false
+
+# Viewer-only: invert the vertical look axis. The default keeps the viewer's
+# existing pad convention (stick up looks down).
+invert_look_y = true

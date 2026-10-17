@@ -10,8 +10,11 @@
 //!   cargo run -p rl_view -- --screenshot shot.png --cam 0,12,-30 --look 0,1,0
 //!                                                 # instant free-cam shot, no sim
 //!   cargo run -p rl_view -- --gamepad-debug       # log every raw pad event
+//!   cargo run -p rl_view -- --camera-config cam.toml # use a different camera file
 
 use std::f32::consts::PI;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
@@ -23,6 +26,8 @@ use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
+use bevy::window::PrimaryWindow;
+use serde::Deserialize;
 
 mod sim;
 use sim::{
@@ -51,43 +56,32 @@ const WHEEL_RADIUS: f32 = 0.52 * CAR_HALF_HEIGHT;
 /// angle is speed-dependent; this is a fixed stand-in.
 const MAX_WHEEL_STEER: f32 = 0.5;
 
-/// Preferred chase position: this far behind, and this far above, the car.
-const CAMERA_DISTANCE: f32 = 5.5;
-const CAMERA_HEIGHT: f32 = 2.6;
+/// The camera settings file, relative to where the viewer is run. Missing is
+/// fine (RL's defaults are used); a malformed file is a hard error. Override the
+/// path with `--camera-config PATH`. The file is hot-reloaded on save.
+const CAMERA_CONFIG_PATH: &str = "camera.toml";
+/// How often the settings file is checked for changes. Five seconds is enough
+/// for hand-tuning and avoids reloading on every keystroke while it is being
+/// edited; a file caught mid-edit normally fails to parse and the previous
+/// settings stay in place.
+const CAMERA_RELOAD_CHECK_SECS: f32 = 5.0;
 /// The camera may leave the arena through the walls *and* the roof - the shell is
 /// one-sided, so it can still see back in - but it never drops below the pitch,
 /// which would film the game from underneath. This is the margin it keeps off the
 /// floor.
 const CAMERA_FLOOR_MARGIN: f32 = 0.4;
-/// How high above the car the straight-ahead car-cam aim point sits.
-const CAMERA_AIM_HEIGHT: f32 = 0.6;
-/// How far left/right the look control swivels the camera, in radians.
-const CAMERA_LOOK_YAW: f32 = 1.5;
-/// How far the pitch control orbits the camera up and down around the car, in
-/// radians. Push up raises the camera into a top-down overview; pull down drops
-/// it towards a flat, horizon-skimming view.
+/// Vertical look at full deflection, in radians. It is added to the configured
+/// camera angle; positive looks up, negative looks down.
 const CAMERA_LOOK_PITCH: f32 = 0.9;
-/// The orbit angle is clamped to this range, in radians above the horizontal:
-/// `0` is level with the car, `PI/2` is straight overhead. This is what keeps
-/// the car in frame - the view can never tip past the car into the ground.
-const CAMERA_PITCH_MIN: f32 = 0.10;
-const CAMERA_PITCH_MAX: f32 = 1.35;
-/// Ball cam sits *lower* than car cam (a shallow orbit angle): looking out at a
-/// far ball from a high boom drops the near car off the bottom of the view, so
-/// ball cam uses a low boom that keeps both the car and the ball in frame.
-const CAMERA_BALL_PITCH: f32 = 0.20;
-/// Ball cam's orbit angle is allowed to swing *below* the tangent plane, because
-/// "away from the ball" can point out of the arena: on a wall the ball is inside,
-/// so the boom points outside the wall and the camera sits outside the cage, looking
-/// back in. Car cam's `CAMERA_PITCH_MIN` clamp, by contrast, keeps it above the car.
-const CAMERA_BALL_PITCH_MIN: f32 = -1.40;
-/// Vertical look is inverted: pushing the stick up looks down (and so raises the
-/// camera into the overview). Flip to `false` for the standard mapping.
-const CAMERA_LOOK_INVERT_Y: bool = true;
-/// How fast the look angle catches up to the swivel target, per second (higher
-/// is snappier). Only the swivel is smoothed: the look-behind click is a hard
-/// 180° flip, both in and out.
-const CAMERA_LOOK_RESPONSE: f32 = 8.0;
+/// Absolute cap on the view pitch, keeping it short of straight up/down so
+/// `looking_to` always has a usable up vector.
+const CAMERA_PITCH_LIMIT: f32 = 1.45;
+/// Swivel rate per unit of RL's `swivel_speed`, in radians per second. RL exposes
+/// 1..=10; at the default 5 the camera turns at ~172°/s with the stick held.
+const SWIVEL_RAD_PER_SPEED: f32 = 0.6;
+/// How quickly the swivel springs back to centre when the stick is released,
+/// per unit of `swivel_speed`, in inverse seconds.
+const SWIVEL_RETURN_PER_SPEED: f32 = 2.0;
 
 // ---------------------------------------------------------------------------
 // Resources / components
@@ -95,6 +89,118 @@ const CAMERA_LOOK_RESPONSE: f32 = 8.0;
 
 #[derive(Resource)]
 struct Sim(sim::Sim);
+
+/// Rocket League's camera settings, in the viewer's units (metres, degrees).
+///
+/// The names and defaults mirror the in-game camera panel so a config file reads
+/// like the settings screen: distance/height are the boom, `angle` is the view
+/// pitch (not the boom), and `stiffness` controls how tightly the camera follows
+/// the car. RL stores distance/height in Unreal units - multiply by 100 for the
+/// `uu` values shown in game (270 uu = 2.7 m).
+///
+/// `fov` is the **horizontal** field of view, as in RL. Bevy's projection takes a
+/// vertical FOV, so [`vertical_fov`] converts it using the window aspect.
+#[derive(Resource, Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct CameraSettings {
+    /// Horizontal field of view, in degrees (RL 80..=110).
+    fov: f32,
+    /// How far behind the car the camera sits, in metres (RL 1.0..=4.0).
+    distance: f32,
+    /// How far above the car the camera sits, in metres (RL 0.4..=2.0).
+    height: f32,
+    /// View pitch in degrees, independent of the boom (RL -15..=5). Negative
+    /// looks down; the camera position does not move when this changes.
+    angle: f32,
+    /// How tightly the camera follows the car, 0 (loose) ..= 1 (locked).
+    stiffness: f32,
+    /// Right-stick swivel rate (RL 1..=10).
+    swivel_speed: f32,
+    /// How quickly the camera swings between car cam and ball cam (RL 1..=2).
+    transition_speed: f32,
+    /// Invert the horizontal swivel axis (RL's "Invert Swivel").
+    invert_swivel: bool,
+    /// Invert the vertical look axis. Not an RL camera-panel setting; kept so
+    /// the viewer's pad convention can stay as it was.
+    invert_look_y: bool,
+}
+
+impl Default for CameraSettings {
+    /// Rocket League's default camera: 110° FOV, 270 uu distance, 100 uu height,
+    /// -4° angle, 0.5 stiffness, 5.0 swivel speed, 1.0 transition speed.
+    fn default() -> Self {
+        Self {
+            fov: 110.0,
+            distance: 2.7,
+            height: 1.0,
+            angle: -4.0,
+            stiffness: 0.5,
+            swivel_speed: 5.0,
+            transition_speed: 1.0,
+            invert_swivel: false,
+            invert_look_y: true,
+        }
+    }
+}
+
+impl CameraSettings {
+    /// Clamp each numeric field to the range RL allows, warning when a hand-edited
+    /// file falls outside it. Clamping (rather than rejecting) keeps a typo from
+    /// taking the whole viewer down while still making the mistake visible.
+    fn clamped(mut self) -> Self {
+        let default = Self::default();
+        clamp_setting(&mut self.fov, 80.0, 110.0, default.fov, "fov");
+        clamp_setting(&mut self.distance, 1.0, 4.0, default.distance, "distance");
+        clamp_setting(&mut self.height, 0.4, 2.0, default.height, "height");
+        clamp_setting(&mut self.angle, -15.0, 5.0, default.angle, "angle");
+        clamp_setting(
+            &mut self.stiffness,
+            0.0,
+            1.0,
+            default.stiffness,
+            "stiffness",
+        );
+        clamp_setting(
+            &mut self.swivel_speed,
+            1.0,
+            10.0,
+            default.swivel_speed,
+            "swivel_speed",
+        );
+        clamp_setting(
+            &mut self.transition_speed,
+            1.0,
+            2.0,
+            default.transition_speed,
+            "transition_speed",
+        );
+        self
+    }
+}
+
+/// Where the settings came from and when it last changed, so the file can be
+/// hot-reloaded while the viewer runs.
+#[derive(Resource)]
+struct CameraConfig {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+}
+
+fn clamp_setting(value: &mut f32, lo: f32, hi: f32, default: f32, name: &str) {
+    if !value.is_finite() {
+        warn!("camera: {name} must be finite; using {default}");
+        *value = default;
+        return;
+    }
+    let clamped = value.clamp(lo, hi);
+    if clamped != *value {
+        warn!(
+            "camera: {name}={} is outside {lo}..={hi}; using {clamped}",
+            *value
+        );
+        *value = clamped;
+    }
+}
 
 /// How the app was started.
 #[derive(Resource)]
@@ -186,6 +292,7 @@ fn main() {
     let mut shot: Option<(String, Option<u64>)> = None;
     let mut cam: Option<Vec3> = None;
     let mut look: Option<Vec3> = None;
+    let mut camera_config: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -205,6 +312,12 @@ fn main() {
             }
             "--cam" => cam = Some(parse_vec3_arg(&mut args, "--cam")),
             "--look" => look = Some(parse_vec3_arg(&mut args, "--look")),
+            "--camera-config" => {
+                camera_config = Some(PathBuf::from(
+                    args.next()
+                        .unwrap_or_else(|| panic!("--camera-config needs a path")),
+                ));
+            }
             "--gamepad-debug" => gamepad_debug = true,
             _ => {}
         }
@@ -227,10 +340,14 @@ fn main() {
         None => Mode::Play,
     };
 
+    let (camera_settings, camera_config) = initial_camera_settings(camera_config);
+
     App::new()
         .add_plugins(DefaultPlugins)
         .insert_resource(Sim(sim::Sim::new()))
         .insert_resource(mode)
+        .insert_resource(camera_settings)
+        .insert_resource(camera_config)
         .insert_resource(GamepadDebug(gamepad_debug))
         .insert_resource(BallCam(true))
         .init_resource::<LastSteer>()
@@ -246,6 +363,7 @@ fn main() {
                 report_gamepad_events,
                 sync_visuals,
                 spin_wheels,
+                (reload_camera_settings, apply_camera_fov).chain(),
                 chase_camera.run_if(simulating),
                 update_hud,
                 screenshot_driver,
@@ -266,6 +384,35 @@ fn resolve_free_cam(cam: Option<Vec3>, look: Option<Vec3>) -> Option<FreeCam> {
         pos: cam.unwrap_or(FREE_CAM_DEFAULT_POS),
         look: look.unwrap_or(FREE_CAM_DEFAULT_LOOK),
     })
+}
+
+/// Load `--camera-config PATH`, or `camera.toml` if it exists. An explicit path
+/// must load; a missing default file silently falls back to RL's defaults.
+fn initial_camera_settings(explicit: Option<PathBuf>) -> (CameraSettings, CameraConfig) {
+    let required = explicit.is_some();
+    let path = explicit.unwrap_or_else(|| PathBuf::from(CAMERA_CONFIG_PATH));
+    let modified = file_modified(&path);
+    let settings = match read_camera_settings(&path) {
+        Ok(settings) => settings,
+        // No config file is the normal case: use the built-in RL defaults.
+        Err(_) if !required && !path.exists() => CameraSettings::default(),
+        Err(e) => panic!("camera config: {e}"),
+    };
+    (settings, CameraConfig { path, modified })
+}
+
+fn read_camera_settings(path: &Path) -> Result<CameraSettings, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    toml::from_str::<CameraSettings>(&raw)
+        .map(CameraSettings::clamped)
+        .map_err(|e| format!("could not parse {}: {e}", path.display()))
+}
+
+fn file_modified(path: &Path) -> Option<SystemTime> {
+    std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .ok()
 }
 
 /// Read the `x,y,z` value for `flag`, exiting with a clear message if it is
@@ -314,6 +461,7 @@ fn setup_scene(
     mut images: ResMut<Assets<Image>>,
     sim: Res<Sim>,
     mode: Res<Mode>,
+    settings: Res<CameraSettings>,
 ) {
     // --- arena ---
     // The arena is drawn from RocketSim's own collision mesh (`sim::
@@ -672,13 +820,20 @@ fn setup_scene(
     // `threshold * (1 - softness)` = 3.0, still clear of the ball.
     // The chase camera normally starts behind the kickoff and then follows the
     // car. A `--cam` shot pins it to a fixed pose instead, and the chase system
-    // is skipped (see `simulating`).
+    // is skipped (see `simulating`). Start the chase camera at its resting pose
+    // rather than easing in from an arbitrary one.
     let camera_pose = match &*mode {
         Mode::Capture {
             free_cam: Some(free),
             ..
         } => Transform::from_translation(free.pos).looking_at(free.look, Vec3::Y),
-        _ => Transform::from_xyz(0.0, 3.2, -22.0).looking_at(Vec3::new(0.0, 0.8, 0.0), Vec3::Y),
+        _ => {
+            let car = sim.0.car();
+            let heading = base_heading(false, car.forward, Vec3::ZERO).unwrap_or(Vec3::Z);
+            let position = chase_position(car.pos, heading, settings.distance, settings.height);
+            let view = view_direction(heading, settings.angle.to_radians());
+            Transform::from_translation(position).looking_to(view, Vec3::Y)
+        }
     };
     commands.spawn((
         Camera3d::default(),
@@ -1372,9 +1527,13 @@ fn spin_wheels(
 
 /// Look input as two scalars in `-1..=1`, merged from the pad's right stick and
 /// the keyboard (`I`/`K` pitch, `J`/`L` swivel). `x` is positive to the right;
-/// `y` is the pitch input, positive to look up. The vertical axis is inverted
-/// (`CAMERA_LOOK_INVERT_Y`), so pushing the stick up looks down.
-fn look_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> (f64, f64) {
+/// `y` is the pitch input, positive to look up. `invert_y` flips the vertical
+/// axis (the viewer's default), so pushing the stick up looks down.
+fn look_input(
+    keys: &ButtonInput<KeyCode>,
+    gamepad: Option<&Gamepad>,
+    invert_y: bool,
+) -> (f64, f64) {
     let key_x = axis(keys, &[KeyCode::KeyL], &[KeyCode::KeyJ]);
     let key_y = axis(keys, &[KeyCode::KeyI], &[KeyCode::KeyK]);
     let (pad_x, pad_y) = match gamepad {
@@ -1385,7 +1544,7 @@ fn look_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> (f64, f
         None => (0.0, 0.0),
     };
     let y = strongest(key_y, pad_y);
-    let y = if CAMERA_LOOK_INVERT_Y { -y } else { y };
+    let y = if invert_y { -y } else { y };
     (strongest(key_x, pad_x), y)
 }
 
@@ -1395,73 +1554,107 @@ fn look_behind(gamepad: Option<&Gamepad>) -> bool {
     gamepad.is_some_and(|pad| pad.pressed(GamepadButton::RightThumb))
 }
 
-/// How far the camera is yawed away from straight-behind, in radians. Left and
-/// right swivel; `behind` turns the camera right around to the front of the car,
-/// which is Rocket League's look-behind.
-fn look_yaw_offset(look_x: f64, behind: bool) -> f32 {
-    if behind {
-        PI
+/// A horizontal direction's yaw, where `0` points along `+Z` and positive angles
+/// turn toward `+X` (Bevy's positive rotation about `Y`).
+fn yaw_of(dir: Vec3) -> f32 {
+    dir.x.atan2(dir.z)
+}
+
+fn dir_from_yaw(yaw: f32) -> Vec3 {
+    Vec3::new(yaw.sin(), 0.0, yaw.cos())
+}
+
+/// Yaw of the camera's view heading after swivel and look-behind. Positive
+/// `swivel` looks right: for a heading along `+Z`, right is `-X`.
+fn heading_yaw(base_yaw: f32, swivel: f32, behind: bool) -> f32 {
+    base_yaw - swivel + if behind { PI } else { 0.0 }
+}
+
+/// Shortest signed way round from one angle to another.
+fn shortest_angle(delta: f32) -> f32 {
+    (delta + PI).rem_euclid(std::f32::consts::TAU) - PI
+}
+
+/// Horizontal direction the camera looks along: the car's heading in car cam, or
+/// the bearing to the ball in ball cam. `None` means the input is vertical (a car
+/// pointing straight up a wall), so the caller keeps its previous heading rather
+/// than snapping to an arbitrary one.
+fn base_heading(ball_cam: bool, car_forward: Vec3, to_ball: Vec3) -> Option<Vec3> {
+    let dir = if ball_cam {
+        Vec3::new(to_ball.x, 0.0, to_ball.z)
     } else {
-        -(look_x as f32) * CAMERA_LOOK_YAW
+        Vec3::new(car_forward.x, 0.0, car_forward.z)
+    };
+    (dir.length_squared() > 1e-6).then(|| dir.normalize())
+}
+
+/// Camera position for a view heading, RL-style: a fixed distance behind and
+/// height above the car, along world up. Building the boom from a horizontal
+/// heading rather than the car's own frame is what keeps the camera upright when
+/// the car drives up a wall or rolls in the air.
+fn chase_position(car_pos: Vec3, heading: Vec3, distance: f32, height: f32) -> Vec3 {
+    car_pos - heading * distance + Vec3::Y * height
+}
+
+/// Unit view direction from a horizontal heading and a pitch in radians
+/// (negative looks down).
+fn view_direction(heading: Vec3, pitch: f32) -> Vec3 {
+    (heading * pitch.cos() + Vec3::Y * pitch.sin()).normalize()
+}
+
+/// Convert RL's horizontal FOV (degrees) to the vertical FOV Bevy's perspective
+/// projection takes.
+fn vertical_fov(horizontal_degrees: f32, aspect_ratio: f32) -> f32 {
+    let half_horizontal = horizontal_degrees.to_radians() * 0.5;
+    2.0 * (half_horizontal.tan() / aspect_ratio.max(0.1)).atan()
+}
+
+/// Hot-reload `camera.toml` when it changes. Parsing is cheap and this checks
+/// every few seconds, so tuning the camera does not need a restart. A failed
+/// parse leaves the last good settings in place.
+fn reload_camera_settings(
+    time: Res<Time>,
+    mut config: ResMut<CameraConfig>,
+    mut settings: ResMut<CameraSettings>,
+    mut since_check: Local<f32>,
+) {
+    *since_check += time.delta_secs();
+    if *since_check < CAMERA_RELOAD_CHECK_SECS {
+        return;
+    }
+    *since_check = 0.0;
+    let Some(modified) = file_modified(&config.path) else {
+        return;
+    };
+    if config.modified == Some(modified) {
+        return;
+    }
+    config.modified = Some(modified);
+    match read_camera_settings(&config.path) {
+        Ok(new_settings) => {
+            info!("camera: reloaded {}", config.path.display());
+            *settings = new_settings;
+        }
+        Err(e) => error!("camera: reload failed: {e}"),
     }
 }
 
-/// The camera's resting orbit angle: the angle above the horizontal at which
-/// the preferred chase position sits.
-fn resting_pitch() -> f32 {
-    CAMERA_HEIGHT.atan2(CAMERA_DISTANCE)
-}
-
-/// The orbit angle for an (already inverted) vertical look input, clamped to the
-/// safe range. Push up raises the camera towards a top-down view; pull down
-/// lowers it towards a flat one. `base` is the resting angle for the mode
-/// (`resting_pitch` for car cam, `CAMERA_BALL_PITCH` for ball cam).
-fn pitch_for_look(base: f32, look_y: f32) -> f32 {
-    (base - look_y * CAMERA_LOOK_PITCH).clamp(CAMERA_PITCH_MIN, CAMERA_PITCH_MAX)
-}
-
-/// The camera's offsets from the car: where it sits (`boom`) and the point it
-/// looks at (`aim`), from a yaw offset (`look_yaw_offset`) and an orbit angle
-/// (`pitch`, in radians above the car's own up axis).
-///
-/// The boom is built in the car's own frame - rotated about the car's `up` axis
-/// and lifted along it - so the camera follows the car onto a wall and the
-/// ceiling instead of collapsing to "straight below" once the forward axis goes
-/// vertical. On the ground `up` is world up, which is exactly the old behaviour:
-/// at zero yaw and the resting pitch, `boom` is `-forward * CAMERA_DISTANCE +
-/// up * CAMERA_HEIGHT` and `aim` is `up * CAMERA_AIM_HEIGHT`.
-fn camera_frame(forward: Vec3, up: Vec3, yaw: f32, pitch: f32) -> (Vec3, Vec3) {
-    let back = Quat::from_axis_angle(up, yaw) * -forward;
-    let radius = (CAMERA_DISTANCE * CAMERA_DISTANCE + CAMERA_HEIGHT * CAMERA_HEIGHT).sqrt();
-    let boom = back * (radius * pitch.cos()) + up * (radius * pitch.sin());
-    let aim = up * CAMERA_AIM_HEIGHT;
-    (boom, aim)
-}
-
-/// Ball cam's resting boom: the yaw (about the car's `up`) and pitch that point
-/// the boom straight *away from the ball*, so the camera sits on the far side of
-/// the car from the ball and looks through the car at it.
-///
-/// "Away from the ball" is measured in full 3D, not only in the car's tangent
-/// plane. On the floor it puts the camera behind the car; on a wall it lifts the
-/// boom clean out of the arena, so the camera sits *outside* the wall and looks
-/// back in through the see-through cage with the car in front of the ball. The
-/// tangent-plane bearing the car uses elsewhere would keep the boom inside the
-/// wall plane and never get there. `CAMERA_BALL_PITCH` is folded in so the boom
-/// still lifts off a flat floor, where "away from the ball" is level.
-fn ball_cam_angle(car_up: Vec3, forward: Vec3, to_ball: Vec3) -> (f32, f32) {
-    let away = (-to_ball).normalize_or_zero();
-    let along_up = away.dot(car_up).clamp(-1.0, 1.0);
-    let tangent = away - car_up * along_up;
-    let yaw = if tangent.length_squared() > 1e-6 {
-        let n = tangent.normalize();
-        let back = -forward;
-        car_up.dot(back.cross(n)).atan2(back.dot(n))
-    } else {
-        // Directly off the surface: no bearing to speak of, so trail the car.
-        0.0
+/// Apply RL's horizontal FOV to the camera as Bevy's vertical FOV.
+fn apply_camera_fov(
+    settings: Res<CameraSettings>,
+    windows: Query<&Window, With<PrimaryWindow>>,
+    mut cameras: Query<&mut Projection, With<ChaseCam>>,
+) {
+    let Ok(window) = windows.single() else {
+        return;
     };
-    (yaw, along_up.asin() + CAMERA_BALL_PITCH)
+    let aspect = window.width() / window.height().max(1.0);
+    let fov = vertical_fov(settings.fov, aspect);
+    for mut projection in &mut cameras {
+        if let Projection::Perspective(perspective) = &mut *projection {
+            perspective.fov = fov;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1470,130 +1663,97 @@ fn chase_camera(
     gamepads: Query<&Gamepad>,
     sim: Res<Sim>,
     ball_cam: Res<BallCam>,
+    settings: Res<CameraSettings>,
     time: Res<Time>,
     mut query: Query<&mut Transform, With<ChaseCam>>,
-    mut look_yaw: Local<f32>,
+    mut heading: Local<Option<f32>>,
+    mut swivel: Local<f32>,
     mut behind_last: Local<bool>,
 ) {
     let car = sim.0.car();
-
-    // Follow the car's *full* forward axis, not just its horizontal part, so the
-    // camera trails it up a wall and over onto the ceiling. On the flat ground the
-    // two are the same, because a grounded car's forward is horizontal.
-    let forward = car.forward.normalize_or_zero();
-    // The car's up axis is the surface normal on the ground, a wall's normal on a
-    // wall, and straight down on the ceiling. That is the frame the camera boom
-    // is built in (see `camera_frame`).
-    let car_up = if car.up.length_squared() > 0.5 {
-        car.up.normalize()
-    } else {
-        Vec3::Y
-    };
-    let car_pos = car.pos;
     let ball_pos = sim.0.ball().pos;
+    let car_pos = car.pos;
+    let dt = time.delta_secs();
 
     let pad = gamepads.iter().next();
     let behind = look_behind(pad);
-    let (look_x, look_y) = look_input(&keys, pad);
-
-    // Look-behind is a hard 180° flip in Rocket League: it jumps around the
-    // instant the stick is clicked, and jumps back on release. `behind_last`
-    // catches both edges so neither transition swivels. The ordinary swivel, by
-    // contrast, is smoothed so the camera eases around after the stick.
-    let was_behind = *behind_last;
+    // Look-behind is a hard 180° flip in RL: snap the pose on both edges rather
+    // than easing the boom through the car.
+    let snap = behind != *behind_last;
     *behind_last = behind;
-    let snap = behind != was_behind;
+    let (mut look_x, look_y) = look_input(&keys, pad, settings.invert_look_y);
+    if settings.invert_swivel {
+        look_x = -look_x;
+    }
 
-    // The boom's resting direction. In ball cam it points straight away from the
-    // ball (so the camera looks *through* the car at it, and on a wall sits outside
-    // the wall doing so); car cam keeps the boom behind the car, trailing its
-    // heading. See `ball_cam_angle` / `camera_frame`.
+    // The heading is horizontal in both modes: car cam trails the car's heading,
+    // ball cam looks along the bearing to the ball. This is the whole difference
+    // from the old car-frame boom - the camera never rolls with the car, and on a
+    // wall the ball still steers the camera around the field, as in RL.
     let to_ball = ball_pos - car_pos;
-    let (resting_yaw, resting_pitch) = if ball_cam.0 {
-        ball_cam_angle(car_up, forward, to_ball)
-    } else {
-        (0.0, resting_pitch())
-    };
+    let base = base_heading(ball_cam.0, car.forward, to_ball);
+    let target_yaw = base.map(yaw_of);
 
-    // Smooth the yaw *angle*, not the camera position: easing the angle swings
-    // the camera *around* the car rather than cutting through it. Ease by the
-    // shortest way round, so the ball passing behind the car does not spin the
-    // camera the long way.
-    let smooth = if snap {
+    // Ease the heading angle, not the camera position: swinging the angle walks
+    // the camera *around* the car instead of cutting through it. Stiffness
+    // tightens the follow; transition speed shortens the swing when toggling
+    // between ball and car cam.
+    let stiffness = settings.stiffness;
+    let yaw_rate = (4.0 + 16.0 * stiffness) * settings.transition_speed;
+    let yaw_weight = if stiffness >= 0.999 {
         1.0
     } else {
-        1.0 - (-CAMERA_LOOK_RESPONSE * time.delta_secs()).exp()
+        1.0 - (-yaw_rate * dt).exp()
     };
-    let target_yaw = look_yaw_offset(look_x, behind) + resting_yaw;
-    let mut delta = target_yaw - *look_yaw;
-    delta = (delta + PI).rem_euclid(std::f32::consts::TAU) - PI;
-    *look_yaw += delta * smooth;
-    let pitch = if ball_cam.0 {
-        // Ball cam may swing below the tangent plane (out of the arena); see
-        // `CAMERA_BALL_PITCH_MIN`.
-        (resting_pitch - look_y as f32 * CAMERA_LOOK_PITCH)
-            .clamp(CAMERA_BALL_PITCH_MIN, CAMERA_PITCH_MAX)
-    } else {
-        pitch_for_look(resting_pitch, look_y as f32)
+    let current_yaw = match (*heading, target_yaw) {
+        (Some(current), Some(target)) => current + shortest_angle(target - current) * yaw_weight,
+        (Some(current), None) => current,
+        (None, Some(target)) => target,
+        (None, None) => 0.0,
     };
-    let (boom, aim_offset) = camera_frame(forward, car_up, *look_yaw, pitch);
+    *heading = Some(current_yaw);
 
-    // The arena is a see-through cage - its shell is drawn one-sided (see
-    // `arena_surface_mesh`) - so the camera is free to sit outside it and look
-    // back in through the wall or the roof. That is what keeps the car in view
-    // when it drives up a wall or across the ceiling, instead of the boom stopping
-    // dead against the shell as it used to. The only guard is the floor, which the
-    // camera never drops below.
-    let mut desired = car_pos + boom;
+    // Swivel is a rate, as in RL: holding the stick turns the camera at
+    // `swivel_speed`, and releasing it springs back to centre. Look-behind is a
+    // hard 180° flip, so swivel is ignored while it is held.
+    let look_x = look_x as f32;
+    if !behind && look_x.abs() > 0.05 {
+        *swivel += look_x * settings.swivel_speed * SWIVEL_RAD_PER_SPEED * dt;
+        *swivel = swivel.clamp(-PI, PI);
+    } else {
+        let recenter = settings.swivel_speed * SWIVEL_RETURN_PER_SPEED * dt;
+        *swivel *= (-recenter).exp();
+    }
+
+    let view_heading = dir_from_yaw(heading_yaw(current_yaw, *swivel, behind));
+
+    // RL's camera angle pitches the *view*; it does not move the boom. Keeping
+    // the camera at `distance`/`height` and tilting the view is what leaves the
+    // car low in the frame instead of centred like a look-at camera.
+    let target = chase_position(car_pos, view_heading, settings.distance, settings.height);
+    let mut desired = target;
+    // The shell is a see-through cage, so the camera may sit outside it and look
+    // back in. The only guard is the floor; it never films from underneath.
     desired.y = desired.y.max(CAMERA_FLOOR_MARGIN);
 
-    // Where the camera looks. Ball cam frames the ball; car cam (or while the
-    // look controls are in use) squares up on the car, so a swivel keeps the car
-    // centred instead of dragging the aim off toward the ball.
-    //
-    // This is an absolute aim point, not a weighted average of the car and ball
-    // positions: blending the raw positions lets the aim drift behind the camera
-    // whenever the ball is, and the camera then stares at the floor with the car
-    // off screen.
-    let look_amount = if behind {
+    let follow_rate = 3.0 + 17.0 * stiffness;
+    let weight = if snap || stiffness >= 0.999 {
         1.0
     } else {
-        (look_x.abs().max(look_y.abs()) as f32).clamp(0.0, 1.0)
-    };
-    // Ball cam frames the ball (the car sits between the camera and the ball);
-    // car cam, look-behind, or a swivel square up on the car.
-    let frame_ball = ball_cam.0 && !behind && look_amount < 0.5;
-    let car_aim = car_pos + aim_offset;
-    let aim = if frame_ball {
-        // Aim at the ball so it stays framed; the low ball-cam boom keeps the
-        // car in the bottom of the view.
-        ball_pos
-    } else {
-        car_aim
+        1.0 - (-follow_rate * dt).exp()
     };
 
-    // Ease the camera into place to damp jitter, except on a look-behind flip,
-    // where the whole point is to jump straight to the other side of the car.
-    let weight = if snap {
-        1.0
-    } else {
-        1.0 - (-8.0 * time.delta_secs()).exp()
-    };
+    let pitch = (settings.angle.to_radians() + look_y as f32 * CAMERA_LOOK_PITCH)
+        .clamp(-CAMERA_PITCH_LIMIT, CAMERA_PITCH_LIMIT);
+    let view = view_direction(view_heading, pitch);
+
     for mut transform in &mut query {
+        // Stiffness damps the position follow; the heading is damped above.
         transform.translation = transform.translation.lerp(desired, weight);
-        // Directly overhead - or, on a wall, directly below - world up is
-        // parallel to the view direction and `look_at` has no valid basis. Fall
-        // back to the car's own up axis, which stays horizontal on a wall.
-        let to_aim = aim - transform.translation;
-        let view = to_aim.normalize_or_zero();
-        let up = if view.cross(Vec3::Y).length() > 0.2 {
-            Vec3::Y
-        } else if view.cross(car_up).length() > 0.2 {
-            car_up
-        } else {
-            Vec3::X
-        };
-        transform.look_at(aim, up);
+        transform.translation.y = transform.translation.y.max(CAMERA_FLOOR_MARGIN);
+        // World up, always: the camera stays level when the car rolls or drives
+        // on a wall, which is how RL's camera behaves.
+        transform.rotation = Transform::default().looking_to(view, Vec3::Y).rotation;
     }
 }
 
@@ -1681,205 +1841,164 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_boom_is_not_clipped_against_the_arena() {
-        // The arena is a see-through cage, so a car backed against a wall gets
-        // its full boom even though that puts the camera outside the arena: the
-        // shell is drawn one-sided and the car stays visible through it.
+    fn camera_defaults_match_rocket_league() {
+        let s = CameraSettings::default();
+        assert_eq!(s.fov, 110.0);
+        assert_eq!(s.distance, 2.7); // 270 uu
+        assert_eq!(s.height, 1.0); // 100 uu
+        assert_eq!(s.angle, -4.0);
+        assert_eq!(s.stiffness, 0.5);
+        assert_eq!(s.swivel_speed, 5.0);
+        assert_eq!(s.transition_speed, 1.0);
+        assert!(!s.invert_swivel);
+    }
+
+    #[test]
+    fn camera_settings_load_from_toml_and_clamp_to_rl_ranges() {
+        let parsed: CameraSettings = toml::from_str(
+            "fov = 90\n\
+             distance = 3.5\n\
+             height = 0.75\n\
+             angle = -6\n\
+             stiffness = 0.7\n\
+             swivel_speed = 7\n\
+             transition_speed = 1.5\n\
+             invert_swivel = true\n\
+             invert_look_y = false",
+        )
+        .unwrap();
+        assert_eq!(parsed.fov, 90.0);
+        assert_eq!(parsed.distance, 3.5);
+        assert_eq!(parsed.height, 0.75);
+        assert_eq!(parsed.angle, -6.0);
+        assert_eq!(parsed.stiffness, 0.7);
+        assert_eq!(parsed.swivel_speed, 7.0);
+        assert_eq!(parsed.transition_speed, 1.5);
+        assert!(parsed.invert_swivel);
+        assert!(!parsed.invert_look_y);
+
+        // Out-of-range values are clamped to the game's limits.
+        let clamped: CameraSettings = toml::from_str("distance = 9.0\nfov = 10.0").unwrap();
+        let clamped = clamped.clamped();
+        assert_eq!(clamped.distance, 4.0);
+        assert_eq!(clamped.fov, 80.0);
+    }
+
+    #[test]
+    fn camera_settings_reject_unknown_keys() {
+        assert!(toml::from_str::<CameraSettings>("distnace = 2.0").is_err());
+    }
+
+    #[test]
+    fn the_camera_boom_is_rl_distance_and_height() {
+        let car = Vec3::new(1.0, 0.17, 2.0);
+        let heading = base_heading(false, Vec3::Z, Vec3::ZERO).unwrap();
+        let position = chase_position(car, heading, 2.7, 1.0);
+        let expected = car - Vec3::Z * 2.7 + Vec3::Y * 1.0;
+        assert!((position - expected).length() < 1e-5, "{position:?}");
+    }
+
+    #[test]
+    fn the_camera_is_not_clipped_against_the_arena() {
+        // The arena is a see-through cage, so a car backed against a wall keeps
+        // its full boom even when that puts the camera outside the shell.
         let car = Vec3::new(0.0, 0.18, -(ARENA_HALF_Z - 0.6));
-        let (boom, _) = camera_frame(Vec3::new(0.0, 0.0, 1.0), Vec3::Y, 0.0, resting_pitch());
-        let desired = car + boom;
+        let position = chase_position(car, Vec3::Z, 2.7, 1.0);
         assert!(
-            desired.z < -ARENA_HALF_Z,
-            "the camera should sit outside the wall, got {desired:?}"
+            position.z < -ARENA_HALF_Z,
+            "the camera should sit outside the wall, got {position:?}"
         );
     }
 
     #[test]
-    fn camera_frame_without_look_is_the_plain_chase_offset() {
-        // The look control must not change the resting view: at zero yaw and the
-        // resting pitch the boom is exactly the old
-        // `-forward * CAMERA_DISTANCE + Y * CAMERA_HEIGHT`, and the aim sits
-        // CAMERA_AIM_HEIGHT above the car.
-        let forward = Vec3::new(0.0, 0.0, 1.0);
-        let (boom, aim) = camera_frame(forward, Vec3::Y, 0.0, resting_pitch());
-        let expected = -forward * CAMERA_DISTANCE + Vec3::Y * CAMERA_HEIGHT;
-        assert!((boom - expected).length() < 1e-5, "boom {boom:?}");
+    fn ball_cam_steers_by_the_horizontal_bearing_to_the_ball() {
+        let to_ball = Vec3::new(3.0, 7.0, 4.0);
+        let heading = base_heading(true, Vec3::Z, to_ball).unwrap();
         assert!(
-            (aim - Vec3::Y * CAMERA_AIM_HEIGHT).length() < 1e-5,
-            "aim {aim:?}"
+            heading.y.abs() < 1e-6,
+            "heading must stay level: {heading:?}"
+        );
+        let flat_ball = Vec3::new(to_ball.x, 0.0, to_ball.z).normalize();
+        assert!(heading.dot(flat_ball) > 0.999);
+
+        // Behind the car relative to the ball, and still a fixed height up: no
+        // 3D orbit and no climbing the car's wall normal.
+        let camera = chase_position(Vec3::ZERO, heading, 2.7, 1.0);
+        assert!(
+            camera.dot(to_ball) < 0.0,
+            "camera should be on the far side of the car: {camera:?}"
+        );
+        assert!((camera.y - 1.0).abs() < 1e-6, "camera height {camera:?}");
+    }
+
+    #[test]
+    fn the_camera_follows_a_wall_without_rolling() {
+        // Nose straight up a wall: there is no horizontal heading to follow, so
+        // the caller keeps its previous one rather than snapping.
+        assert!(base_heading(false, Vec3::Y, Vec3::ZERO).is_none());
+
+        // Nosed up at an angle: only the horizontal component is used, and the
+        // boom stays world-up, so the camera is level while the car is sideways.
+        let heading = base_heading(false, Vec3::new(0.0, 1.0, 0.2), Vec3::ZERO).unwrap();
+        assert!(heading.y.abs() < 1e-6);
+        assert!((heading - Vec3::Z).length() < 1e-5);
+        let camera = chase_position(Vec3::new(0.0, 5.0, 0.0), heading, 2.7, 1.0);
+        assert!(
+            (camera.y - 6.0).abs() < 1e-5,
+            "camera should stay world-up: {camera:?}"
         );
     }
 
     #[test]
-    fn look_yaw_swings_the_camera_around_the_car() {
-        let forward = Vec3::new(0.0, 0.0, 1.0);
-        let radius = (CAMERA_DISTANCE * CAMERA_DISTANCE + CAMERA_HEIGHT * CAMERA_HEIGHT).sqrt();
-        let (resting, _) = camera_frame(forward, Vec3::Y, 0.0, resting_pitch());
-
-        for look_x in [-1.0, -0.5, 0.5, 1.0] {
-            let (swung, _) = camera_frame(
-                forward,
-                Vec3::Y,
-                look_yaw_offset(look_x, false),
-                resting_pitch(),
-            );
-            assert!(
-                (swung.length() - radius).abs() < 1e-4,
-                "look_x {look_x}: distance {} vs {radius}",
-                swung.length()
-            );
-            assert!(
-                (swung.x - resting.x).abs() > 0.1,
-                "look_x {look_x} did not swing: {swung:?}"
-            );
-        }
+    fn look_behind_flips_the_heading_180_degrees() {
+        let base_yaw = yaw_of(Vec3::Z);
+        let front = dir_from_yaw(heading_yaw(base_yaw, 0.0, false));
+        let behind = dir_from_yaw(heading_yaw(base_yaw, 0.0, true));
+        assert!(front.dot(behind) < -0.999, "{front:?} vs {behind:?}");
     }
 
     #[test]
-    fn look_behind_swings_the_camera_to_the_front_of_the_car() {
-        let forward = Vec3::new(0.0, 0.0, 1.0);
-        let (resting, _) = camera_frame(
-            forward,
-            Vec3::Y,
-            look_yaw_offset(0.0, false),
-            resting_pitch(),
-        );
-        assert!(
-            resting.z < 0.0,
-            "the resting boom sits behind the car: {resting:?}"
-        );
-
-        let (behind, _) = camera_frame(
-            forward,
-            Vec3::Y,
-            look_yaw_offset(0.0, true),
-            resting_pitch(),
-        );
-        assert!(behind.z > 0.0, "look-behind must cross the car: {behind:?}");
+    fn positive_swivel_looks_right() {
+        // Looking along +Z, the camera's right is -X in Bevy's frame.
+        let heading = dir_from_yaw(heading_yaw(yaw_of(Vec3::Z), 0.5, false));
+        assert!(heading.x < 0.0, "{heading:?}");
     }
 
     #[test]
-    fn pitch_orbits_the_camera_up_and_over_the_car() {
-        // Push up (look_y is inverted, so negative) raises the camera towards a
-        // top-down view; pull down drops it flatter. Either way the aim stays on
-        // the car, so it can never stare past it into the ground.
-        let forward = Vec3::new(0.0, 0.0, 1.0);
-        let height = |look_y: f32| {
-            camera_frame(
-                forward,
-                Vec3::Y,
-                0.0,
-                pitch_for_look(resting_pitch(), look_y),
-            )
-            .0
-            .y
-        };
+    fn camera_angle_pitches_the_view_not_the_boom() {
+        // RL's default -4° angle looks slightly down, while the boom itself is
+        // still distance/height only.
+        let view = view_direction(Vec3::Z, -4.0_f32.to_radians());
+        assert!(view.y < 0.0, "default angle should look down: {view:?}");
 
-        assert!(
-            height(-1.0) > height(0.0),
-            "pushing up should raise the camera: {} vs {}",
-            height(-1.0),
-            height(0.0)
-        );
-        assert!(
-            height(1.0) < height(0.0),
-            "pulling down should lower the camera: {} vs {}",
-            height(1.0),
-            height(0.0)
-        );
-
-        // The orbit is bounded: a hard push can never take the camera below the
-        // car, which is where "looking into the ground" began.
-        assert!(
-            height(-5.0) > 0.0,
-            "clamped push-up must stay above the car"
-        );
-        assert!((pitch_for_look(resting_pitch(), -5.0) - CAMERA_PITCH_MAX).abs() < 1e-6);
-        assert!((pitch_for_look(resting_pitch(), 5.0) - CAMERA_PITCH_MIN).abs() < 1e-6);
-
-        // Throughout the range the aim sits just above the car, never down at the
-        // ground.
-        for look_y in [-1.0, -0.5, 0.0, 0.5, 1.0] {
-            let (_, aim) = camera_frame(
-                forward,
-                Vec3::Y,
-                0.0,
-                pitch_for_look(resting_pitch(), look_y),
-            );
-            assert!(
-                (aim - Vec3::Y * CAMERA_AIM_HEIGHT).length() < 1e-6,
-                "aim drifted off the car at look_y {look_y}: {aim:?}"
-            );
-        }
+        let camera = chase_position(Vec3::ZERO, Vec3::Z, 2.7, 1.0);
+        assert!((camera.y - 1.0).abs() < 1e-6);
     }
 
     #[test]
-    fn the_boom_is_built_in_the_cars_own_frame() {
-        // On a wall the car's forward is vertical and its up is horizontal. The
-        // boom must lie in the wall plane - lifted off the wall along the car's
-        // up - rather than collapsing to "straight down", which is what let ball
-        // cam track the ball on a wall.
-        let forward = Vec3::new(0.0, 1.0, 0.0); // up the +X wall
-        let up = Vec3::new(-1.0, 0.0, 0.0); // wall normal, into the arena
-        let (boom, aim) = camera_frame(forward, up, 0.0, resting_pitch());
-        assert!(boom.y < -1.0, "boom should sit down the wall: {boom:?}");
-        assert!(boom.x < -1.0, "boom should lift off the wall: {boom:?}");
-        assert!(boom.z.abs() < 1e-4, "boom left the wall plane: {boom:?}");
-        assert!(
-            (aim - up * CAMERA_AIM_HEIGHT).length() < 1e-5,
-            "aim {aim:?}"
-        );
-    }
-
-    #[test]
-    fn ball_cam_swings_the_boom_outside_the_wall() {
-        // Car high on the +X wall, ball in-field. Ball cam puts the camera on the
-        // far side of the car from the ball - *outside* the wall - so the car is in
-        // front of the ball looking back in through the cage.
-        let car_up = Vec3::new(-1.0, 0.0, 0.0);
-        let forward = Vec3::new(0.0, 1.0, 0.0);
-        let half_x = 40.96_f32; // RocketSim soccar half-width (4096 uu)
-        let car = Vec3::new(half_x - 0.2, 8.0, 0.0);
-        let ball = Vec3::new(20.0, 2.0, 3.0);
-        let (yaw, pitch) = ball_cam_angle(car_up, forward, ball - car);
-        let (boom, _) = camera_frame(forward, car_up, yaw, pitch);
-        let camera = car + boom;
-        assert!(
-            camera.x > half_x,
-            "the camera should sit outside the +X wall, got {camera:?}"
-        );
-        assert!(
-            boom.dot(ball - car) < 0.0,
-            "the boom should point away from the ball: {boom:?}"
-        );
-    }
-
-    #[test]
-    fn ball_cam_on_the_floor_still_trails_the_car() {
-        // Ball ahead on the ground: the boom stays behind and above the car, i.e.
-        // the plain resting chase offset.
-        let forward = Vec3::new(0.0, 0.0, 1.0);
-        let car = Vec3::new(0.0, 0.2, 0.0);
-        let ball = Vec3::new(0.0, 0.2, 10.0);
-        let (yaw, pitch) = ball_cam_angle(Vec3::Y, forward, ball - car);
-        let (boom, _) = camera_frame(forward, Vec3::Y, yaw, pitch);
-        assert!(boom.z < -1.0, "boom should be behind the car: {boom:?}");
-        assert!(boom.y > 1.0, "boom should be above the car: {boom:?}");
-        assert!(yaw.abs() < 1e-4, "yaw {yaw}");
+    fn horizontal_fov_converts_to_bevy_vertical_fov() {
+        // 110° horizontal on 16:9 is ~77.6° vertical.
+        let vertical = vertical_fov(110.0, 16.0 / 9.0).to_degrees();
+        assert!((vertical - 77.6).abs() < 0.2, "vertical FOV {vertical}");
+        assert!(vertical > 45.0, "RL's default must be wider than Bevy's");
     }
 
     #[test]
     fn the_vertical_axis_is_inverted() {
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyL);
-        let (x, _) = look_input(&keys, None);
+        let (x, _) = look_input(&keys, None, true);
         assert!(x > 0.5, "L should swivel right, got {x}");
 
-        // Pushing up looks down, so the aim lift comes out negative.
+        // Pushing up looks down, so the pitch input comes out negative.
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyI);
-        let (_, y) = look_input(&keys, None);
+        let (_, y) = look_input(&keys, None, true);
         assert!(y < -0.5, "I should look down (inverted), got {y}");
+
+        // The same key is not inverted when the setting is off.
+        let (_, y) = look_input(&keys, None, false);
+        assert!(y > 0.5, "I should look up when not inverted, got {y}");
     }
 
     #[test]

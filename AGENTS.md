@@ -51,6 +51,10 @@ cargo clippy --workspace --all-targets # kept clean
 - The viewer needs RL's dumped arena meshes in `RL/collision_meshes/soccar/` at
   runtime or it exits with a message. Dump them with `tools/rlacd.py`
   (Linux/Proton) or RLArenaCollisionDumper (Windows).
+- `camera.toml` at the repo root holds Rocket League camera settings (distance,
+  height, angle, FOV, stiffness, swivel/transition speed). It is optional —
+  missing means built-in RL defaults — and hot-reloads while the viewer runs.
+  `--camera-config PATH` overrides it.
 - Project tasks are defined in `.zed/tasks.json`.
 
 **To see your work, render a PNG** — both forms exit on their own:
@@ -92,17 +96,20 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
 
 ## Traps already paid for
 
-- **Chase camera:** the arena is a see-through cage, so the camera is _not_
-  clipped to its walls — a car on a wall gets its full boom even when that puts the
-  camera outside the shell, and the one-sided shell keeps the car visible through
-  the wall. It is kept above the pitch (`CAMERA_FLOOR_MARGIN`) but free to leave
-  through the walls _and_ the roof, so ball cam can film a car on the ceiling from
-  above it. Ball cam points the boom straight away from the ball in _full 3D_
-  (`ball_cam_angle`); measuring the bearing only in the car's tangent plane kept
-  the boom in the wall plane and left the car behind the camera on a wall. Still:
-  don't clamp the camera to the wall plane (it collapses onto the car), and don't
-  aim at a weighted average of car/ball positions (it ends up facing the floor).
-  See the comments in `view/src/main.rs`.
+- **Chase camera:** RL parity means a world-upright, yaw-only boom, not a boom
+  built in the car's frame. The camera sits at `car - heading * distance +
+  Y * height`, where `heading` is the car's horizontal forward in car cam or the
+  horizontal bearing to the ball in ball cam. `CameraSettings::angle` pitches the
+  _view_, not the boom, which is what leaves the car low in the frame. The arena
+  is a see-through cage, so the camera is _not_ clipped to its walls — it may sit
+  outside the shell and look back in — but it is kept above the pitch
+  (`CAMERA_FLOOR_MARGIN`). Do not build the boom from the car's own `up`: that
+  rolls the camera with the car on a wall or in the air and is exactly the
+  behaviour this model replaced. A vertical car heading (nose straight up a wall)
+  has no horizontal direction; keep the last yaw rather than clamping the boom to
+  the wall plane (that collapses it onto the car). Don't aim at a weighted average
+  of car/ball positions (it ends up facing the floor). Settings live in
+  `camera.toml` and hot-reload; see the comments in `view/src/main.rs`.
 - **The arena mesh is two sources, not one.** `sim::arena_collision_mesh` is
   RocketSim's dumped `.cmf` triangles _plus_ four flat quads. The dumped meshes
   carry only the _curved_ parts (corners, wall-to-floor/wall-to-ceiling fillets,

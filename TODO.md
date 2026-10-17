@@ -6,31 +6,20 @@
 
 # QUESTIONS
 
-- how to do physics tests properly, make parity with actual rocket league a test suite?
-  - started: the constants now come from RocketSim, but a real parity harness
-    (record inputs + state hashes from a reference build, assert in CI) is still
-    the missing piece.
-
 # TODO
 
-- free-cam shots show only the kickoff scene; add pose flags (`--car` / `--ball`)
-  so a specific dynamic setup can be shot instantly without simulating to it
-- aim for just being able to bounce a ball against a wall
-- I need to break things down into really simple things:
-  - get the car moving properly just on flat ground
-  - get the ball moving properly
-- port the rest of the car handling from RocketSim:
-  - suspension and tyre slip, so the turn radii are more than a bicycle-model
-    approximation, and so wall driving is a wheel model rather than "glue the
-    car to the surface"
-- start comparing our physics with the real game by looking at replay files:
-  - I should be able to produce some replay files doing really simpler things like:
-    - driving forward, reversing, to make sure acceleration is correct
-    - turning
-    - jumping
-    - etc
+- make it look more like RL but keep low-poly:
+  - show agent some images?
+- sound (engine sound, boost sound)
+- settings:
+  - as a yaml file? or sqlite?
+  - controller, keyboard shortcuts
+  - camera
+- rlbot integration
 
 # DOING
+
+- camera parity
 
 # DONE
 

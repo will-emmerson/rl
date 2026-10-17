@@ -79,12 +79,17 @@ clicking the right stick in (`R3`) looks behind you; everything springs back whe
 released. (If your pad reports nothing, see the gamepad section under "A note on
 Bevy's features" below.)
 
-The camera trails the car and, in ball cam (the default), keeps the ball framed
-from the far side of the car — on a wall that swings the camera _outside_ the wall,
-looking back in with the car in front of the ball. `Y` (or `C`) switches to a
-straight-ahead car cam. The shell is a see-through cage, so a wall play is filmed
-from outside it, through the wall. This needs a GPU and a window; it was developed
-on Vulkan.
+The camera follows Rocket League's model rather than the old car-frame boom:
+the boom is world-upright, a fixed distance behind and height above the car, and
+only its yaw tracks the car. RL's camera angle pitches the _view_, not the boom,
+so the car sits low in the frame. In ball cam (the default) the yaw follows the
+horizontal bearing to the ball; `Y` (or `C`) switches to a straight-ahead car
+cam. The camera is not clipped to the arena — because the shell is one-sided it
+may sit outside and look back in — so wall play stays visible. Camera settings
+live in `camera.toml` (RL defaults: 110° FOV, 270 uu distance, 100 uu height, -4°
+angle, 0.5 stiffness; metres in the file, ×100 for the in-game `uu` values) and
+are hot-reloaded when you save. Pass `--camera-config PATH` to use another file.
+This needs a GPU and a window; it was developed on Vulkan.
 
 The arena is drawn straight from RocketSim's own collision mesh — the very
 geometry the ball and car collide with — so what you see is what you hit. A
@@ -187,6 +192,7 @@ lighting and camera framing, not a dynamic pose. The tick is ignored when
 
 ```
 Cargo.toml        virtual workspace; the game crate is `view`
+camera.toml       camera settings, hot-reloaded (RL defaults; see the file)
 view/             the game: Bevy 3D viewer + RocketSim (`rl_view`)
   src/main.rs     scene, input, camera, HUD
   src/sim.rs      the RocketSim backend (the only place that knows about it)
