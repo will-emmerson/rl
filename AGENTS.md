@@ -48,11 +48,18 @@ should know RocketSim's frame or units.
 
 ```sh
 cargo run -p rl_view                   # play (dev profile is already playable)
+cargo run -p rl_view -- --fullscreen --stats  # native-res fullscreen + frame timing
+cargo run -p rl_view -- --resolution 1920x1080 --stats --no-vsync  # windowed, uncapped
 cargo run -p rl_view -- --rlbot        # same, plus an RLBot v5 bot slot
 cargo run -p rl_view -- --rlbot --rlbot-config bot.toml  # ...and launch the bot
 cargo test --workspace                 # the check that matters
 cargo clippy --workspace --all-targets # kept clean
 ```
+
+- `--fullscreen` is borderless fullscreen on the primary monitor at its native
+  resolution. `--resolution WxH` sets a windowed physical-pixel size (ignored
+  by fullscreen), and `--no-vsync` uncaps the frame rate. `--stats` adds a
+  frame-time/FPS/max/1%-low line to the HUD; **F3** toggles it at runtime.
 
 - The dev profile is tuned on purpose (own crates `opt-level = 1`, deps `3`).
   **Don't default to `--release`**: it uses a separate target dir and rebuilds

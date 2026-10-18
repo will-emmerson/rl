@@ -23,6 +23,26 @@ cargo run --release -p rl_view   # smoother, but the first run rebuilds Bevy
 The dev profile is set up to be playable (this crate at `opt-level = 1`, all
 dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 
+### Check performance
+
+```sh
+cargo run -p rl_view -- --fullscreen --stats
+cargo run -p rl_view -- --fullscreen --stats --no-vsync   # uncapped frame rate
+cargo run -p rl_view -- --resolution 1920x1080 --stats    # windowed, fixed size
+```
+
+`--fullscreen` starts borderless fullscreen on the primary monitor, which
+renders at its native resolution without changing the desktop video mode.
+`--resolution WIDTHxHEIGHT` sets a windowed (physical-pixel) size and is ignored
+with `--fullscreen`. `--no-vsync` disables the frame-rate cap so the timing
+shows the actual cost of a frame; leave it off to see the frame time the display
+receives.
+
+`--stats` shows a performance line in the HUD (F3 toggles it at runtime): average
+FPS and frame time over the last 5 seconds, the worst frame, the 1% low FPS, and
+the current window resolution. Frame time is wall-clock time between frames, so
+with vsync on it bottoms out at the monitor's refresh interval.
+
 ### Play against an RLBot v5 bot
 
 The viewer can expose the bot-facing half of RLBot v5 over TCP, so ordinary

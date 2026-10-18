@@ -12,10 +12,12 @@
 //!   cargo run -p rl_view -- --gamepad-debug       # log every raw pad event
 //!   cargo run -p rl_view -- --camera-config cam.toml # use a different camera file
 //!   cargo run -p rl_view -- --controls-config keys.toml # different bindings file
+//!   cargo run -p rl_view -- --fullscreen --stats  # native-res fullscreen + perf overlay
 //!   cargo run -p rl_view -- --rlbot                # listen for one RLBot v5 bot
 //!   cargo run -p rl_view -- --rlbot --rlbot-config Nexto
 //!                                                 # ...and start the bot too
 
+use std::collections::VecDeque;
 use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -31,7 +33,9 @@ use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
 use bevy::render::view::screenshot::{save_to_disk, Screenshot};
-use bevy::window::PrimaryWindow;
+use bevy::window::{
+    MonitorSelection, PresentMode, PrimaryWindow, WindowMode, WindowPlugin, WindowResolution,
+};
 use serde::Deserialize;
 
 mod sim;
@@ -351,6 +355,54 @@ struct ChaseCam;
 #[derive(Component)]
 struct HudText;
 
+/// Rolling frame-time window for the `--stats` overlay. A 5 s window keeps the
+/// average responsive while still giving the 1% low a useful number of frames
+/// to choose from (300 at 60 fps).
+const PERF_WINDOW_SECS: f32 = 5.0;
+/// How often the overlay's numbers are recomputed. Updating every frame would
+/// sort the window constantly and make the text unreadable.
+const PERF_REFRESH_SECS: f32 = 0.25;
+/// Ignore the first second: pipeline compilation and window bring-up make the
+/// first frames far slower than steady state, which would poison max/1% low.
+const PERF_WARMUP_SECS: f32 = 1.0;
+
+/// Frame timing for the performance overlay, switched on with `--stats` or F3.
+/// Frames are measured from `Time<Real>`, i.e. wall-clock time between frames,
+/// so the numbers are what the display actually receives (vsync included).
+#[derive(Resource)]
+struct PerfStats {
+    visible: bool,
+    /// Frame times in milliseconds, covering roughly `PERF_WINDOW_SECS`.
+    frames: VecDeque<f32>,
+    window_ms: f32,
+    since_refresh: f32,
+    fps: f32,
+    avg_ms: f32,
+    max_ms: f32,
+    low_fps: f32,
+    /// Physical window size, shown next to the timings to confirm the render
+    /// resolution (fullscreen picks the monitor's native size).
+    width: u32,
+    height: u32,
+}
+
+impl Default for PerfStats {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            frames: VecDeque::new(),
+            window_ms: 0.0,
+            since_refresh: 0.0,
+            fps: 0.0,
+            avg_ms: 0.0,
+            max_ms: 0.0,
+            low_fps: 0.0,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
 /// The two goal totals in the top-centre scoreboard.
 #[derive(Component)]
 struct BlueScoreText;
@@ -408,6 +460,13 @@ fn main() {
     let mut look: Option<Vec3> = None;
     let mut camera_config: Option<PathBuf> = None;
     let mut controls_config: Option<PathBuf> = None;
+    // Window presentation. Fullscreen is borderless, so it uses the monitor's
+    // native resolution without changing the desktop video mode.
+    let mut fullscreen = false;
+    let mut resolution: Option<(u32, u32)> = None;
+    let mut no_vsync = false;
+    // Start with the frame-time overlay visible (F3 toggles it either way).
+    let mut stats = false;
     let mut rlbot_enabled = false;
     let mut rlbot_port = rlbot_bridge::DEFAULT_PORT;
     // `None` means "use the bot config, or the built-in default".
@@ -448,6 +507,15 @@ fn main() {
                         .unwrap_or_else(|| panic!("--controls-config needs a path")),
                 ));
             }
+            "--fullscreen" => fullscreen = true,
+            "--resolution" => {
+                let value = args
+                    .next()
+                    .unwrap_or_else(|| panic!("--resolution needs WIDTHxHEIGHT"));
+                resolution = Some(parse_resolution(&value));
+            }
+            "--no-vsync" => no_vsync = true,
+            "--stats" => stats = true,
             "--gamepad-debug" => gamepad_debug = true,
             "--rlbot" => rlbot_enabled = true,
             "--rlbot-port" => {
@@ -494,6 +562,12 @@ fn main() {
 
     if rlbot_command.is_some() && rlbot_config.is_some() {
         panic!("use --rlbot-command or --rlbot-config, not both");
+    }
+    if fullscreen && resolution.is_some() {
+        eprintln!(
+            "note: --resolution is ignored with --fullscreen; borderless fullscreen \
+             uses the monitor's native resolution"
+        );
     }
     if rlbot_dir.is_some() && rlbot_command.is_none() && rlbot_config.is_none() {
         panic!("--rlbot-dir needs --rlbot-command or --rlbot-config");
@@ -574,8 +648,27 @@ fn main() {
         Rlbot::disabled()
     };
 
+    let mut window = Window::default();
+    if fullscreen {
+        // Borderless rather than exclusive: it still renders at the monitor's
+        // native resolution, but avoids a desktop video-mode switch (and works
+        // on Wayland, where exclusive fullscreen is not available).
+        window.mode = WindowMode::BorderlessFullscreen(MonitorSelection::Primary);
+    }
+    if let Some((width, height)) = resolution {
+        window.resolution = WindowResolution::new(width, height);
+    }
+    if no_vsync {
+        // `AutoNoVsync` falls back to vsync when a tearing-free mode is the only
+        // one available; `Immediate` would panic in that case.
+        window.present_mode = PresentMode::AutoNoVsync;
+    }
+
     App::new()
-        .add_plugins(DefaultPlugins)
+        .add_plugins(DefaultPlugins.set(WindowPlugin {
+            primary_window: Some(window),
+            ..default()
+        }))
         .insert_resource(Sim(sim))
         .insert_resource(rlbot)
         .insert_resource(mode)
@@ -585,6 +678,10 @@ fn main() {
         .insert_resource(controls_config)
         .insert_resource(GamepadDebug(gamepad_debug))
         .insert_resource(BallCam(true))
+        .insert_resource(PerfStats {
+            visible: stats,
+            ..default()
+        })
         .init_resource::<Boosting>()
         .insert_resource(Time::<Fixed>::from_hz(sim::TICK_HZ))
         .add_systems(
@@ -606,6 +703,7 @@ fn main() {
                 (reload_camera_settings, apply_camera_fov).chain(),
                 reload_controls,
                 chase_camera.run_if(simulating),
+                track_performance.before(update_hud),
                 update_hud,
                 update_boost_meter,
                 screenshot_driver,
@@ -685,6 +783,28 @@ fn parse_vec3_arg(args: &mut impl Iterator<Item = String>, flag: &str) -> Vec3 {
         .next()
         .unwrap_or_else(|| panic!("{flag} needs an x,y,z value"));
     parse_vec3(&raw).unwrap_or_else(|| panic!("{flag}: bad value {raw:?}, want x,y,z"))
+}
+
+/// Parse `--resolution WIDTHxHEIGHT` (physical pixels).
+fn parse_resolution(raw: &str) -> (u32, u32) {
+    let (width, height) = raw
+        .split_once('x')
+        .or_else(|| raw.split_once('X'))
+        .unwrap_or_else(|| {
+            panic!("--resolution: bad value {raw:?}, want WIDTHxHEIGHT (e.g. 1920x1080)")
+        });
+    let width = width
+        .trim()
+        .parse::<u32>()
+        .unwrap_or_else(|_| panic!("--resolution: bad value {raw:?}, want WIDTHxHEIGHT"));
+    let height = height
+        .trim()
+        .parse::<u32>()
+        .unwrap_or_else(|_| panic!("--resolution: bad value {raw:?}, want WIDTHxHEIGHT"));
+    if width == 0 || height == 0 {
+        panic!("--resolution: bad value {raw:?}, want WIDTHxHEIGHT");
+    }
+    (width, height)
 }
 
 /// Parse a comma-separated `x,y,z` triple (`12,6,-30` or `12, 6, -30`).
@@ -1247,7 +1367,12 @@ fn setup_scene(
             left: px(12),
             ..default()
         },
-        children![TextSpan::new(""), TextSpan::new(""), TextSpan::new("")],
+        children![
+            TextSpan::new(""),
+            TextSpan::new(""),
+            TextSpan::new(""),
+            TextSpan::new("")
+        ],
         HudText,
     ));
 
@@ -3223,9 +3348,68 @@ fn chase_camera(
     }
 }
 
+/// Collect frame times for the `--stats` overlay. `Time<Real>` is wall-clock
+/// time, so this measures the interval the display actually sees, not just the
+/// time spent inside the ECS schedules.
+fn track_performance(
+    time: Res<Time<Real>>,
+    keys: Res<ButtonInput<KeyCode>>,
+    window: Single<&Window, With<PrimaryWindow>>,
+    mut perf: ResMut<PerfStats>,
+) {
+    if keys.just_pressed(KeyCode::F3) {
+        perf.visible = !perf.visible;
+    }
+    if time.elapsed_secs() < PERF_WARMUP_SECS {
+        return;
+    }
+
+    let dt_ms = time.delta_secs() * 1000.0;
+    if dt_ms <= 0.0 || !dt_ms.is_finite() {
+        return;
+    }
+
+    perf.frames.push_back(dt_ms);
+    perf.window_ms += dt_ms;
+    while perf.window_ms > PERF_WINDOW_SECS * 1000.0 {
+        match perf.frames.pop_front() {
+            Some(old) => perf.window_ms -= old,
+            None => {
+                perf.window_ms = 0.0;
+                break;
+            }
+        }
+    }
+
+    perf.since_refresh += dt_ms / 1000.0;
+    if perf.since_refresh < PERF_REFRESH_SECS || perf.frames.is_empty() {
+        return;
+    }
+    perf.since_refresh = 0.0;
+
+    let count = perf.frames.len();
+    let avg_ms = perf.frames.iter().sum::<f32>() / count as f32;
+    let max_ms = perf.frames.iter().copied().fold(0.0, f32::max);
+
+    // 1% low: the mean of the slowest 1% of frames (at least one), which is
+    // steadier than reading the single worst frame.
+    let mut sorted: Vec<f32> = perf.frames.iter().copied().collect();
+    sorted.sort_by(f32::total_cmp);
+    let slowest = (count / 100).max(1);
+    let low_ms = sorted[count - slowest..].iter().sum::<f32>() / slowest as f32;
+
+    perf.avg_ms = avg_ms;
+    perf.fps = 1000.0 / avg_ms.max(0.001);
+    perf.max_ms = max_ms;
+    perf.low_fps = 1000.0 / low_ms.max(0.001);
+    perf.width = window.physical_width();
+    perf.height = window.physical_height();
+}
+
 fn update_hud(
     sim: Res<Sim>,
     ball_cam: Res<BallCam>,
+    perf: Res<PerfStats>,
     hud: Single<Entity, With<HudText>>,
     blue_score: Single<Entity, With<BlueScoreText>>,
     orange_score: Single<Entity, With<OrangeScoreText>>,
@@ -3254,6 +3438,16 @@ fn update_hud(
         format!("bot  {:>5.1} m/s   boost {:>3.0}\n", bot.speed, bot.boost)
     } else {
         String::new()
+    };
+    *writer.text(entity, 4) = if !perf.visible {
+        String::new()
+    } else if perf.fps > 0.0 {
+        format!(
+            "fps {:>5.0}   frame {:>5.1} ms   max {:>5.1} ms   1% low {:>5.0} fps   {}x{}\n",
+            perf.fps, perf.avg_ms, perf.max_ms, perf.low_fps, perf.width, perf.height
+        )
+    } else {
+        "stats: warming up\n".to_string()
     };
 }
 
@@ -3332,6 +3526,13 @@ fn screenshot_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolution_argument_parses_both_separators() {
+        assert_eq!(parse_resolution("1920x1080"), (1920, 1080));
+        assert_eq!(parse_resolution("2560X1440"), (2560, 1440));
+        assert_eq!(parse_resolution(" 3840x2160 "), (3840, 2160));
+    }
 
     #[test]
     fn camera_defaults_match_rocket_league() {
