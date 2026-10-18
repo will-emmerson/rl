@@ -344,6 +344,13 @@ struct ChaseCam;
 #[derive(Component)]
 struct HudText;
 
+/// The boost meter's numbered readout and its fill bar, bottom right as in RL.
+#[derive(Component)]
+struct BoostMeterText;
+
+#[derive(Component)]
+struct BoostMeterFill;
+
 /// A visual wheel. `steers` marks the front pair, which also yaw with the
 /// steering input; every wheel rolls about its axle.
 #[derive(Component)]
@@ -485,6 +492,7 @@ fn main() {
                 reload_controls,
                 chase_camera.run_if(simulating),
                 update_hud,
+                update_boost_meter,
                 screenshot_driver,
                 quit_on_escape,
             ),
@@ -1290,6 +1298,64 @@ fn setup_scene(
         },
         children![TextSpan::new(""), TextSpan::new(""), TextSpan::new("")],
         HudText,
+    ));
+
+    // RL's boost gauge lives in the bottom-right corner. The fill is a plain
+    // node; `update_boost_meter` drives its width from the car's boost.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            right: px(24),
+            bottom: px(24),
+            width: px(220),
+            flex_direction: FlexDirection::Column,
+            row_gap: px(6),
+            ..default()
+        },
+        children![
+            (
+                Node {
+                    width: percent(100),
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    ..default()
+                },
+                children![
+                    (
+                        Text::new("BOOST"),
+                        TextFont::from_font_size(13.0),
+                        TextColor(Color::srgba(0.85, 0.9, 1.0, 0.75)),
+                    ),
+                    (
+                        Text::new("100"),
+                        TextFont::from_font_size(20.0),
+                        BoostMeterText,
+                    ),
+                ],
+            ),
+            (
+                Node {
+                    width: percent(100),
+                    height: px(18),
+                    padding: UiRect::all(px(2)),
+                    border: UiRect::all(px(2)),
+                    border_radius: BorderRadius::all(px(6)),
+                    ..default()
+                },
+                BackgroundColor(Color::srgba(0.02, 0.03, 0.05, 0.75)),
+                BorderColor::all(Color::srgba(0.8, 0.85, 0.95, 0.55)),
+                children![(
+                    Node {
+                        width: percent(100),
+                        height: percent(100),
+                        border_radius: BorderRadius::all(px(4)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(1.0, 0.62, 0.12)),
+                    BoostMeterFill,
+                )],
+            ),
+        ],
     ));
 }
 
@@ -2903,9 +2969,8 @@ fn update_hud(
     let score = sim.0.score();
     *writer.text(entity, 1) = format!("BLUE {:>2} - {:<2} ORANGE\n", score[0], score[1]);
     *writer.text(entity, 2) = format!(
-        "speed {:>5.1} m/s   boost {:>5.1}   tick {:>6}   cam {}\n",
+        "speed {:>5.1} m/s   tick {:>6}   cam {}\n",
         car.speed,
-        car.boost,
         sim.0.tick(),
         if ball_cam.0 { "ball" } else { "car" }
     );
@@ -2915,6 +2980,17 @@ fn update_hud(
         ball.pos.y,
         ball.spin.length()
     );
+}
+
+/// Fill the bottom-right bar and its number from the car's boost (0..100).
+fn update_boost_meter(
+    sim: Res<Sim>,
+    mut fill: Single<&mut Node, With<BoostMeterFill>>,
+    mut text: Single<&mut Text, With<BoostMeterText>>,
+) {
+    let boost = sim.0.car().boost.clamp(0.0, 100.0);
+    fill.width = percent(boost);
+    text.0 = format!("{boost:.0}");
 }
 
 fn quit_on_escape(
