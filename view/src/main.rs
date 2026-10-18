@@ -137,6 +137,14 @@ const SWIVEL_RAD_PER_SPEED: f32 = 0.6;
 /// How quickly the swivel springs back to centre when the stick is released,
 /// per unit of `swivel_speed`, in inverse seconds.
 const SWIVEL_RETURN_PER_SPEED: f32 = 2.0;
+/// An axis is only trusted to imply the car's heading while its horizontal
+/// projection is at least this long. Below it the axis is close to vertical and
+/// its direction is mostly numerical noise; the other axis takes over.
+const CAR_HEADING_MIN_HORIZONTAL: f32 = 0.1;
+/// How upright an airborne car must be before the camera follows its heading.
+/// Below this (about 18° of pitch or roll) the car is mid-flip, and the camera
+/// holds its yaw: RL's car cam does not swing through a dodge's pitch/roll.
+const CAR_UPRIGHT_MIN_UP_Y: f32 = 0.95;
 
 // ---------------------------------------------------------------------------
 // Resources / components
@@ -1232,7 +1240,20 @@ fn setup_scene(
         } => Transform::from_translation(free.pos).looking_at(free.look, Vec3::Y),
         _ => {
             let car = sim.0.car();
-            let heading = base_heading(false, car.forward, Vec3::ZERO).unwrap_or(Vec3::Z);
+            let heading = dir_from_yaw(
+                base_yaw(
+                    false,
+                    car.forward,
+                    car.up,
+                    Vec3::ZERO,
+                    None,
+                    car.is_on_ground,
+                )
+                // At startup there is no previous heading to keep, so fall
+                // back to the nose's horizontal projection (the car is
+                // upright at kickoff).
+                .unwrap_or_else(|| yaw_of(car.forward)),
+            );
             let position = chase_position(car.pos, heading, settings.distance, settings.height);
             let view = view_direction(heading, settings.angle.to_radians());
             Transform::from_translation(position).looking_to(view, Vec3::Y)
@@ -2603,17 +2624,59 @@ fn shortest_angle(delta: f32) -> f32 {
     (delta + PI).rem_euclid(std::f32::consts::TAU) - PI
 }
 
-/// Horizontal direction the camera looks along: the car's heading in car cam, or
-/// the bearing to the ball in ball cam. `None` means the input is vertical (a car
-/// pointing straight up a wall), so the caller keeps its previous heading rather
-/// than snapping to an arbitrary one.
-fn base_heading(ball_cam: bool, car_forward: Vec3, to_ball: Vec3) -> Option<Vec3> {
-    let dir = if ball_cam {
-        Vec3::new(to_ball.x, 0.0, to_ball.z)
-    } else {
-        Vec3::new(car_forward.x, 0.0, car_forward.z)
-    };
-    (dir.length_squared() > 1e-6).then(|| dir.normalize())
+/// Yaw the camera's horizontal heading should follow: the car's heading in car
+/// cam, or the bearing to the ball in ball cam. `None` means the input gives no
+/// usable heading, so the caller keeps its previous yaw rather than snapping.
+///
+/// Car cam cannot use the horizontal projection of the nose alone: a front or
+/// back flip pitches the nose through vertical, where that projection collapses
+/// and then reverses, which would whip the camera through 180°. It cannot use
+/// the car's right axis alone either: a side flip or air roll spins that axis.
+/// The two axes are orthogonal, so take the yaw each implies and follow the one
+/// closest to the heading we already had. During a front/back flip the nose is
+/// reversed but the right axis is steady; during a side flip/roll the nose is
+/// steady and the right axis spins. This also keeps a nose-up wall stable.
+///
+/// None of that applies while the car is tilted in the air: a dodge rotates the
+/// whole car about a horizontal axis, so *both* axes swing even though its yaw
+/// (and RL's camera) does not. `on_ground` is what separates a wall, where the
+/// two axes are still meaningful, from a flip; while airborne and tilted the
+/// caller holds its heading, and tracking resumes as the car levels out.
+fn base_yaw(
+    ball_cam: bool,
+    car_forward: Vec3,
+    car_up: Vec3,
+    to_ball: Vec3,
+    current: Option<f32>,
+    on_ground: bool,
+) -> Option<f32> {
+    if ball_cam {
+        let dir = Vec3::new(to_ball.x, 0.0, to_ball.z);
+        return (dir.length_squared() > 1e-6).then(|| yaw_of(dir));
+    }
+
+    if !on_ground && car_up.y < CAR_UPRIGHT_MIN_UP_Y {
+        return None;
+    }
+
+    let right = car_up.cross(car_forward);
+    // The yaw implied by an axis is the direction that axis points when the
+    // car is upright: forward itself, and `right` rotated a quarter turn.
+    let candidates = [
+        Vec3::new(car_forward.x, 0.0, car_forward.z),
+        Vec3::new(-right.z, 0.0, right.x),
+    ];
+    candidates
+        .into_iter()
+        .filter(|dir| dir.length_squared() > CAR_HEADING_MIN_HORIZONTAL.powi(2))
+        .map(yaw_of)
+        // Of the valid candidates, take the one nearest the heading we already
+        // had; that picks the un-reversed axis through a flip. Without a current
+        // heading (startup), the first valid candidate wins.
+        .min_by(|a, b| {
+            let distance = |yaw: f32| current.map_or(0.0, |c| shortest_angle(yaw - c).abs());
+            distance(*a).total_cmp(&distance(*b))
+        })
 }
 
 /// Camera position for a view heading, RL-style: a fixed distance behind and
@@ -2756,8 +2819,14 @@ fn chase_camera(
     // from the old car-frame boom - the camera never rolls with the car, and on a
     // wall the ball still steers the camera around the field, as in RL.
     let to_ball = ball_pos - car_pos;
-    let base = base_heading(ball_cam.0, car.forward, to_ball);
-    let target_yaw = base.map(yaw_of);
+    let target_yaw = base_yaw(
+        ball_cam.0,
+        car.forward,
+        car.up,
+        to_ball,
+        *heading,
+        car.is_on_ground,
+    );
 
     // Ease the heading angle, not the camera position: swinging the angle walks
     // the camera *around* the car instead of cutting through it. Stiffness
@@ -2965,7 +3034,8 @@ mod tests {
     #[test]
     fn the_camera_boom_is_rl_distance_and_height() {
         let car = Vec3::new(1.0, 0.17, 2.0);
-        let heading = base_heading(false, Vec3::Z, Vec3::ZERO).unwrap();
+        let heading =
+            dir_from_yaw(base_yaw(false, Vec3::Z, Vec3::Y, Vec3::ZERO, None, true).unwrap());
         let position = chase_position(car, heading, 2.7, 1.0);
         let expected = car - Vec3::Z * 2.7 + Vec3::Y * 1.0;
         assert!((position - expected).length() < 1e-5, "{position:?}");
@@ -3005,7 +3075,7 @@ mod tests {
     #[test]
     fn ball_cam_steers_by_the_horizontal_bearing_to_the_ball() {
         let to_ball = Vec3::new(3.0, 7.0, 4.0);
-        let heading = base_heading(true, Vec3::Z, to_ball).unwrap();
+        let heading = dir_from_yaw(base_yaw(true, Vec3::Z, Vec3::Y, to_ball, None, true).unwrap());
         assert!(
             heading.y.abs() < 1e-6,
             "heading must stay level: {heading:?}"
@@ -3025,20 +3095,74 @@ mod tests {
 
     #[test]
     fn the_camera_follows_a_wall_without_rolling() {
-        // Nose straight up a wall: there is no horizontal heading to follow, so
-        // the caller keeps its previous one rather than snapping.
-        assert!(base_heading(false, Vec3::Y, Vec3::ZERO).is_none());
-
-        // Nosed up at an angle: only the horizontal component is used, and the
-        // boom stays world-up, so the camera is level while the car is sideways.
-        let heading = base_heading(false, Vec3::new(0.0, 1.0, 0.2), Vec3::ZERO).unwrap();
-        assert!(heading.y.abs() < 1e-6);
-        assert!((heading - Vec3::Z).length() < 1e-5);
-        let camera = chase_position(Vec3::new(0.0, 5.0, 0.0), heading, 2.7, 1.0);
+        // Nose straight up a wall: the nose has no horizontal direction, so the
+        // heading comes from the right axis instead (and the boom stays
+        // world-up) rather than collapsing onto the wall plane.
+        let yaw = base_yaw(false, Vec3::Y, Vec3::NEG_Z, Vec3::ZERO, None, true).unwrap();
+        assert!(yaw.abs() < 1e-5, "nose-up yaw {yaw}");
+        let camera = chase_position(Vec3::new(0.0, 5.0, 0.0), dir_from_yaw(yaw), 2.7, 1.0);
         assert!(
             (camera.y - 6.0).abs() < 1e-5,
             "camera should stay world-up: {camera:?}"
         );
+
+        // Nosed up at an angle: the same heading, still level.
+        let yaw = base_yaw(
+            false,
+            Vec3::new(0.0, 1.0, 0.2),
+            Vec3::NEG_Z,
+            Vec3::ZERO,
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(yaw.abs() < 1e-5, "nosed-up yaw {yaw}");
+    }
+
+    #[test]
+    fn a_flip_does_not_swivel_the_car_camera() {
+        // Front/back, side and diagonal flips all rotate the car a full turn
+        // about a horizontal axis. Their pitch/roll must not move the camera:
+        // while the car is tilted in the air the heading is withheld, and it is
+        // picked up again once the car is upright (at the same yaw, since the
+        // turn is a full revolution).
+        let start_yaw = 0.3_f32;
+        let axes = [
+            Vec3::X,                              // front/back flip
+            Vec3::Z,                              // side flip / air roll
+            Vec3::new(1.0, 0.0, 1.0).normalize(), // diagonal flip
+        ];
+        for axis in axes {
+            let mut heading = start_yaw;
+            for step in 0..=360 {
+                let rotation = Quat::from_rotation_y(start_yaw)
+                    * Quat::from_axis_angle(axis, (step as f32).to_radians());
+                let forward = rotation * Vec3::Z;
+                let up = rotation * Vec3::Y;
+                let target = base_yaw(false, forward, up, Vec3::ZERO, Some(heading), false);
+                if up.y < CAR_UPRIGHT_MIN_UP_Y {
+                    assert!(
+                        target.is_none(),
+                        "tilted airborne car must hold at {step}° about {axis:?}"
+                    );
+                    continue;
+                }
+                let yaw = target.expect("upright car has a heading");
+                assert!(
+                    shortest_angle(yaw - heading).abs() < 0.15,
+                    "yaw jumped from {heading} to {yaw} at {step}° about {axis:?}"
+                );
+                heading = yaw;
+                assert!(
+                    shortest_angle(heading - start_yaw).abs() < 0.15,
+                    "heading drifted to {heading} at {step}° about {axis:?}"
+                );
+            }
+            assert!(
+                shortest_angle(heading - start_yaw).abs() < 0.1,
+                "flip about {axis:?} ended at yaw {heading}, expected {start_yaw}"
+            );
+        }
     }
 
     #[test]

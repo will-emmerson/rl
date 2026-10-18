@@ -111,9 +111,18 @@ Y * height`, where `heading` is the car's horizontal forward in car cam or the
   outside the shell and look back in — but it is kept above the pitch
   (`CAMERA_FLOOR_MARGIN`). Do not build the boom from the car's own `up`: that
   rolls the camera with the car on a wall or in the air and is exactly the
-  behaviour this model replaced. A vertical car heading (nose straight up a wall)
-  has no horizontal direction; keep the last yaw rather than clamping the boom to
-  the wall plane (that collapses it onto the car). Don't aim at a weighted average
+  behaviour this model replaced. On the ground (including a wall) the heading is
+  the car's _yaw_, derived from two axes: the nose and the car's right. Each
+  implies a yaw (the horizontal projection of the nose, or of the right rotated
+  a quarter turn), and the code follows whichever candidate is closest to the
+  heading it already had. That keeps a nose-up car on a wall stable and avoids
+  the 180° swing a nose-only projection gives when it reverses through vertical.
+  While **airborne and tilted** (`CarView::is_on_ground` false and `up.y` below
+  ~0.95) the heading is deliberately _held_ instead: a dodge rotates the whole
+  car about a horizontal axis, so both axes swing even though its yaw does not.
+  Following them is what made the camera swivel during front/back and diagonal
+  flips; RL's car cam does not. Tracking resumes as the car levels out or lands.
+  Don't aim at a weighted average
   of car/ball positions (it ends up facing the floor). Settings live in
   `camera.toml` and hot-reload; see the comments in `view/src/main.rs`.
 - **Wall/ceiling trim is flat, visual-only geometry.** `arena_grid_mesh` lays

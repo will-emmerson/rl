@@ -148,6 +148,9 @@ pub struct CarView {
     pub pos: Vec3,
     pub forward: Vec3,
     pub up: Vec3,
+    /// Whether at least three wheels are in contact with a surface, so the car
+    /// is driving rather than flying. True on the walls as well as the floor.
+    pub is_on_ground: bool,
     /// Total speed, m/s.
     pub speed: f32,
     /// Speed along the car's forward axis, m/s (negative when reversing).
@@ -294,6 +297,7 @@ impl Sim {
             pos: pos_view(car.pos.x, car.pos.y, car.pos.z),
             forward: dir_view(forward.x, forward.y, forward.z),
             up: dir_view(up.x, up.y, up.z),
+            is_on_ground: car.is_on_ground,
             speed: car.vel.length() * UU_TO_M,
             forward_speed: car.vel.dot(forward) * UU_TO_M,
             boost: car.boost,
