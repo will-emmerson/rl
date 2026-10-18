@@ -79,23 +79,14 @@ pub fn resolve_bot_config(spec: &str) -> PathBuf {
         collect_bot_configs(path, 3, &mut found);
     } else {
         let roots = botpack_roots();
-        found = find_bot_configs(&roots, spec);
+        let configs = bot_configs_in(&roots);
+        found = configs
+            .iter()
+            .filter(|config| bot_config_matches(config, spec))
+            .cloned()
+            .collect();
         if found.is_empty() {
-            let looked = if roots.is_empty() {
-                "no RLBot botpack directory was found".to_string()
-            } else {
-                format!(
-                    "looked in {}",
-                    roots
-                        .iter()
-                        .map(|root| root.display().to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                )
-            };
-            panic!(
-                "--rlbot-config: no bot named {spec:?} ({looked}); pass the path to its bot.toml instead"
-            );
+            panic!("{}", no_bot_message(spec, &roots, &configs));
         }
     }
 
@@ -132,15 +123,70 @@ fn botpack_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-fn find_bot_configs(roots: &[PathBuf], spec: &str) -> Vec<PathBuf> {
+fn bot_configs_in(roots: &[PathBuf]) -> Vec<PathBuf> {
     let mut found = Vec::new();
     for root in roots {
         collect_bot_configs(root, 4, &mut found);
     }
-    found.retain(|config| bot_config_matches(config, spec));
     found.sort();
     found.dedup();
     found
+}
+
+#[cfg(test)]
+fn find_bot_configs(roots: &[PathBuf], spec: &str) -> Vec<PathBuf> {
+    let mut found = bot_configs_in(roots);
+    found.retain(|config| bot_config_matches(config, spec));
+    found
+}
+
+/// A human-readable `Name (agent/id)` label for the not-found error.
+fn bot_label(config: &Path) -> String {
+    let Ok(text) = std::fs::read_to_string(config) else {
+        return config.display().to_string();
+    };
+    let Ok(toml): Result<BotToml, _> = toml::from_str(&text) else {
+        return config.display().to_string();
+    };
+    let name = toml.settings.name.filter(|name| !name.trim().is_empty());
+    let agent_id = toml.settings.agent_id.filter(|id| !id.trim().is_empty());
+
+    match (name, agent_id) {
+        (Some(name), Some(agent_id)) => format!("{name} ({agent_id})"),
+        (Some(name), None) => name,
+        (None, Some(agent_id)) => agent_id,
+        (None, None) => config.display().to_string(),
+    }
+}
+
+fn no_bot_message(spec: &str, roots: &[PathBuf], configs: &[PathBuf]) -> String {
+    let looked = if roots.is_empty() {
+        "no RLBot botpack directory was found".to_string()
+    } else {
+        format!(
+            "looked in {}",
+            roots
+                .iter()
+                .map(|root| root.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    };
+
+    let mut labels: Vec<String> = configs.iter().map(|config| bot_label(config)).collect();
+    labels.sort();
+    labels.dedup();
+
+    if labels.is_empty() {
+        format!(
+            "--rlbot-config: no bot named {spec:?} ({looked}) and no bots were found there; pass the path to a bot.toml instead"
+        )
+    } else {
+        format!(
+            "--rlbot-config: no bot named {spec:?} ({looked}).\nInstalled bots:\n  {}\nPass the path to a bot.toml instead if the bot lives elsewhere",
+            labels.join("\n  ")
+        )
+    }
 }
 
 fn collect_bot_configs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -746,6 +792,28 @@ FOO = "bar"
             find_bot_configs(std::slice::from_ref(&root), "Nexto").len(),
             2
         );
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn no_match_lists_the_installed_bots() {
+        let root = temp_tree("message");
+        write_bot(
+            &root,
+            "pack/Element",
+            "bot.toml",
+            "Element",
+            "Rangler/Element",
+        );
+        write_bot(&root, "pack/Nexto", "bot.toml", "Nexto", "rlgym/nexto");
+
+        let configs = bot_configs_in(std::slice::from_ref(&root));
+        let message = no_bot_message("elementv5", std::slice::from_ref(&root), &configs);
+
+        assert!(message.contains("\"elementv5\""), "{message}");
+        assert!(message.contains("Element (Rangler/Element)"), "{message}");
+        assert!(message.contains("Nexto (rlgym/nexto)"), "{message}");
 
         std::fs::remove_dir_all(&root).unwrap();
     }
