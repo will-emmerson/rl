@@ -1,0 +1,81 @@
+# Keyboard and gamepad bindings for rl_view. Like camera.toml this file is
+# optional (the defaults below are built in) and hot-reloaded while the viewer
+# runs. Pass --controls-config PATH to use a different file.
+#
+# A binding is one name or a list, so an action can live on several controls.
+# Keyboard names accept Bevy's KeyCode spellings (KeyW, ArrowUp, ControlLeft)
+# and short ones (W, Up, Ctrl), case-insensitively. Gamepad names are:
+#
+#   face buttons   A / South, B / East, X / North, Y / West
+#   bumpers        LB / L1 / LeftTrigger, RB / R1 / RightTrigger
+#   triggers       LT / L2 / LeftTrigger2, RT / R2 / RightTrigger2
+#   stick clicks   L3 / LeftThumb, R3 / RightThumb
+#   d-pad          Up / DPadUp, Down / DPadDown, Left / DPadLeft, Right / DPadRight
+#   start/select   Start, Select (also Back/View/Share)
+#   guide          Mode (also Guide/Home/PS)
+#
+# So for RB boost and LB handbrake, put this under [gamepad]:
+#
+#   boost = "RB"
+#   drift = "LB"
+#
+# If a pad's physical labels disagree with what happens, run --gamepad-debug and
+# bind the name it logs.
+
+[keyboard]
+# Ground movement. The drive keys double as air control by default: W/S pitch
+# (frontflip/backflip) and A/D yaw in the same direction as steering.
+throttle_forward = ["W", "Up"]
+throttle_backward = ["S", "Down"]
+steer_left = ["A", "Left"]
+steer_right = ["D", "Right"]
+
+# Air control. Bind these separately to decouple flying from driving.
+pitch_forward = ["W", "Up"]   # nose down / frontflip
+pitch_backward = ["S", "Down"] # nose up / backflip
+yaw_left = ["A", "Left"]
+yaw_right = ["D", "Right"]
+roll_left = ["Q"]
+roll_right = ["E"]
+
+# Actions.
+jump = ["Ctrl"]
+boost = ["Space"]
+drift = ["Shift"]
+look_left = ["J"]
+look_right = ["L"]
+look_up = ["I"]
+look_down = ["K"]
+look_behind = []              # unbound by default; e.g. "B"
+toggle_camera = ["C"]
+reset = ["R"]
+quit = ["Esc"]
+
+[gamepad]
+# Movement axes: the left stick drives and pitches, the right stick looks.
+steer_axis = "LeftStickX"
+pitch_axis = "LeftStickY"
+look_x_axis = "RightStickX"
+look_y_axis = "RightStickY"
+
+# Analogue triggers. Most pads expose them as the LeftZ/RightZ axes; the button
+# fallback covers pads that report them as buttons instead.
+throttle_forward = { axis = "RightZ", button = "RightTrigger2" }
+throttle_backward = { axis = "LeftZ", button = "LeftTrigger2" }
+
+# Digital actions. Air roll is drift + stick as in RL, and can *also* have
+# dedicated buttons below. `RightTrigger`/`LeftTrigger` are the bumpers (RB/LB);
+# `RightTrigger2`/`LeftTrigger2` are the analogue triggers (RT/LT).
+jump = "A"          # A / Cross
+boost = "RB"           # right bumper
+drift = "LB"           # left bumper
+
+# Dedicated air-roll buttons, used in addition to drift + stick. Empty [] leaves
+# only the RL-style drift + stick roll. X and B here, as requested.
+roll_left = "X"    # X / Square
+roll_right = "B"    # B / Circle
+
+look_behind = "R3" # R3
+toggle_camera = "Y"  # Y / Triangle
+reset = "Start"
+quit = []               # unbound by default

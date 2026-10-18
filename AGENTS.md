@@ -12,7 +12,8 @@ physics, and draws RocketSim's own arena collision mesh.
 - `view/` — `rl_view`. `view/src/sim.rs` is the **only** place that knows about
   RocketSim: it owns the `Arena`, converts RocketSim's frame and units into the
   viewer's, exposes the car/ball/pads/score the scene reads, and builds the
-  collision mesh. `view/src/main.rs` is the scene, input, camera and HUD.
+  collision mesh. `view/src/main.rs` is the scene, input wiring, camera and HUD;
+  `view/src/controls.rs` parses the keyboard/gamepad bindings.
 - `tools/rlacd.py` — a Linux/Proton port of RLArenaCollisionDumper: dumps RL's
   arena collision meshes, which RocketSim needs at runtime (see below). Upstream
   is Windows-only.
@@ -55,6 +56,10 @@ cargo clippy --workspace --all-targets # kept clean
   height, angle, FOV, stiffness, swivel/transition speed). It is optional —
   missing means built-in RL defaults — and hot-reloads while the viewer runs.
   `--camera-config PATH` overrides it.
+- `controls.toml` at the repo root holds the keyboard/gamepad bindings. It is
+  optional (built-in defaults mirror RL's pad layout), hot-reloads, and is
+  overridden by `--controls-config PATH`. Bindings live in `view/src/controls.rs`;
+  input _signs_ still live in `read_input` (see the input-signs trap below).
 - Project tasks are defined in `.zed/tasks.json`.
 
 **To see your work, render a PNG** — both forms exit on their own:
@@ -72,7 +77,8 @@ cargo run -p rl_view -- --screenshot out.png --cam X,Y,Z --look X,Y,Z  # free ca
   geometry/materials/lighting from a chosen angle — but it only ever shows the
   kickoff scene (no dynamic pose). Either flag alone works (the other falls back
   to an overview default), and `TICK` is then ignored.
-- `--gamepad-debug` logs every raw pad event — the viewer's only other flag.
+- `--gamepad-debug` logs every raw pad event; `--camera-config` and
+  `--controls-config` choose the two settings files.
 
 ## Bevy is pinned to 0.19.1
 
@@ -156,6 +162,12 @@ Y * height`, where `heading` is the car's horizontal forward in car cam or the
   mirrors the axis and has bitten before. If an axis ever looks wrong, re-run the
   probe and change the sign where the input is built (`read_input` in `main.rs`),
   not here.
+- **Pad trigger axes start at `0.0`, not at rest.** Bevy pre-fills every axis with
+  `0.0` until the pad sends its first event, but `LeftZ`/`RightZ` rest at `-1.0`,
+  so `0.0` reads as half-pressed. `controls::seed_trigger_axes` sets configured
+  trigger axes to `-1.0` when a pad connects or bindings reload; without it, using
+  and releasing one trigger makes the untouched one look half-pressed and the car
+  creeps backwards.
 - **Screenshots need a render warm-up.** The first ~second of 3D frames is the
   bare clear colour (pipeline compilation + window bring-up); a frame grabbed
   before that is blank. The driven `--screenshot N` clears it by running to tick N

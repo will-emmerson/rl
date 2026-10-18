@@ -11,6 +11,7 @@
 //!                                                 # instant free-cam shot, no sim
 //!   cargo run -p rl_view -- --gamepad-debug       # log every raw pad event
 //!   cargo run -p rl_view -- --camera-config cam.toml # use a different camera file
+//!   cargo run -p rl_view -- --controls-config keys.toml # different bindings file
 
 use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
@@ -35,6 +36,9 @@ use sim::{
     Input as SimInput, BALL_RADIUS, CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH,
     CAR_WHEELBASE, GOAL_DEPTH, GOAL_HALF_WIDTH, GOAL_HEIGHT,
 };
+
+mod controls;
+use controls::{button_axis, key_axis, seed_trigger_axes, strongest, Controls};
 
 /// Soccar arena half-extents, in metres. The long axis is Z in the viewer.
 /// RocketSim's `consts::arena::get_aabb(Soccar)` gives 4096 x 5120 x 2048 uu;
@@ -108,11 +112,14 @@ const BOOST_PULSE_AMOUNT: f32 = 0.04;
 /// fine (RL's defaults are used); a malformed file is a hard error. Override the
 /// path with `--camera-config PATH`. The file is hot-reloaded on save.
 const CAMERA_CONFIG_PATH: &str = "camera.toml";
-/// How often the settings file is checked for changes. Five seconds is enough
+/// The keyboard/gamepad bindings file. Like `camera.toml`, it is optional and
+/// hot-reloaded; `--controls-config PATH` overrides the path.
+const CONTROLS_CONFIG_PATH: &str = "controls.toml";
+/// How often the settings files are checked for changes. Five seconds is enough
 /// for hand-tuning and avoids reloading on every keystroke while it is being
 /// edited; a file caught mid-edit normally fails to parse and the previous
 /// settings stay in place.
-const CAMERA_RELOAD_CHECK_SECS: f32 = 5.0;
+const SETTINGS_RELOAD_CHECK_SECS: f32 = 5.0;
 /// The camera may leave the arena through the walls *and* the roof - the shell is
 /// one-sided, so it can still see back in - but it never drops below the pitch,
 /// which would film the game from underneath. This is the margin it keeps off the
@@ -226,10 +233,17 @@ impl CameraSettings {
     }
 }
 
-/// Where the settings came from and when it last changed, so the file can be
-/// hot-reloaded while the viewer runs.
+/// Where the camera settings came from and when they last changed, so the file
+/// can be hot-reloaded while the viewer runs.
 #[derive(Resource)]
 struct CameraConfig {
+    path: PathBuf,
+    modified: Option<SystemTime>,
+}
+
+/// Where the input bindings came from and when they last changed.
+#[derive(Resource)]
+struct ControlsConfig {
     path: PathBuf,
     modified: Option<SystemTime>,
 }
@@ -366,6 +380,7 @@ fn main() {
     let mut cam: Option<Vec3> = None;
     let mut look: Option<Vec3> = None;
     let mut camera_config: Option<PathBuf> = None;
+    let mut controls_config: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -391,6 +406,12 @@ fn main() {
                         .unwrap_or_else(|| panic!("--camera-config needs a path")),
                 ));
             }
+            "--controls-config" => {
+                controls_config = Some(PathBuf::from(
+                    args.next()
+                        .unwrap_or_else(|| panic!("--controls-config needs a path")),
+                ));
+            }
             "--gamepad-debug" => gamepad_debug = true,
             _ => {}
         }
@@ -414,6 +435,7 @@ fn main() {
     };
 
     let (camera_settings, camera_config) = initial_camera_settings(camera_config);
+    let (controls, controls_config) = initial_controls(controls_config);
 
     let mut sim = sim::Sim::new();
     // Debug-only wall pose for free-cam screenshots (the sim is skipped in that
@@ -428,11 +450,17 @@ fn main() {
         .insert_resource(mode)
         .insert_resource(camera_settings)
         .insert_resource(camera_config)
+        .insert_resource(controls)
+        .insert_resource(controls_config)
         .insert_resource(GamepadDebug(gamepad_debug))
         .insert_resource(BallCam(true))
         .init_resource::<LastSteer>()
         .init_resource::<Boosting>()
         .insert_resource(Time::<Fixed>::from_hz(sim::TICK_HZ))
+        .add_systems(
+            PreUpdate,
+            seed_gamepad_triggers.after(bevy::input::InputSystems),
+        )
         .add_systems(Startup, setup_scene)
         .add_systems(FixedUpdate, step_simulation.run_if(simulating))
         .add_systems(
@@ -446,6 +474,7 @@ fn main() {
                 animate_boost_pads,
                 spin_wheels,
                 (reload_camera_settings, apply_camera_fov).chain(),
+                reload_controls,
                 chase_camera.run_if(simulating),
                 update_hud,
                 screenshot_driver,
@@ -489,6 +518,27 @@ fn read_camera_settings(path: &Path) -> Result<CameraSettings, String> {
     toml::from_str::<CameraSettings>(&raw)
         .map(CameraSettings::clamped)
         .map_err(|e| format!("could not parse {}: {e}", path.display()))
+}
+
+/// Load `--controls-config PATH`, or `controls.toml` if it exists. An explicit
+/// path must load; a missing default file silently falls back to the built-in
+/// bindings.
+fn initial_controls(explicit: Option<PathBuf>) -> (Controls, ControlsConfig) {
+    let required = explicit.is_some();
+    let path = explicit.unwrap_or_else(|| PathBuf::from(CONTROLS_CONFIG_PATH));
+    let modified = file_modified(&path);
+    let controls = match read_controls(&path) {
+        Ok(controls) => controls,
+        Err(_) if !required && !path.exists() => Controls::default(),
+        Err(e) => panic!("controls config: {e}"),
+    };
+    (controls, ControlsConfig { path, modified })
+}
+
+fn read_controls(path: &Path) -> Result<Controls, String> {
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| format!("could not read {}: {e}", path.display()))?;
+    toml::from_str::<Controls>(&raw).map_err(|e| format!("could not parse {}: {e}", path.display()))
 }
 
 fn file_modified(path: &Path) -> Option<SystemTime> {
@@ -2166,72 +2216,24 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 // Simulation
 // ---------------------------------------------------------------------------
 
-fn axis(keys: &ButtonInput<KeyCode>, positive: &[KeyCode], negative: &[KeyCode]) -> f64 {
-    let p = positive.iter().any(|k| keys.pressed(*k));
-    let n = negative.iter().any(|k| keys.pressed(*k));
-    match (p, n) {
-        (true, false) => 1.0,
-        (false, true) => -1.0,
-        _ => 0.0,
-    }
-}
-
-/// Whichever of the two is further from zero, so the keyboard and the pad can
-/// be used interchangeably without cancelling each other out.
-fn strongest(a: f64, b: f64) -> f64 {
-    if a.abs() >= b.abs() {
-        a
-    } else {
-        b
-    }
-}
-
-/// Reads one analogue trigger, in `0.0..=1.0`.
-///
-/// gilrs maps a pad through a database entry keyed by its device id. This pad
-/// has no entry (see `examples/gamepad_probe.rs`), so it falls back to gilrs'
-/// built-in default mapping, which exposes the xpad triggers as the *axes*
-/// `LeftZ` / `RightZ` (evdev ABS_Z / ABS_RZ) rather than as trigger buttons.
-/// Those axes run 0..=255 and are normalised to `-1.0..=1.0`, so they rest near
-/// `-1.0` and reach `+1.0` when fully pulled. Pads that *do* have a database
-/// entry report the triggers as buttons instead, so accept either and take the
-/// larger.
-fn trigger(pad: &Gamepad, axis: GamepadAxis, button: GamepadButton) -> f64 {
-    let from_axis = pad
-        .get(axis)
-        .map(|v| ((v as f64 + 1.0) * 0.5).clamp(0.0, 1.0))
-        .unwrap_or(0.0);
-    let from_button = pad.get(button).unwrap_or(0.0) as f64;
-
-    // The axis' resting value only maps to about 0, not exactly 0, so trim the
-    // slack and stop the car creeping at idle.
-    let value = strongest(from_axis, from_button);
-    if value < 0.05 {
-        0.0
-    } else {
-        value
-    }
-}
-
-fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInput {
-    let keyboard_throttle = axis(
+fn read_input(
+    keys: &ButtonInput<KeyCode>,
+    gamepad: Option<&Gamepad>,
+    controls: &Controls,
+) -> SimInput {
+    let keyboard = &controls.keyboard;
+    let keyboard_throttle = key_axis(
         keys,
-        &[KeyCode::KeyW, KeyCode::ArrowUp],
-        &[KeyCode::KeyS, KeyCode::ArrowDown],
+        &keyboard.throttle_forward,
+        &keyboard.throttle_backward,
     );
-    let keyboard_steer = axis(
-        keys,
-        &[KeyCode::KeyA, KeyCode::ArrowLeft],
-        &[KeyCode::KeyD, KeyCode::ArrowRight],
-    );
+    let keyboard_steer = key_axis(keys, &keyboard.steer_left, &keyboard.steer_right);
     // Air roll, on dedicated keys: Q rolls left, E rolls right (positive `roll`
     // is left, the same sign convention as `steer` and `yaw`).
-    let keyboard_roll = axis(keys, &[KeyCode::KeyQ], &[KeyCode::KeyE]);
-    let keyboard_jump = keys.pressed(KeyCode::ControlLeft) || keys.pressed(KeyCode::ControlRight);
+    let keyboard_roll = key_axis(keys, &keyboard.roll_left, &keyboard.roll_right);
 
     // Triggers are analogue, so they give proportional throttle rather than the
-    // keyboard's full-on. Button layout matches Rocket League: A jumps, B boosts
-    // and X is the handbrake. The pad's *stick* axes carry steer and air pitch
+    // keyboard's full-on. The pad's *stick* axes carry steer and air pitch
     // (throttle is the triggers), which is how RL binds it.
     //
     // NOTE: a driver-default (unmapped) X-Box pad gets gilrs' built-in mapping,
@@ -2241,42 +2243,63 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
     // the camera toggle is `West` (physical Y). On an SDL-mapped pad these two
     // are the other way round.
     let (pad_throttle, pad_steer, pad_pitch, pad_boost, pad_drift, pad_jump) = match gamepad {
-        Some(pad) => (
-            trigger(pad, GamepadAxis::RightZ, GamepadButton::RightTrigger2)
-                - trigger(pad, GamepadAxis::LeftZ, GamepadButton::LeftTrigger2),
-            // Sticks are positive to the right; `steer` is positive to the left.
-            -pad.get(GamepadAxis::LeftStickX).unwrap_or(0.0) as f64,
-            // Sticks are positive up here (see `look_input`); pitch +1 is nose
-            // up, so the sign flips.
-            -pad.get(GamepadAxis::LeftStickY).unwrap_or(0.0) as f64,
-            pad.get(GamepadButton::East).unwrap_or(0.0) > 0.5,
-            pad.get(GamepadButton::North).unwrap_or(0.0) > 0.5,
-            pad.get(GamepadButton::South).unwrap_or(0.0) > 0.5,
-        ),
+        Some(pad) => {
+            let gamepad = &controls.gamepad;
+            (
+                gamepad.throttle_forward.value(pad) - gamepad.throttle_backward.value(pad),
+                // Sticks are positive to the right; `steer` is positive to the left.
+                -pad.get(gamepad.steer_axis.0).unwrap_or(0.0) as f64,
+                // Sticks are positive up here (see `look_input`); pitch +1 is nose
+                // up, so the sign flips.
+                -pad.get(gamepad.pitch_axis.0).unwrap_or(0.0) as f64,
+                gamepad.boost.pressed(pad),
+                gamepad.drift.pressed(pad),
+                gamepad.jump.pressed(pad),
+            )
+        }
         None => (0.0, 0.0, 0.0, false, false, false),
     };
 
+    // Dedicated air-roll buttons take priority over RL's drift + stick roll when
+    // held, so a user can bind both and get the button they are pressing.
+    let pad_button_roll = gamepad
+        .map(|pad| {
+            button_axis(
+                pad,
+                &controls.gamepad.roll_left,
+                &controls.gamepad.roll_right,
+            )
+        })
+        .unwrap_or(0.0);
+
     let throttle = strongest(keyboard_throttle, pad_throttle);
     let steer = strongest(keyboard_steer, pad_steer);
-    let drift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight) || pad_drift;
+    let drift = keyboard.drift.pressed(keys) || pad_drift;
 
     // Air orientation. RL flies with the same stick it drives with: stick up is a
-    // frontflip (`pitch -1`) and stick left yaws left. On the keyboard the W/S
-    // keys double as pitch; the pad uses the left stick's vertical axis, which is
-    // why pitch is *not* taken from the throttle.
+    // frontflip (`pitch -1`) and stick left yaws left. On the keyboard the
+    // pitch buttons default to the drive keys; the pad uses the left stick's
+    // vertical axis, which is why pitch is *not* taken from the throttle.
     //
     // `yaw` keeps `steer`'s sign, so the same key that steers left also yaws and
     // dodges left: RocketSim's positive steer/yaw/roll all go to the car's left
     // (measured by `examples/axis_probe.rs`), and the viewer's `steer` is already
     // positive to the left.
-    let keyboard_pitch = -keyboard_throttle;
+    let keyboard_pitch = -key_axis(keys, &keyboard.pitch_forward, &keyboard.pitch_backward);
     let pitch = strongest(keyboard_pitch, pad_pitch);
     let yaw = steer;
 
     // On the pad, air roll is the handbrake/drift button plus the stick, as in
     // Rocket League: drift + stick left rolls left (so it keeps `pad_steer`'s
-    // sign). The keyboard uses Q/E.
-    let pad_roll = if pad_drift { pad_steer } else { 0.0 };
+    // sign). Dedicated roll buttons, if configured, win while one is held. The
+    // keyboard uses the configured roll keys.
+    let pad_roll = if pad_button_roll != 0.0 {
+        pad_button_roll
+    } else if pad_drift {
+        pad_steer
+    } else {
+        0.0
+    };
     let roll = strongest(keyboard_roll, pad_roll);
 
     SimInput::with_air(
@@ -2285,22 +2308,36 @@ fn read_input(keys: &ButtonInput<KeyCode>, gamepad: Option<&Gamepad>) -> SimInpu
         pitch,
         yaw,
         roll,
-        keys.pressed(KeyCode::Space) || pad_boost,
+        keyboard.boost.pressed(keys) || pad_boost,
         drift,
-        keyboard_jump || pad_jump,
+        keyboard.jump.pressed(keys) || pad_jump,
     )
+}
+
+/// Seed trigger axes on pads that have just connected.
+///
+/// See [`seed_trigger_axes`]: a pad's axes start at `0.0` until their first
+/// event, which is half-pressed for a trigger that actually rests at `-1.0`.
+fn seed_gamepad_triggers(
+    mut gamepads: Query<&mut Gamepad, Added<Gamepad>>,
+    controls: Res<Controls>,
+) {
+    for mut pad in &mut gamepads {
+        seed_trigger_axes(&mut pad, &controls);
+    }
 }
 
 fn step_simulation(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
+    controls: Res<Controls>,
     mut sim: ResMut<Sim>,
     mut last_steer: ResMut<LastSteer>,
     mut boosting: ResMut<Boosting>,
     mode: Res<Mode>,
 ) {
     let input = match &*mode {
-        Mode::Play => read_input(&keys, gamepads.iter().next()),
+        Mode::Play => read_input(&keys, gamepads.iter().next(), &controls),
         // Self-driving, so a capture is reproducible rather than dependent on
         // the frame rate. See `capture_input` for the schedule.
         Mode::Capture { .. } => capture_input(sim.0.tick()),
@@ -2393,21 +2430,27 @@ fn capture_input(tick: u64) -> SimInput {
 fn toggle_camera_mode(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
+    controls: Res<Controls>,
     mut ball_cam: ResMut<BallCam>,
 ) {
     let pad_toggle = gamepads
         .iter()
-        .any(|pad| pad.just_pressed(GamepadButton::West));
-    if pad_toggle || keys.just_pressed(KeyCode::KeyC) {
+        .any(|pad| controls.gamepad.toggle_camera.just_pressed(pad));
+    if controls.keyboard.toggle_camera.just_pressed(&keys) || pad_toggle {
         ball_cam.0 = !ball_cam.0;
     }
 }
 
-fn reset_on_key(keys: Res<ButtonInput<KeyCode>>, gamepads: Query<&Gamepad>, mut sim: ResMut<Sim>) {
+fn reset_on_key(
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    controls: Res<Controls>,
+    mut sim: ResMut<Sim>,
+) {
     let pad_reset = gamepads
         .iter()
-        .any(|pad| pad.just_pressed(GamepadButton::Start));
-    if keys.just_pressed(KeyCode::KeyR) || pad_reset {
+        .any(|pad| controls.gamepad.reset.just_pressed(pad));
+    if controls.keyboard.reset.just_pressed(&keys) || pad_reset {
         sim.0.reset();
     }
 }
@@ -2500,22 +2543,27 @@ fn spin_wheels(
     }
 }
 
-/// Look input as two scalars in `-1..=1`, merged from the pad's right stick and
-/// the keyboard (`I`/`K` pitch, `J`/`L` swivel). `x` is positive to the right;
-/// `y` is the pitch input, positive to look up. `invert_y` flips the vertical
-/// axis (the viewer's default), so pushing the stick up looks down.
+/// Look input as two scalars in `-1..=1`, merged from the pad's look stick and
+/// the keyboard's look keys. `x` is positive to the right; `y` is the pitch
+/// input, positive to look up. `invert_y` flips the vertical axis (the viewer's
+/// default), so pushing the stick up looks down.
 fn look_input(
     keys: &ButtonInput<KeyCode>,
     gamepad: Option<&Gamepad>,
+    controls: &Controls,
     invert_y: bool,
 ) -> (f64, f64) {
-    let key_x = axis(keys, &[KeyCode::KeyL], &[KeyCode::KeyJ]);
-    let key_y = axis(keys, &[KeyCode::KeyI], &[KeyCode::KeyK]);
+    let keyboard = &controls.keyboard;
+    let key_x = key_axis(keys, &keyboard.look_right, &keyboard.look_left);
+    let key_y = key_axis(keys, &keyboard.look_up, &keyboard.look_down);
     let (pad_x, pad_y) = match gamepad {
-        Some(pad) => (
-            pad.get(GamepadAxis::RightStickX).unwrap_or(0.0) as f64,
-            pad.get(GamepadAxis::RightStickY).unwrap_or(0.0) as f64,
-        ),
+        Some(pad) => {
+            let gamepad = &controls.gamepad;
+            (
+                pad.get(gamepad.look_x_axis.0).unwrap_or(0.0) as f64,
+                pad.get(gamepad.look_y_axis.0).unwrap_or(0.0) as f64,
+            )
+        }
         None => (0.0, 0.0),
     };
     let y = strongest(key_y, pad_y);
@@ -2524,9 +2572,14 @@ fn look_input(
 }
 
 /// Whether the look-behind control is held. In Rocket League that is pushing the
-/// right stick in - the "click", R3.
-fn look_behind(gamepad: Option<&Gamepad>) -> bool {
-    gamepad.is_some_and(|pad| pad.pressed(GamepadButton::RightThumb))
+/// right stick in - the "click", R3 - but it can also be bound to a keyboard key.
+fn look_behind(
+    keys: &ButtonInput<KeyCode>,
+    gamepad: Option<&Gamepad>,
+    controls: &Controls,
+) -> bool {
+    controls.keyboard.look_behind.pressed(keys)
+        || gamepad.is_some_and(|pad| controls.gamepad.look_behind.pressed(pad))
 }
 
 /// A horizontal direction's yaw, where `0` points along `+Z` and positive angles
@@ -2594,7 +2647,7 @@ fn reload_camera_settings(
     mut since_check: Local<f32>,
 ) {
     *since_check += time.delta_secs();
-    if *since_check < CAMERA_RELOAD_CHECK_SECS {
+    if *since_check < SETTINGS_RELOAD_CHECK_SECS {
         return;
     }
     *since_check = 0.0;
@@ -2611,6 +2664,42 @@ fn reload_camera_settings(
             *settings = new_settings;
         }
         Err(e) => error!("camera: reload failed: {e}"),
+    }
+}
+
+/// Hot-reload `controls.toml` when it changes. The old bindings stay in place
+/// until the new file parses, so a half-saved edit cannot leave the car without
+/// controls.
+fn reload_controls(
+    time: Res<Time>,
+    mut config: ResMut<ControlsConfig>,
+    mut controls: ResMut<Controls>,
+    mut gamepads: Query<&mut Gamepad>,
+    mut since_check: Local<f32>,
+) {
+    *since_check += time.delta_secs();
+    if *since_check < SETTINGS_RELOAD_CHECK_SECS {
+        return;
+    }
+    *since_check = 0.0;
+    let Some(modified) = file_modified(&config.path) else {
+        return;
+    };
+    if config.modified == Some(modified) {
+        return;
+    }
+    config.modified = Some(modified);
+    match read_controls(&config.path) {
+        Ok(new_controls) => {
+            info!("controls: reloaded {}", config.path.display());
+            *controls = new_controls;
+            // A newly configured trigger axis may still be at its synthetic
+            // 0.0 start value; give it the trigger rest value before it is read.
+            for mut pad in &mut gamepads {
+                seed_trigger_axes(&mut pad, &controls);
+            }
+        }
+        Err(e) => error!("controls: reload failed: {e}"),
     }
 }
 
@@ -2636,6 +2725,7 @@ fn apply_camera_fov(
 fn chase_camera(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
+    controls: Res<Controls>,
     sim: Res<Sim>,
     ball_cam: Res<BallCam>,
     settings: Res<CameraSettings>,
@@ -2651,12 +2741,12 @@ fn chase_camera(
     let dt = time.delta_secs();
 
     let pad = gamepads.iter().next();
-    let behind = look_behind(pad);
+    let behind = look_behind(&keys, pad, &controls);
     // Look-behind is a hard 180° flip in RL: snap the pose on both edges rather
     // than easing the boom through the car.
     let snap = behind != *behind_last;
     *behind_last = behind;
-    let (mut look_x, look_y) = look_input(&keys, pad, settings.invert_look_y);
+    let (mut look_x, look_y) = look_input(&keys, pad, &controls, settings.invert_look_y);
     if settings.invert_swivel {
         look_x = -look_x;
     }
@@ -2758,8 +2848,16 @@ fn update_hud(
     );
 }
 
-fn quit_on_escape(keys: Res<ButtonInput<KeyCode>>, mut exit: MessageWriter<AppExit>) {
-    if keys.just_pressed(KeyCode::Escape) {
+fn quit_on_escape(
+    keys: Res<ButtonInput<KeyCode>>,
+    gamepads: Query<&Gamepad>,
+    controls: Res<Controls>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let pad_quit = gamepads
+        .iter()
+        .any(|pad| controls.gamepad.quit.just_pressed(pad));
+    if controls.keyboard.quit.just_pressed(&keys) || pad_quit {
         exit.write(AppExit::Success);
     }
 }
@@ -2979,19 +3077,20 @@ mod tests {
 
     #[test]
     fn the_vertical_axis_is_inverted() {
+        let controls = Controls::default();
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyL);
-        let (x, _) = look_input(&keys, None, true);
+        let (x, _) = look_input(&keys, None, &controls, true);
         assert!(x > 0.5, "L should swivel right, got {x}");
 
         // Pushing up looks down, so the pitch input comes out negative.
         let mut keys = ButtonInput::<KeyCode>::default();
         keys.press(KeyCode::KeyI);
-        let (_, y) = look_input(&keys, None, true);
+        let (_, y) = look_input(&keys, None, &controls, true);
         assert!(y < -0.5, "I should look down (inverted), got {y}");
 
         // The same key is not inverted when the setting is off.
-        let (_, y) = look_input(&keys, None, false);
+        let (_, y) = look_input(&keys, None, &controls, false);
         assert!(y > 0.5, "I should look up when not inverted, got {y}");
     }
 
@@ -3004,7 +3103,7 @@ mod tests {
         let press = |code| {
             let mut keys = ButtonInput::<KeyCode>::default();
             keys.press(code);
-            read_input(&keys, None)
+            read_input(&keys, None, &Controls::default())
         };
 
         let up = press(KeyCode::KeyW);
@@ -3024,6 +3123,103 @@ mod tests {
 
         let roll_right = press(KeyCode::KeyE);
         assert!(roll_right.roll < -0.5, "E: {roll_right:?}");
+    }
+
+    #[test]
+    fn remapped_bindings_drive_the_car() {
+        // Both keyboard and pad bindings come from the same file, and a remap
+        // replaces the default rather than adding to it.
+        let controls: Controls = toml::from_str(
+            "[keyboard]\n\
+             throttle_forward = \"F\"\n\
+             throttle_backward = \"V\"\n\
+             steer_left = \"G\"\n\
+             steer_right = \"H\"\n\
+             boost = \"B\"\n\
+             \n\
+             [gamepad]\n\
+             jump = \"North\"\n\
+             boost = \"West\"\n",
+        )
+        .unwrap();
+
+        let press = |code| {
+            let mut keys = ButtonInput::<KeyCode>::default();
+            keys.press(code);
+            read_input(&keys, None, &controls)
+        };
+        assert!(press(KeyCode::KeyF).throttle > 0.5);
+        assert!(press(KeyCode::KeyW).throttle < 0.5, "W was unbound");
+        assert!(press(KeyCode::KeyB).boost);
+
+        // The pad side follows the same file: North jumps and West boosts.
+        let mut pad = Gamepad::default();
+        pad.digital_mut().press(GamepadButton::North);
+        pad.digital_mut().press(GamepadButton::West);
+        let input = read_input(&ButtonInput::default(), Some(&pad), &controls);
+        assert!(input.jump, "{input:?}");
+        assert!(input.boost, "{input:?}");
+    }
+
+    #[test]
+    fn bumper_aliases_boost_and_drift() {
+        // RB/LB are aliases for the bumper buttons (`RightTrigger`/`LeftTrigger`
+        // in gilrs' naming), not for the analogue triggers.
+        let controls: Controls =
+            toml::from_str("[gamepad]\nboost = \"RB\"\ndrift = \"LB\"\n").unwrap();
+        let mut pad = Gamepad::default();
+        pad.digital_mut().press(GamepadButton::RightTrigger);
+        pad.digital_mut().press(GamepadButton::LeftTrigger);
+
+        let input = read_input(&ButtonInput::default(), Some(&pad), &controls);
+        assert!(input.boost, "RB should boost: {input:?}");
+        assert!(input.handbrake, "LB should be the handbrake: {input:?}");
+    }
+
+    #[test]
+    fn an_unseen_trigger_axis_does_not_reverse_the_car() {
+        // Regression: Bevy starts every pad axis at 0.0, which is *half* a
+        // trigger. After using one trigger, the other would read half-pressed
+        // and the car would creep backwards. Seeding both to -1.0 (rest) makes
+        // releasing the forward trigger mean zero throttle, not reverse.
+        let controls = Controls::default();
+        let mut pad = Gamepad::default();
+        seed_trigger_axes(&mut pad, &controls);
+
+        pad.analog_mut().set(GamepadAxis::RightZ, 1.0);
+        let pressed = read_input(&ButtonInput::default(), Some(&pad), &controls);
+        assert!(pressed.throttle > 0.5, "{pressed:?}");
+
+        pad.analog_mut().set(GamepadAxis::RightZ, -1.0);
+        let released = read_input(&ButtonInput::default(), Some(&pad), &controls);
+        assert_eq!(released.throttle, 0.0, "released: {released:?}");
+    }
+
+    #[test]
+    fn dedicated_roll_buttons_work_alongside_drift_stick() {
+        let controls: Controls =
+            toml::from_str("[gamepad]\nroll_left = \"North\"\nroll_right = \"East\"\n").unwrap();
+
+        let mut pad = Gamepad::default();
+        pad.digital_mut().press(GamepadButton::North);
+        let input = read_input(&ButtonInput::default(), Some(&pad), &controls);
+        assert!(input.roll > 0.5, "X should roll left: {input:?}");
+
+        let mut pad = Gamepad::default();
+        pad.digital_mut().press(GamepadButton::East);
+        let input = read_input(&ButtonInput::default(), Some(&pad), &controls);
+        assert!(input.roll < -0.5, "B should roll right: {input:?}");
+
+        // The RL-style drift + stick roll is still there when no dedicated
+        // roll button is configured.
+        let mut pad = Gamepad::default();
+        pad.digital_mut().press(GamepadButton::North);
+        pad.analog_mut().set(GamepadAxis::LeftStickX, -1.0);
+        let input = read_input(&ButtonInput::default(), Some(&pad), &Controls::default());
+        assert!(
+            input.roll > 0.5,
+            "drift + stick left should roll left: {input:?}"
+        );
     }
 
     #[test]

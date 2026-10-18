@@ -66,7 +66,10 @@ cosmetic constants (ball/car mesh sizes, goal frame) from RocketSim too, in
 | `esc`                     | -                 | quit               |
 
 Keyboard and pad are merged per axis, so either works and holding both does not
-cancel out. On the pad the triggers are analogue throttle: pull the right trigger
+cancel out. Bindings live in `controls.toml` and are hot-reloaded when you save;
+pass `--controls-config PATH` to use another file. Missing entries keep the
+defaults shown above, and any action can take one key/button or a list. On the
+pad the triggers are analogue throttle: pull the right trigger
 to accelerate, the left to reverse. Boost (`space` / `B`) is replenished by the
 boost pads on the pitch — six big pads (full tank, shown as translucent orbs)
 and 28 small ones (flat discs). They cannot be taken at a full tank, and vanish
@@ -74,7 +77,9 @@ while on cooldown. Jump (`ctrl` / `A`) is edge-triggered, and
 pressing it again while airborne gives a double jump — or, with the stick held
 off centre, a **flip**. The drive stick doubles as air control: stick up is a
 frontflip, stick left yaws left, and `Q`/`E` (or `X`/`B`-style drift + stick)
-rolls. The right stick (or `IJKL`) swivels the camera and pitches it, and
+rolls. `controls.toml` can also bind dedicated pad `roll_left`/`roll_right`
+buttons, which work alongside drift + stick. The right stick (or `IJKL`) swivels
+the camera and pitches it, and
 clicking the right stick in (`R3`) looks behind you; everything springs back when
 released. (If your pad reports nothing, see the gamepad section under "A note on
 Bevy's features" below.)
@@ -89,7 +94,9 @@ may sit outside and look back in — so wall play stays visible. Camera settings
 live in `camera.toml` (RL defaults: 110° FOV, 270 uu distance, 100 uu height, -4°
 angle, 0.5 stiffness; metres in the file, ×100 for the in-game `uu` values) and
 are hot-reloaded when you save. Pass `--camera-config PATH` to use another file.
-This needs a GPU and a window; it was developed on Vulkan.
+Keyboard and gamepad bindings live in `controls.toml`, with the same optional,
+hot-reloaded treatment (`--controls-config PATH` to override). This needs a GPU
+and a window; it was developed on Vulkan.
 
 The arena is drawn straight from RocketSim's own collision mesh — the very
 geometry the ball and car collide with — so what you see is what you hit. A
