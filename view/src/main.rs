@@ -13,6 +13,7 @@
 //!   cargo run -p rl_view -- --camera-config cam.toml # use a different camera file
 //!   cargo run -p rl_view -- --controls-config keys.toml # different bindings file
 //!   cargo run -p rl_view -- --fullscreen --stats  # native-res fullscreen + perf overlay
+//!   cargo run -p rl_view -- --fullscreen --stats --quality low  # cheaper visuals
 //!   cargo run -p rl_view -- --rlbot                # listen for one RLBot v5 bot
 //!   cargo run -p rl_view -- --rlbot --rlbot-config Nexto
 //!                                                 # ...and start the bot too
@@ -27,7 +28,7 @@ use bevy::asset::RenderAssetUsages;
 use bevy::camera::Hdr;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::gamepad::{RawGamepadAxisChangedEvent, RawGamepadButtonChangedEvent};
-use bevy::light::NotShadowCaster;
+use bevy::light::{DirectionalLightShadowMap, NotShadowCaster};
 use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::prelude::*;
@@ -355,6 +356,43 @@ struct ChaseCam;
 #[derive(Component)]
 struct HudText;
 
+/// Visual-cost preset for `--quality`. `High` is the viewer's normal look;
+/// `Low` is for integrated GPUs, where 4x MSAA + shadows + bloom at 1080p is
+/// enough to miss vsync every so often.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum QualityPreset {
+    Low,
+    Medium,
+    #[default]
+    High,
+}
+
+/// The resolved render settings used by `setup_scene`. `--msaa` can override the
+/// preset's MSAA level without changing its shadow/bloom choices.
+#[derive(Resource, Clone, Copy)]
+struct RenderQuality {
+    msaa: Msaa,
+    shadows: bool,
+    bloom: bool,
+    shadow_map_size: usize,
+}
+
+impl RenderQuality {
+    fn new(preset: QualityPreset, msaa_override: Option<Msaa>) -> Self {
+        let (msaa, shadows, bloom, shadow_map_size) = match preset {
+            QualityPreset::Low => (Msaa::Off, false, false, 1024),
+            QualityPreset::Medium => (Msaa::Sample2, true, true, 1024),
+            QualityPreset::High => (Msaa::Sample4, true, true, 2048),
+        };
+        Self {
+            msaa: msaa_override.unwrap_or(msaa),
+            shadows,
+            bloom,
+            shadow_map_size,
+        }
+    }
+}
+
 /// Rolling frame-time window for the `--stats` overlay. A 5 s window keeps the
 /// average responsive while still giving the 1% low a useful number of frames
 /// to choose from (300 at 60 fps).
@@ -465,6 +503,9 @@ fn main() {
     let mut fullscreen = false;
     let mut resolution: Option<(u32, u32)> = None;
     let mut no_vsync = false;
+    // Render-cost preset and an optional MSAA override for it.
+    let mut quality = QualityPreset::default();
+    let mut msaa_override = None;
     // Start with the frame-time overlay visible (F3 toggles it either way).
     let mut stats = false;
     let mut rlbot_enabled = false;
@@ -515,6 +556,18 @@ fn main() {
                 resolution = Some(parse_resolution(&value));
             }
             "--no-vsync" => no_vsync = true,
+            "--quality" => {
+                let value = args
+                    .next()
+                    .unwrap_or_else(|| panic!("--quality needs low, medium or high"));
+                quality = parse_quality(&value);
+            }
+            "--msaa" => {
+                let value = args
+                    .next()
+                    .unwrap_or_else(|| panic!("--msaa needs off, 2, 4 or 8"));
+                msaa_override = Some(parse_msaa(&value));
+            }
             "--stats" => stats = true,
             "--gamepad-debug" => gamepad_debug = true,
             "--rlbot" => rlbot_enabled = true,
@@ -664,12 +717,18 @@ fn main() {
         window.present_mode = PresentMode::AutoNoVsync;
     }
 
+    let render_quality = RenderQuality::new(quality, msaa_override);
+
     App::new()
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(window),
             ..default()
         }))
         .insert_resource(Sim(sim))
+        .insert_resource(render_quality)
+        .insert_resource(DirectionalLightShadowMap {
+            size: render_quality.shadow_map_size,
+        })
         .insert_resource(rlbot)
         .insert_resource(mode)
         .insert_resource(camera_settings)
@@ -807,6 +866,27 @@ fn parse_resolution(raw: &str) -> (u32, u32) {
     (width, height)
 }
 
+/// Parse `--quality low|medium|high`.
+fn parse_quality(raw: &str) -> QualityPreset {
+    match raw.to_ascii_lowercase().as_str() {
+        "low" => QualityPreset::Low,
+        "medium" | "med" => QualityPreset::Medium,
+        "high" => QualityPreset::High,
+        _ => panic!("--quality: bad value {raw:?}, want low, medium or high"),
+    }
+}
+
+/// Parse `--msaa off|2|4|8` (`0`/`none` are accepted as aliases for `off`).
+fn parse_msaa(raw: &str) -> Msaa {
+    match raw.to_ascii_lowercase().as_str() {
+        "off" | "none" | "0" => Msaa::Off,
+        "2" => Msaa::Sample2,
+        "4" => Msaa::Sample4,
+        "8" => Msaa::Sample8,
+        _ => panic!("--msaa: bad value {raw:?}, want off, 2, 4 or 8"),
+    }
+}
+
 /// Parse a comma-separated `x,y,z` triple (`12,6,-30` or `12, 6, -30`).
 fn parse_vec3(s: &str) -> Option<Vec3> {
     let mut parts = s.split(',');
@@ -837,6 +917,7 @@ fn simulating(mode: Res<Mode>) -> bool {
 // Scene
 // ---------------------------------------------------------------------------
 
+#[allow(clippy::too_many_arguments)]
 fn setup_scene(
     mut commands: Commands,
     mut meshes: ResMut<Assets<Mesh>>,
@@ -845,6 +926,7 @@ fn setup_scene(
     sim: Res<Sim>,
     mode: Res<Mode>,
     settings: Res<CameraSettings>,
+    quality: Res<RenderQuality>,
 ) {
     // --- arena ---
     // The arena is drawn from RocketSim's own collision mesh (`sim::
@@ -1278,7 +1360,7 @@ fn setup_scene(
     commands.spawn((
         DirectionalLight {
             illuminance: 9_000.0,
-            shadow_maps_enabled: true,
+            shadow_maps_enabled: quality.shadows,
             ..default()
         },
         Transform::from_rotation(Quat::from_rotation_x(-PI / 3.5) * Quat::from_rotation_y(0.6)),
@@ -1295,7 +1377,8 @@ fn setup_scene(
     ));
 
     // --- camera ---
-    // HDR plus bloom, so the emissive boost pads glow.
+    // HDR, plus bloom when the quality preset keeps it on, so the emissive boost
+    // pads glow. `--quality low` drops bloom along with MSAA and shadows.
     //
     // The prefilter threshold is the whole trick, and it has to sit *above*
     // everything else in the scene. HDR linear values here are already exposure-
@@ -1338,10 +1421,15 @@ fn setup_scene(
             Transform::from_translation(position).looking_to(view, Vec3::Y)
         }
     };
-    commands.spawn((
+    let mut camera = commands.spawn((
         Camera3d::default(),
+        quality.msaa,
         Hdr,
-        Bloom {
+        camera_pose,
+        ChaseCam,
+    ));
+    if quality.bloom {
+        camera.insert(Bloom {
             intensity: 0.4,
             prefilter: BloomPrefilter {
                 threshold: 6.0,
@@ -1352,10 +1440,8 @@ fn setup_scene(
             // prefilter is used.
             composite_mode: BloomCompositeMode::Additive,
             ..Bloom::NATURAL
-        },
-        camera_pose,
-        ChaseCam,
-    ));
+        });
+    }
 
     // --- hud ---
     // Only the readouts; the control bindings live in the README, not on screen.
@@ -3526,6 +3612,34 @@ fn screenshot_driver(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quality_presets_and_msaa_override_parse() {
+        assert_eq!(parse_quality("LOW"), QualityPreset::Low);
+        assert_eq!(parse_quality("medium"), QualityPreset::Medium);
+        assert_eq!(parse_quality("high"), QualityPreset::High);
+        assert_eq!(parse_msaa("off"), Msaa::Off);
+        assert_eq!(parse_msaa("0"), Msaa::Off);
+        assert_eq!(parse_msaa("2"), Msaa::Sample2);
+        assert_eq!(parse_msaa("4"), Msaa::Sample4);
+        assert_eq!(parse_msaa("8"), Msaa::Sample8);
+
+        let low = RenderQuality::new(QualityPreset::Low, None);
+        assert_eq!(low.msaa, Msaa::Off);
+        assert!(!low.shadows);
+        assert!(!low.bloom);
+
+        let high = RenderQuality::new(QualityPreset::High, None);
+        assert_eq!(high.msaa, Msaa::Sample4);
+        assert!(high.shadows);
+        assert!(high.bloom);
+
+        // The override changes MSAA only; the preset still owns shadows/bloom.
+        let overridden = RenderQuality::new(QualityPreset::High, Some(Msaa::Off));
+        assert_eq!(overridden.msaa, Msaa::Off);
+        assert!(overridden.shadows);
+        assert!(overridden.bloom);
+    }
 
     #[test]
     fn resolution_argument_parses_both_separators() {

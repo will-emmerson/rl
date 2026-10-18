@@ -60,6 +60,10 @@ cargo clippy --workspace --all-targets # kept clean
   resolution. `--resolution WxH` sets a windowed physical-pixel size (ignored
   by fullscreen), and `--no-vsync` uncaps the frame rate. `--stats` adds a
   frame-time/FPS/max/1%-low line to the HUD; **F3** toggles it at runtime.
+- `--quality low|medium|high` selects the render-cost preset (`high` is the
+  normal look; `low` is MSAA-off, no shadows, no bloom). `--msaa off|2|4|8`
+  overrides just the MSAA level. At 1080p, 4x MSAA + shadows + bloom on an
+  integrated GPU is what causes frame-time spikes; the presets are the lever.
 
 - The dev profile is tuned on purpose (own crates `opt-level = 1`, deps `3`).
   **Don't default to `--release`**: it uses a separate target dir and rebuilds

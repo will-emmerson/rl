@@ -28,6 +28,7 @@ dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 ```sh
 cargo run -p rl_view -- --fullscreen --stats
 cargo run -p rl_view -- --fullscreen --stats --no-vsync   # uncapped frame rate
+cargo run -p rl_view -- --fullscreen --stats --quality low  # cheaper visuals
 cargo run -p rl_view -- --resolution 1920x1080 --stats    # windowed, fixed size
 ```
 
@@ -42,6 +43,18 @@ receives.
 FPS and frame time over the last 5 seconds, the worst frame, the 1% low FPS, and
 the current window resolution. Frame time is wall-clock time between frames, so
 with vsync on it bottoms out at the monitor's refresh interval.
+
+`--quality low|medium|high` trades visuals for GPU time. `high` is the normal
+look; `low` is for integrated GPUs and turns off MSAA, shadows and bloom.
+
+| Preset           | MSAA | Shadows  | Bloom |
+| ---------------- | ---- | -------- | ----- |
+| `high` (default) | 4x   | 2048 map | on    |
+| `medium`         | 2x   | 1024 map | on    |
+| `low`            | off  | off      | off   |
+
+`--msaa off|2|4|8` overrides just the MSAA level, keeping the preset's shadow
+and bloom choices (for example, `--quality high --msaa off`).
 
 ### Play against an RLBot v5 bot
 
