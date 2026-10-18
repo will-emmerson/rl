@@ -56,11 +56,12 @@ pub const TICK_HZ: f64 = 120.0;
 /// Soccar ball radius: RocketSim `consts::ball::RADIUS_SOCCAR` = 91.25 uu.
 pub const BALL_RADIUS: f32 = 0.9125;
 
-/// Soccar goal: half the mouth width and the crossbar height, from RocketSim
-/// `consts::goal::SOCCAR_GOAL_HALF_WIDTH` (892.755 uu) and `SOCCAR_GOAL_HEIGHT`
-/// (642.775 uu).
+/// Soccar goal: half the mouth width, the crossbar height and the recess depth,
+/// from RocketSim `consts::goal::SOCCAR_GOAL_HALF_WIDTH` (892.755 uu),
+/// `SOCCAR_GOAL_HEIGHT` (642.775 uu) and `SOCCAR_GOAL_DEPTH` (880 uu).
 pub const GOAL_HALF_WIDTH: f32 = 8.92755;
 pub const GOAL_HEIGHT: f32 = 6.42775;
+pub const GOAL_DEPTH: f32 = 8.8;
 
 /// Octane hitbox half-extents: RocketSim `CarBodyConfig::OCTANE.hitbox_size`
 /// (120.507 x 86.6994 x 38.6591 uu). These size the *visual* car mesh; collision
@@ -297,6 +298,29 @@ impl Sim {
             forward_speed: car.vel.dot(forward) * UU_TO_M,
             boost: car.boost,
         }
+    }
+
+    /// Debug-only helper for eyeballing wall detail: park the car flat on the
+    /// viewer's +X wall, facing +Z, halfway up. Used by an env-var path in
+    /// `main` for free-cam screenshots; it is not part of normal play.
+    pub fn debug_park_on_wall(&mut self) {
+        let mut state = *self.arena.get_car_state(self.car);
+        // viewer = (-x, z, y), so viewer (40.767, 10, 3) -> rs
+        // (-40.767, 3, 10) metres, and RocketSim positions are in uu.
+        state.phys.pos = rocketsim::Vec3A::new(
+            -(40.96 - CAR_HALF_HEIGHT) * 100.0,
+            3.0 * 100.0,
+            10.0 * 100.0,
+        );
+        // forward +Z viewer = +Y rs; right +Y viewer = +Z rs; up -X viewer = +X rs.
+        state.phys.rot_mat = rocketsim::Mat3A::from_cols(
+            rocketsim::Vec3A::new(0.0, 1.0, 0.0),
+            rocketsim::Vec3A::new(0.0, 0.0, 1.0),
+            rocketsim::Vec3A::new(1.0, 0.0, 0.0),
+        );
+        state.phys.vel = rocketsim::Vec3A::ZERO;
+        state.phys.ang_vel = rocketsim::Vec3A::ZERO;
+        self.arena.set_car_state(self.car, state);
     }
 
     /// The ball's state, in the viewer's frame.

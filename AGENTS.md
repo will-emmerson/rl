@@ -98,7 +98,7 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
 
 - **Chase camera:** RL parity means a world-upright, yaw-only boom, not a boom
   built in the car's frame. The camera sits at `car - heading * distance +
-  Y * height`, where `heading` is the car's horizontal forward in car cam or the
+Y * height`, where `heading` is the car's horizontal forward in car cam or the
   horizontal bearing to the ball in ball cam. `CameraSettings::angle` pitches the
   _view_, not the boom, which is what leaves the car low in the frame. The arena
   is a see-through cage, so the camera is _not_ clipped to its walls — it may sit
@@ -110,6 +110,30 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
   the wall plane (that collapses it onto the car). Don't aim at a weighted average
   of car/ball positions (it ends up facing the floor). Settings live in
   `camera.toml` and hot-reload; see the comments in `view/src/main.rs`.
+- **Wall/ceiling trim is flat, visual-only geometry.** `arena_grid_mesh` lays
+  one-sided quads 1 cm inside the shell: wall uprights and rails, a ceiling
+  grid, and a grid above each goal. Keep them flat (no thickness) so they never
+  poke into the car when it drives on a wall. They are culled from outside like
+  the shell, preserving the see-through cage.
+- **Boost pads are two different props, as in RL.** A small pad is a hexagonal
+  metal plate with a dark puck, a glowing ring/core and four translucent flame
+  panels. Only the glow is collected: the ring, core and panels vanish on
+  pickup while the hexagonal marker stays on the pitch. A big pad is a fiery orb
+  (an icosphere with low-frequency displacement and a molten-to-charred
+  vertex-colour gradient, so the spin shows), a ring and a light beam over a
+  dark cross platform that stays put. Flames and beams are `unlit` +
+  `AlphaMode::Add`; Bevy replaces `base_color` with the mesh's vertex colour
+  (alpha included) there, so their gradient and brightness live in
+  `with_vertical_gradient`, not in `emissive`. Motion lives in
+  `animate_boost_pads`; visibility still lives in `sync_visuals` via
+  `Vis::BoostPad(index)` on a parent.
+- **The pitch is untracked geometry, not the collision floor.** `pitch_mesh` in
+  `main.rs` is vertex-coloured quads 1 cm above the collision floor: 10.24 m
+  mowed squares, thin white marking quads, a 48-segment centre ring and
+  team-tinted goal boxes, all procedurally built (no texture). The arena
+  collision mesh itself carries only region vertex colours (green floor, slate
+  walls/roof, team-tinted ends). Don't put markings or a repeating grid back on
+  the collision mesh.
 - **The arena mesh is two sources, not one.** `sim::arena_collision_mesh` is
   RocketSim's dumped `.cmf` triangles _plus_ four flat quads. The dumped meshes
   carry only the _curved_ parts (corners, wall-to-floor/wall-to-ceiling fillets,

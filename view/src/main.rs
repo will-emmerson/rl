@@ -21,7 +21,8 @@ use bevy::asset::RenderAssetUsages;
 use bevy::camera::Hdr;
 use bevy::image::{ImageAddressMode, ImageSampler, ImageSamplerDescriptor};
 use bevy::input::gamepad::{RawGamepadAxisChangedEvent, RawGamepadButtonChangedEvent};
-use bevy::mesh::{Indices, PrimitiveTopology};
+use bevy::light::NotShadowCaster;
+use bevy::mesh::{Indices, PrimitiveTopology, VertexAttributeValues};
 use bevy::post_process::bloom::{Bloom, BloomCompositeMode, BloomPrefilter};
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, Face, TextureDimension, TextureFormat};
@@ -32,22 +33,46 @@ use serde::Deserialize;
 mod sim;
 use sim::{
     Input as SimInput, BALL_RADIUS, CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH,
-    CAR_WHEELBASE, GOAL_HALF_WIDTH, GOAL_HEIGHT,
+    CAR_WHEELBASE, GOAL_DEPTH, GOAL_HALF_WIDTH, GOAL_HEIGHT,
 };
 
-/// Arena dimensions, matching RocketSim's soccar arena: the goal line, frame and
-/// net sit at `ARENA_HALF_Z`.
+/// Soccar arena half-extents, in metres. The long axis is Z in the viewer.
+/// RocketSim's `consts::arena::get_aabb(Soccar)` gives 4096 x 5120 x 2048 uu;
+/// the goal line, frame and net sit at `ARENA_HALF_Z`.
+const ARENA_HALF_X: f32 = 40.96;
 const ARENA_HALF_Z: f32 = 51.20;
+const ARENA_HEIGHT: f32 = 20.48;
 
-/// World size of one tile of the arena grid texture, in metres. Inside a tile
-/// the minor lines are spaced `GRID_TILE / GRID_CELLS` apart, and the tile border
-/// is a heavier major line, so the surfaces read as a 2 m grid with a 10 m major
-/// grid - enough to eyeball distances and the curve of the arena corners.
-const GRID_TILE: f32 = 10.0;
-const GRID_CELLS: u32 = 5;
-/// Texture resolution per tile, and the pixels per minor cell.
-const GRID_TEXELS: u32 = 500;
-const GRID_CELL_PX: u32 = GRID_TEXELS / GRID_CELLS;
+/// Structural ribs standing `GRID_DEPTH` proud of the inside of the shell
+/// (visual only). A little thickness is what keeps them visible when the camera
+/// is looking along the wall from a car driving on it; `GRID_BEAM` is their
+/// width. They are shallow enough not to foul the visual car.
+const GRID_DEPTH: f32 = 0.03;
+const GRID_BEAM: f32 = 0.14;
+
+/// World size of one repeat of the wall chain-link texture, in metres. Small
+/// cells are the point: a chase camera on a wall is only ~20 cm from it, so a
+/// fine pattern still shows several cells, while metre-scale ribs do not.
+const WALL_TEX_WORLD: f32 = 1.0;
+
+/// The pitch is a single quad laid just above the collision floor. The offset
+/// only has to beat z-fighting, not fill a hole: the collision floor is beneath
+/// it and is painted the same green.
+const PITCH_OFFSET: f32 = 0.01;
+
+/// Mowed-square size, in metres. It divides both pitch dimensions exactly (8
+/// squares across, 10 along), so the checkerboard lines up with the arena.
+const PITCH_TILE: f32 = 10.24;
+/// White pitch markings, in metres. They are geometry: a 16 cm line is a thin
+/// quad, so the whole pitch is still only a few hundred triangles and needs no
+/// texture at all.
+const PITCH_LINE_WIDTH: f32 = 0.16;
+/// How far the touchline sits inside the wall.
+const PITCH_INSET: f32 = 1.2;
+const CENTER_CIRCLE_RADIUS: f32 = 9.0;
+/// Goal box: how far it reaches into the pitch, and how far past each post.
+const GOAL_BOX_DEPTH: f32 = 8.0;
+const GOAL_BOX_MARGIN: f32 = 2.5;
 
 /// Visual wheel radius, in metres. A fraction of the hitbox half height, so the
 /// tyre reaches the hitbox floor.
@@ -55,6 +80,29 @@ const WHEEL_RADIUS: f32 = 0.52 * CAR_HALF_HEIGHT;
 /// Full-lock angle for the visual front wheels, in radians. RL's real front-wheel
 /// angle is speed-dependent; this is a fixed stand-in.
 const MAX_WHEEL_STEER: f32 = 0.5;
+
+/// Boost pad visuals. The pickup hitboxes (RLBot's useful game values: 144 uu
+/// radius for a small pad, 208 uu for a big one) are much larger than the glow,
+/// so these are the visible sizes. A small pad is a hexagonal plate with a ring
+/// and four flame panels; a big pad is a hovering orb over a dark cross-shaped
+/// platform, with a beam rising from the centre.
+const SMALL_PAD_RADIUS: f32 = 0.52;
+const SMALL_PAD_PANEL_HEIGHT: f32 = 0.44;
+const SMALL_PAD_PANEL_RADIUS: f32 = 0.34;
+const BIG_PAD_RADIUS: f32 = 0.80;
+const BIG_BEAM_HEIGHT: f32 = 1.0;
+/// Big pad orb: radius and centre height above the pitch. It hovers clear of the
+/// platform, as RL's "pill" does.
+const BIG_ORB_RADIUS: f32 = 0.64;
+const BIG_ORB_HEIGHT: f32 = 1.08;
+
+/// Pads are never quite still in RL. The big orbs bob and turn; the small pads'
+/// light cones breathe. Periods in seconds, spin in radians per second.
+const BOOST_BOB_PERIOD: f32 = 2.6;
+const BOOST_BOB_AMPLITUDE: f32 = 0.045;
+const BOOST_ORB_SPIN: f32 = 0.55;
+const BOOST_PULSE_PERIOD: f32 = 2.2;
+const BOOST_PULSE_AMOUNT: f32 = 0.04;
 
 /// The camera settings file, relative to where the viewer is run. Missing is
 /// fine (RL's defaults are used); a malformed file is a hard error. Override the
@@ -260,9 +308,11 @@ struct BallCam(bool);
 enum Vis {
     Car,
     Ball,
-    /// A boost pad's glowing part, indexed into `World::boost_pads`. Hidden while
-    /// the pad is on cooldown. The small pads' translucent base disc has no `Vis`
-    /// at all, so it stays on the pitch whether or not the boost is available.
+    /// The glowing part of a boost pad, indexed into `World::boost_pads`.
+    /// Hidden while the pad is on cooldown. For a small pad that is its ring,
+    /// core and flame panels; the hexagonal marker stays on the pitch. For a big
+    /// pad it is the orb, light beam and base ring, leaving only the dark
+    /// platform standing.
     BoostPad(usize),
 }
 
@@ -284,6 +334,29 @@ struct Wheel {
 /// keeps its own copy.
 #[derive(Resource, Default)]
 struct LastSteer(f64);
+
+/// Whether the car was actually boosting on the most recent tick (the button is
+/// held *and* there is boost to spend). Drives the visual exhaust flame.
+#[derive(Resource, Default)]
+struct Boosting(bool);
+
+/// The car's exhaust flame, shown only while boosting.
+#[derive(Component)]
+struct BoostFlame;
+
+/// A big pad's orb pivot. It bobs and spins as one, carrying its shell and core.
+#[derive(Component)]
+struct BoostOrb {
+    base_y: f32,
+    phase: f32,
+}
+
+/// A small pad's flame panel, breathing slowly so the pad reads as live even
+/// when nothing is happening.
+#[derive(Component)]
+struct BoostPulse {
+    phase: f32,
+}
 
 fn main() {
     let mut gamepad_debug = false;
@@ -342,15 +415,23 @@ fn main() {
 
     let (camera_settings, camera_config) = initial_camera_settings(camera_config);
 
+    let mut sim = sim::Sim::new();
+    // Debug-only wall pose for free-cam screenshots (the sim is skipped in that
+    // mode, so the car stays where it is put).
+    if std::env::var_os("RL_WALL_DEBUG").is_some() {
+        sim.debug_park_on_wall();
+    }
+
     App::new()
         .add_plugins(DefaultPlugins)
-        .insert_resource(Sim(sim::Sim::new()))
+        .insert_resource(Sim(sim))
         .insert_resource(mode)
         .insert_resource(camera_settings)
         .insert_resource(camera_config)
         .insert_resource(GamepadDebug(gamepad_debug))
         .insert_resource(BallCam(true))
         .init_resource::<LastSteer>()
+        .init_resource::<Boosting>()
         .insert_resource(Time::<Fixed>::from_hz(sim::TICK_HZ))
         .add_systems(Startup, setup_scene)
         .add_systems(FixedUpdate, step_simulation.run_if(simulating))
@@ -362,6 +443,7 @@ fn main() {
                 report_gamepads,
                 report_gamepad_events,
                 sync_visuals,
+                animate_boost_pads,
                 spin_wheels,
                 (reload_camera_settings, apply_camera_fov).chain(),
                 chase_camera.run_if(simulating),
@@ -466,15 +548,15 @@ fn setup_scene(
     // --- arena ---
     // The arena is drawn from RocketSim's own collision mesh (`sim::
     // arena_collision_mesh`), so the visible surface *is* the surface the ball
-    // and car collide with - the real RL arena, not an approximation. A
-    // repeating grid texture makes the scale readable, and vertex colours pick
-    // out the pitch green from the grey walls.
+    // and car collide with - the real RL arena, not an approximation. Vertex
+    // colours separate the pitch green from the slate walls, the darker roof and
+    // a team-coloured band low on each end wall.
     commands.spawn((
         Mesh3d(meshes.add(arena_surface_mesh())),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::WHITE,
-            base_color_texture: Some(images.add(arena_grid_texture())),
-            perceptual_roughness: 0.85,
+            base_color_texture: Some(images.add(wall_detail_texture())),
+            perceptual_roughness: 0.9,
             // The shell is a cage the camera can see through from outside: the
             // mesh is wound so its front faces inward, so back-face culling hides
             // it from outside and the camera may leave the arena (see
@@ -482,6 +564,36 @@ fn setup_scene(
             cull_mode: Some(Face::Back),
             ..default()
         })),
+    ));
+
+    // --- pitch ---
+    // Mowed squares, markings and goal boxes are vertex-coloured geometry laid a
+    // centimetre above the collision floor: no texture, a few hundred triangles.
+    commands.spawn((
+        Mesh3d(meshes.add(pitch_mesh())),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.95,
+            ..default()
+        })),
+    ));
+
+    // --- wall and ceiling grid ---
+    // Shallow ribs on the inside of the shell, like the trusses and fence panels
+    // in RL. They are one mesh and one material; the 3 cm depth is what keeps
+    // them readable at the grazing angle you get while driving on a wall.
+    commands.spawn((
+        Mesh3d(meshes.add(arena_grid_mesh())),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgb(0.46, 0.50, 0.56),
+            metallic: 0.4,
+            perceptual_roughness: 0.5,
+            // A touch of self-light so the roof grid still reads where the key
+            // light does not reach it. Well below the bloom threshold.
+            emissive: LinearRgba::rgb(0.035, 0.040, 0.050),
+            ..default()
+        })),
+        NotShadowCaster,
     ));
 
     // --- ball ---
@@ -499,81 +611,247 @@ fn setup_scene(
     ));
 
     // --- boost pads ---
-    // The six big pads are Rocket League-style translucent orbs; the 28 small
-    // ones are flat discs on the floor. Both are hidden while on cooldown (see
-    // `sync_visuals`).
-    let pad_big_mesh = meshes.add(Sphere::new(0.8).mesh().uv(24, 18));
-    let pad_small_mesh = meshes.add(Cylinder::new(0.55, 0.08));
-    // The small pad is two pieces: a faint translucent disc (the part you can
-    // see the pitch grid through) plus a small opaque core that blooms. They have
-    // to be separate meshes because one material cannot be both - a surface that
-    // blooms is near-white and hides whatever is behind it, whatever its alpha.
-    // The core is opaque so it takes part in the opaque pass and the translucent
-    // disc then depth-tests and blends over it, leaving an annulus of see-through
-    // disc around a glowing middle.
-    let pad_small_core_mesh = meshes.add(Cylinder::new(0.22, 0.1));
-    let pad_big_mat = materials.add(StandardMaterial {
-        base_color: Color::srgba(1.0, 0.72, 0.15, 0.4),
-        // Emissive is what makes the orb glow: it is set well above the bloom
-        // threshold below, so the pad blooms where nothing lit does. The orb is
-        // blended, so the emissive has to be strong to survive `alpha < 1` and
-        // still throw a halo, while staying weak enough that the pitch shows
-        // through it.
-        emissive: LinearRgba::rgb(14.0, 9.5, 2.0),
-        alpha_mode: AlphaMode::Blend,
-        perceptual_roughness: 1.0,
-        // Both cap faces of the sphere are drawn, so the far wall of the orb
-        // shows through the near one and the sphere reads as a volume, not a
-        // flat disc.
+    // RL has two distinct pickups. A small pad is a light hexagonal plate with a
+    // glowing centre ring and four translucent flame panels; a big pad is a
+    // fiery orb hovering over a dark cross-shaped platform, fed by a light beam.
+    // Both are a handful of shared meshes and materials, animated by
+    // `animate_boost_pads`.
+    //
+    // The flames and the beam are unlit and additive, with a vertical colour
+    // gradient baked into their vertex colours: bright and opaque at the bottom,
+    // fading to nothing at the top. That is what makes them read as light.
+    let pad_base_mesh = meshes.add(Cylinder::new(SMALL_PAD_RADIUS, 0.05).mesh().resolution(6));
+    let pad_top_mesh = meshes.add(
+        Cylinder::new(SMALL_PAD_RADIUS * 0.88, 0.02)
+            .mesh()
+            .resolution(6),
+    );
+    let pad_puck_mesh = meshes.add(Cylinder::new(0.22, 0.10).mesh().resolution(24));
+    let pad_core_mesh = meshes.add(Cylinder::new(0.14, 0.012).mesh().resolution(24));
+    let pad_ring_mesh = meshes.add(
+        Torus::new(0.16, 0.24)
+            .mesh()
+            .minor_resolution(6)
+            .major_resolution(24),
+    );
+    let pad_panel_mesh = meshes.add(with_vertical_gradient(
+        Cuboid::new(0.18, SMALL_PAD_PANEL_HEIGHT, 0.025).into(),
+        [1.0, 0.55, 0.06, 0.70],
+        [1.0, 0.20, 0.00, 0.00],
+    ));
+
+    let big_hub_mesh = meshes.add(Cylinder::new(BIG_PAD_RADIUS, 0.14).mesh().resolution(24));
+    let big_arm_mesh = meshes.add(Cuboid::new(2.6, 0.12, 0.62));
+    let big_arm_glow_mesh = meshes.add(Cuboid::new(2.0, 0.012, 0.26));
+    let big_ring_mesh = meshes.add(
+        Torus::new(0.56, 0.74)
+            .mesh()
+            .minor_resolution(8)
+            .major_resolution(32),
+    );
+    let big_disc_mesh = meshes.add(Cylinder::new(0.54, 0.012).mesh().resolution(32));
+    let big_beam_mesh = meshes.add(with_vertical_gradient(
+        ConicalFrustum {
+            radius_top: 0.10,
+            radius_bottom: 0.24,
+            height: BIG_BEAM_HEIGHT,
+        }
+        .into(),
+        [1.0, 0.95, 0.60, 1.00],
+        [1.0, 0.50, 0.05, 0.10],
+    ));
+    let big_orb_mesh = meshes.add(boost_orb_mesh(BIG_ORB_RADIUS));
+    let big_orb_core_mesh = meshes.add(Sphere::new(0.28).mesh().uv(16, 12));
+
+    let pad_plate_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.09, 0.10, 0.12),
+        metallic: 0.55,
+        perceptual_roughness: 0.45,
+        ..default()
+    });
+    let pad_top_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.55, 0.58, 0.62),
+        metallic: 0.35,
+        perceptual_roughness: 0.45,
+        ..default()
+    });
+    let pad_ring_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.40, 0.03),
+        emissive: LinearRgba::rgb(2.6, 0.7, 0.03),
+        perceptual_roughness: 0.6,
+        ..default()
+    });
+    let pad_flame_mat = materials.add(StandardMaterial {
+        // Unlit and additive: a flame must not pick up the white stadium key
+        // light. The mesh's vertex colours supply both the gradient and the
+        // alpha, and they replace `base_color` entirely (see the shader's
+        // `VERTEX_COLORS` path), so the colour here is unused.
+        base_color: Color::WHITE,
+        alpha_mode: AlphaMode::Add,
+        unlit: true,
+        // Seen from outside on approach and from inside once the car is on the
+        // pad, so neither face may be culled.
         cull_mode: None,
         ..default()
     });
-    let pad_small_mat = materials.add(StandardMaterial {
-        // Kept faint so it reads as translucent, with the pitch grid showing
-        // straight through it. All of the small pad's glow comes from the core
-        // below, not from here.
-        base_color: Color::srgba(1.0, 0.85, 0.28, 0.35),
-        emissive: LinearRgba::rgb(0.5, 0.36, 0.08),
+    let pad_core_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.55, 0.12),
+        // In the bloom's soft knee (the knee reaches down to 3.0), so the pad
+        // reads as a light source without washing out to white the way a hotter
+        // core would.
+        emissive: LinearRgba::rgb(5.0, 2.0, 0.25),
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+    let big_orb_mat = materials.add(StandardMaterial {
+        // The shell carries a hot-to-charred gradient in its vertex colours, so
+        // `base_color` is ignored. Only front faces are drawn: the back wall of
+        // a double-sided transparent sphere shows the bright bottom half through
+        // the top and flattens the orb into a disc.
+        emissive: LinearRgba::rgb(0.8, 0.28, 0.02),
         alpha_mode: AlphaMode::Blend,
         perceptual_roughness: 1.0,
         ..default()
     });
-    let pad_small_core_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.85, 0.45),
-        // Above the bloom threshold, so the core throws the halo the disc cannot.
-        // Kept modest on purpose: a hotter core washes the grid out of the ring.
-        emissive: LinearRgba::rgb(10.0, 6.7, 1.7),
+    let big_orb_core_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.70, 0.25),
+        // Opaque and hot. The shell is opaque now, so this only shows through
+        // the gaps in the displaced silhouette; it mostly adds a warm underglow.
+        emissive: LinearRgba::rgb(6.0, 3.2, 0.5),
         perceptual_roughness: 1.0,
         ..default()
     });
+
     for i in 0..sim.0.num_pads() {
         let pad = sim.0.pad(i);
+        // Stagger the animation so the field does not pulse in lockstep.
+        let phase = i as f32 * 0.7;
         if pad.is_big {
-            // The orb *is* the pad, so the whole thing goes on cooldown.
+            // The dark cross platform is arena scenery and stays put. Everything
+            // that glows is one hidden group, so it all leaves when the pad is
+            // taken.
             commands.spawn((
-                Mesh3d(pad_big_mesh.clone()),
-                MeshMaterial3d(pad_big_mat.clone()),
-                Transform::from_xyz(pad.pos.x, pad.pos.y, pad.pos.z),
-                Vis::BoostPad(i),
+                Mesh3d(big_hub_mesh.clone()),
+                MeshMaterial3d(pad_plate_mat.clone()),
+                Transform::from_xyz(pad.pos.x, 0.07, pad.pos.z),
             ));
+            for yaw in [0.0, PI * 0.5] {
+                commands.spawn((
+                    Mesh3d(big_arm_mesh.clone()),
+                    MeshMaterial3d(pad_plate_mat.clone()),
+                    Transform::from_xyz(pad.pos.x, 0.06, pad.pos.z)
+                        .with_rotation(Quat::from_rotation_y(yaw)),
+                ));
+            }
+            commands
+                .spawn((
+                    Transform::from_xyz(pad.pos.x, 0.0, pad.pos.z),
+                    Visibility::default(),
+                    Vis::BoostPad(i),
+                ))
+                .with_children(|root| {
+                    for yaw in [0.0, PI * 0.5] {
+                        root.spawn((
+                            Mesh3d(big_arm_glow_mesh.clone()),
+                            MeshMaterial3d(pad_ring_mat.clone()),
+                            Transform::from_xyz(0.0, 0.126, 0.0)
+                                .with_rotation(Quat::from_rotation_y(yaw)),
+                        ));
+                    }
+                    root.spawn((
+                        Mesh3d(big_disc_mesh.clone()),
+                        MeshMaterial3d(pad_core_mat.clone()),
+                        Transform::from_xyz(0.0, 0.148, 0.0),
+                    ));
+                    root.spawn((
+                        Mesh3d(big_ring_mesh.clone()),
+                        MeshMaterial3d(pad_ring_mat.clone()),
+                        Transform::from_xyz(0.0, 0.15, 0.0),
+                    ));
+                    root.spawn((
+                        Mesh3d(big_beam_mesh.clone()),
+                        MeshMaterial3d(pad_flame_mat.clone()),
+                        // The frustum is centred on its own height, and a cone
+                        // points +Y (the same convention as the exhaust flame).
+                        Transform::from_xyz(0.0, 0.15 + BIG_BEAM_HEIGHT * 0.5, 0.0),
+                    ));
+                    root.spawn((
+                        Transform::from_xyz(0.0, BIG_ORB_HEIGHT, 0.0),
+                        Visibility::default(),
+                        BoostOrb {
+                            base_y: BIG_ORB_HEIGHT,
+                            phase,
+                        },
+                    ))
+                    .with_children(|orb| {
+                        orb.spawn((
+                            Mesh3d(big_orb_mesh.clone()),
+                            MeshMaterial3d(big_orb_mat.clone()),
+                        ));
+                        orb.spawn((
+                            Mesh3d(big_orb_core_mesh.clone()),
+                            MeshMaterial3d(big_orb_core_mat.clone()),
+                        ));
+                    });
+                });
         } else {
-            // The translucent disc is permanent scenery: it carries no `Vis`, so
-            // `sync_visuals` never hides it and the marking stays put. Disc sits
-            // on the floor (half its height above y = 0).
+            // The hexagonal plate and its dark puck are a permanent marker: they
+            // carry no `Vis`, so they stay on the pitch when the boost is taken.
             commands.spawn((
-                Mesh3d(pad_small_mesh.clone()),
-                MeshMaterial3d(pad_small_mat.clone()),
-                Transform::from_xyz(pad.pos.x, 0.04, pad.pos.z),
+                Mesh3d(pad_base_mesh.clone()),
+                MeshMaterial3d(pad_plate_mat.clone()),
+                Transform::from_xyz(pad.pos.x, 0.025, pad.pos.z),
             ));
-            // Only the glow comes and goes. Poking just above the disc so it is
-            // not coplanar; shares the pad index, so `sync_visuals` hides it on
-            // cooldown.
             commands.spawn((
-                Mesh3d(pad_small_core_mesh.clone()),
-                MeshMaterial3d(pad_small_core_mat.clone()),
-                Transform::from_xyz(pad.pos.x, 0.05, pad.pos.z),
-                Vis::BoostPad(i),
+                Mesh3d(pad_top_mesh.clone()),
+                MeshMaterial3d(pad_top_mat.clone()),
+                Transform::from_xyz(pad.pos.x, 0.06, pad.pos.z),
             ));
+            commands.spawn((
+                Mesh3d(pad_puck_mesh.clone()),
+                MeshMaterial3d(pad_plate_mat.clone()),
+                Transform::from_xyz(pad.pos.x, 0.09, pad.pos.z),
+            ));
+            // Only the glow is collected. The ring, core and flame panels share
+            // one hidden group over the marker.
+            commands
+                .spawn((
+                    Transform::from_xyz(pad.pos.x, 0.0, pad.pos.z),
+                    Visibility::default(),
+                    Vis::BoostPad(i),
+                ))
+                .with_children(|root| {
+                    root.spawn((
+                        Mesh3d(pad_core_mesh.clone()),
+                        MeshMaterial3d(pad_core_mat.clone()),
+                        Transform::from_xyz(0.0, 0.148, 0.0),
+                    ));
+                    root.spawn((
+                        Mesh3d(pad_ring_mesh.clone()),
+                        MeshMaterial3d(pad_ring_mat.clone()),
+                        Transform::from_xyz(0.0, 0.15, 0.0),
+                    ));
+                    // Four flame panels around the ring. Each faces outward and
+                    // leans away from the centre, like a crown of fire.
+                    for k in 0..4 {
+                        let angle = k as f32 * PI * 0.5;
+                        let (sin, cos) = angle.sin_cos();
+                        root.spawn((
+                            Mesh3d(pad_panel_mesh.clone()),
+                            MeshMaterial3d(pad_flame_mat.clone()),
+                            Transform::from_xyz(
+                                SMALL_PAD_PANEL_RADIUS * cos,
+                                0.07 + SMALL_PAD_PANEL_HEIGHT * 0.5,
+                                SMALL_PAD_PANEL_RADIUS * sin,
+                            )
+                            .with_rotation(
+                                Quat::from_rotation_y(PI * 0.5 - angle)
+                                    * Quat::from_rotation_x(0.12),
+                            ),
+                            BoostPulse { phase },
+                        ));
+                    }
+                });
         }
     }
 
@@ -594,6 +872,18 @@ fn setup_scene(
         perceptual_roughness: 0.5,
         ..default()
     });
+    // The net is one procedural cross-hatch texture on a single back quad per
+    // goal. It is blended, so the recess behind it still reads.
+    let net_mat = materials.add(StandardMaterial {
+        base_color: Color::srgba(0.60, 0.65, 0.72, 0.55),
+        base_color_texture: Some(images.add(net_texture())),
+        alpha_mode: AlphaMode::Blend,
+        cull_mode: None,
+        perceptual_roughness: 1.0,
+        ..default()
+    });
+    let net_back_mesh = meshes.add(quad_mesh(2.0 * GOAL_HALF_WIDTH, GOAL_HEIGHT, 20.0, 7.0));
+
     let w = GOAL_HALF_WIDTH;
     let h = GOAL_HEIGHT;
     // Blue defends -Z, orange +Z (matching the sim).
@@ -612,15 +902,27 @@ fn setup_scene(
             MeshMaterial3d(frame.clone()),
             Transform::from_xyz(0.0, h, z_line),
         ));
+
+        // Net: one back panel at RocketSim's goal depth. The quad faces +Z by
+        // default, so turn it to face the pitch. Side panels were tried and
+        // dropped: at chase distance the repeating hatch aliases into bright
+        // static, which is worse than an open recess.
+        commands.spawn((
+            Mesh3d(net_back_mesh.clone()),
+            MeshMaterial3d(net_mat.clone()),
+            Transform::from_xyz(0.0, h * 0.5, sign * (ARENA_HALF_Z + GOAL_DEPTH - 0.15))
+                .with_rotation(Quat::from_rotation_y(if sign > 0.0 { PI } else { 0.0 })),
+        ));
     }
 
     // --- car ---
     // Local axes are (+Z forward, +Y up, +X right), matching the simulation, with
-    // the origin at the hitbox centre. The body is a three-box sedan - bonnet,
-    // cabin, boot - built by extruding Z-Y profiles across the width, so the roof
-    // reaches the hitbox ceiling, the nose and tail reach its ends, and the sill
-    // sits clear of the ground with the wheels filling the arches. The collision
-    // box is unchanged; this is only what you see.
+    // the origin at the hitbox centre. The body is a low wedge with the cabin set
+    // back and a small rear wing - the Octane's silhouette in a dozen triangles -
+    // built by extruding Z-Y profiles across the width. The roof reaches the
+    // hitbox ceiling, the nose and tail reach its ends, and the sill sits clear of
+    // the ground with the wheels filling the arches. The collision box is
+    // unchanged; this is only what you see.
     let (hw, hh, hl) = (CAR_HALF_WIDTH, CAR_HALF_HEIGHT, CAR_HALF_LENGTH);
     let body_color = linear_rgba(0.10, 0.60, 0.95);
     let glass_color = linear_rgba(0.04, 0.09, 0.15);
@@ -655,6 +957,20 @@ fn setup_scene(
         emissive: LinearRgba::rgb(0.6, 0.05, 0.05),
         ..default()
     });
+    let spoiler_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.08, 0.48, 0.78),
+        metallic: 0.35,
+        perceptual_roughness: 0.4,
+        ..default()
+    });
+    let flame_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.62, 0.18),
+        // Above the bloom threshold, so the exhaust flares rather than just
+        // reading as an orange cone - but not so hot that the halo swallows the
+        // rear of the car.
+        emissive: LinearRgba::rgb(10.0, 3.5, 0.4),
+        ..default()
+    });
 
     // A bare node: the parts hang off it so `sync_visuals` can drive the whole
     // car from the hitbox transform.
@@ -669,22 +985,26 @@ fn setup_scene(
         let sill = -0.09_f32;
         let beltline = 0.10_f32; // the bonnet/boot top, where the glass begins
 
-        // Lower body: one slab the full hitbox length, its nose and tail sloping
-        // in below the beltline. The bonnet and boot are just the parts of its top
-        // in front of and behind the cabin.
+        // Lower body: one slab the full hitbox length. The nose is a long low
+        // wedge and the tail falls away quickly, leaving a flat deck between the
+        // cabin and the rear wing.
         parent.spawn((
             Mesh3d(meshes.add(extrude_profile(
                 &[
                     (hl, sill),
-                    (hl, -0.02),
-                    (0.94 * hl, beltline),
-                    (-0.94 * hl, beltline),
+                    (hl, -0.03),
+                    (0.90 * hl, 0.005),
+                    (0.60 * hl, beltline),
+                    (-0.58 * hl, beltline),
+                    (-0.84 * hl, 0.015),
                     (-hl, -0.02),
                     (-hl, sill),
                 ],
                 0.83 * hw,
                 body_color,
                 &[
+                    body_color,
+                    body_color,
                     body_color,
                     body_color,
                     body_color,
@@ -697,15 +1017,15 @@ fn setup_scene(
             Transform::default(),
         ));
         // Cabin: the greenhouse, sitting on the beltline and narrower than the
-        // body so its flanks show as glass, with a raked windscreen and rear
-        // window and a solid roof on the hitbox ceiling.
+        // body so its flanks show as glass, with a raked windscreen, a flat roof
+        // on the hitbox ceiling and a fast rear window.
         parent.spawn((
             Mesh3d(meshes.add(extrude_profile(
                 &[
-                    (0.33 * hl, beltline),
-                    (0.27 * hl, hh),
-                    (-0.27 * hl, hh),
-                    (-0.33 * hl, beltline),
+                    (0.20 * hl, beltline),
+                    (0.08 * hl, hh),
+                    (-0.40 * hl, hh),
+                    (-0.56 * hl, beltline),
                 ],
                 0.69 * hw,
                 glass_color,
@@ -714,6 +1034,21 @@ fn setup_scene(
             MeshMaterial3d(car_mat.clone()),
             Transform::default(),
         ));
+
+        // Rear wing: the one silhouette cue that reads as an Octane rather than a
+        // generic sedan. A bar on two short supports, all in the body colour.
+        parent.spawn((
+            Mesh3d(meshes.add(Cuboid::new(1.55 * hw, 0.025, 0.10))),
+            MeshMaterial3d(spoiler_mat.clone()),
+            Transform::from_xyz(0.0, beltline + 0.06, -0.86 * hl),
+        ));
+        for x in [-0.6 * hw, 0.6 * hw] {
+            parent.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.035, 0.06, 0.04))),
+                MeshMaterial3d(spoiler_mat.clone()),
+                Transform::from_xyz(x, beltline + 0.03, -0.86 * hl),
+            ));
+        }
 
         // Wheels. Each is a node that steers (the front pair only) and rolls
         // about its axle, so tyre, rim and spoke cross turn together - a plain
@@ -777,17 +1112,35 @@ fn setup_scene(
                 Transform::from_xyz(x, -0.055, -hl - 0.005),
             ));
         }
+
+        // Exhaust flames, hidden unless the car is actually boosting (see
+        // `sync_visuals`). A cone points +Y; rotating it -90° about X sends the
+        // tip backwards (-Z), with the wide base at the car. Two small cones read
+        // as twin exhausts without adding much geometry.
+        for x in [-0.16, 0.16] {
+            parent.spawn((
+                Mesh3d(meshes.add(Cone::new(0.06, 0.5))),
+                MeshMaterial3d(flame_mat.clone()),
+                Transform::from_xyz(x, -0.085, -hl - 0.18)
+                    .with_rotation(Quat::from_rotation_x(-PI * 0.5)),
+                Visibility::Hidden,
+                BoostFlame,
+            ));
+        }
     });
 
     // --- lighting ---
+    // Bright, fairly neutral stadium light: enough contrast to make the pitch
+    // read as a lit field, with a cool fill so the slate walls keep their colour
+    // instead of going black.
     commands.insert_resource(GlobalAmbientLight {
-        color: Color::srgb(0.82, 0.88, 1.0),
-        brightness: 620.0,
+        color: Color::srgb(0.78, 0.82, 0.90),
+        brightness: 180.0,
         ..default()
     });
     commands.spawn((
         DirectionalLight {
-            illuminance: 30_000.0,
+            illuminance: 9_000.0,
             shadow_maps_enabled: true,
             ..default()
         },
@@ -797,7 +1150,7 @@ fn setup_scene(
     // from the sun are not solid black.
     commands.spawn((
         DirectionalLight {
-            illuminance: 7_000.0,
+            illuminance: 3_500.0,
             shadow_maps_enabled: false,
             ..default()
         },
@@ -870,18 +1223,19 @@ fn setup_scene(
 }
 
 // ---------------------------------------------------------------------------
-// Arena surface and grid
+// Arena surface, pitch and net
 // ---------------------------------------------------------------------------
 
 /// The arena's collision surface as a single triangle mesh, read straight from
 /// RocketSim (`sim::arena_collision_mesh`) - the same geometry RocketSim collides
 /// against, so the drawn surface and the collision surface are one and the same.
-/// A grid UV and the pitch-vs-wall colour are baked into the vertices.
+/// Region colours are baked into the vertices: green where the surface faces up,
+/// slate on the walls, darker slate on the roof, and a team-coloured band low on
+/// each end wall so the two directions read at a glance.
 ///
 /// The source triangles have no guaranteed winding, so each is oriented here so
 /// its front face looks inward (toward the arena centre); the vertex normals are
-/// the area-weighted average of those, and the grid UV comes from projecting the
-/// vertex onto whichever axis plane it faces most directly.
+/// the area-weighted average of those.
 fn arena_surface_mesh() -> Mesh {
     let (verts, tris) = sim::arena_collision_mesh();
 
@@ -894,8 +1248,11 @@ fn arena_surface_mesh() -> Mesh {
     }
     let centre = (lo + hi) * 0.5;
 
-    let floor_color = linear_rgba(0.17, 0.40, 0.29);
-    let wall_color = linear_rgba(0.60, 0.63, 0.70);
+    let floor_color = linear_rgba(0.20, 0.46, 0.27);
+    let wall_color = linear_rgba(0.34, 0.38, 0.46);
+    let ceiling_color = linear_rgba(0.15, 0.17, 0.21);
+    let blue_team = linear_rgba(0.10, 0.30, 0.82);
+    let orange_team = linear_rgba(0.92, 0.36, 0.08);
 
     let mut normals = vec![Vec3::ZERO; verts.len()];
     let mut indices = Vec::with_capacity(tris.len() * 3);
@@ -920,7 +1277,9 @@ fn arena_surface_mesh() -> Mesh {
         let n = n.normalize_or_zero();
         normal_out.push(n.to_array());
 
-        // Grid UV: project onto the plane the vertex faces most directly.
+        // Chain-link UV: project onto the plane the vertex faces most directly.
+        // The floor is covered by the pitch, so it does not matter that it gets
+        // the same projection.
         let an = n.abs();
         let (u, w) = if an.y >= an.x && an.y >= an.z {
             (v.x, v.z)
@@ -929,12 +1288,29 @@ fn arena_surface_mesh() -> Mesh {
         } else {
             (v.x, v.y)
         };
-        uvs.push([u / GRID_TILE, w / GRID_TILE]);
+        uvs.push([u / WALL_TEX_WORLD, w / WALL_TEX_WORLD]);
 
-        // Green where the surface faces up (the pitch and its base fillet), grey
-        // on the walls and ceiling.
-        let t = ((n.y - 0.3) / 0.5).clamp(0.0, 1.0);
-        colors.push(lerp_rgba(wall_color, floor_color, t));
+        // Blend floor -> wall -> roof by how directly the surface faces up or
+        // down. The fillets between them get a smooth transition for free.
+        let floor = smoothstep(0.55, 0.90, n.y);
+        let ceiling = smoothstep(0.55, 0.90, -n.y);
+        let mut color = lerp_rgba(wall_color, floor_color, floor);
+        color = lerp_rgba(color, ceiling_color, ceiling);
+
+        // Team colour low on each end wall (and on the goal-recess floor). Only
+        // surfaces that actually face along Z take it - the long side walls also
+        // reach the ends, and tinting them smeared a band up each side. It fades
+        // out toward the corners and the roof.
+        let endness = ((v.z.abs() - 0.65 * ARENA_HALF_Z) / (0.35 * ARENA_HALF_Z)).clamp(0.0, 1.0);
+        let low = ((5.0 - v.y) / 5.0).clamp(0.0, 1.0);
+        // The goal-recess floor is upward-facing, so include it explicitly; it
+        // otherwise stays grass-green inside the net.
+        let in_recess = v.z.abs() > ARENA_HALF_Z && v.y < 0.5;
+        let end_facing = smoothstep(0.55, 0.9, n.z.abs()).max(if in_recess { 1.0 } else { 0.0 });
+        let accent = endness * low * end_facing * (1.0 - ceiling);
+        let team = if v.z < 0.0 { blue_team } else { orange_team };
+        color = lerp_rgba(color, team, 0.5 * accent);
+        colors.push(color);
     }
 
     Mesh::new(
@@ -946,40 +1322,563 @@ fn arena_surface_mesh() -> Mesh {
         verts.iter().map(Vec3::to_array).collect::<Vec<_>>(),
     )
     .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normal_out)
-    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
     .with_inserted_attribute(Mesh::ATTRIBUTE_UV_0, uvs)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
     .with_inserted_indices(Indices::U32(indices))
 }
 
-/// A repeating grid: white background (so the vertex colour shows through) with a
-/// darker minor line every `GRID_TILE / GRID_CELLS` metres and a heavier major
-/// line on the tile border.
-fn arena_grid_texture() -> Image {
-    let size = GRID_TEXELS as usize;
-    let cell = GRID_CELL_PX as usize;
-    let mut data = vec![0u8; size * size * 4];
-    for y in 0..size {
-        for x in 0..size {
-            let major = x < 3 || y < 3 || x + 3 >= size || y + 3 >= size;
-            let minor = x % cell < 2 || y % cell < 2;
-            let value = if major {
-                55
-            } else if minor {
-                196
-            } else {
-                255
-            };
-            let i = (y * size + x) * 4;
+/// The pitch surface: mowed squares, white markings and team-tinted goal boxes,
+/// all vertex-coloured quads a centimetre above the collision floor. No
+/// texture - 80 mowed quads, a few line quads and one ring, still only a few
+/// hundred triangles.
+///
+/// The layers are separated by a millimetre so the markings and the goal-box
+/// fill never z-fight with the grass beneath them.
+fn pitch_mesh() -> Mesh {
+    let y_grass = PITCH_OFFSET;
+    let y_box = PITCH_OFFSET + 0.001;
+    let y_line = PITCH_OFFSET + 0.002;
+
+    let light = linear_rgba(0.24, 0.54, 0.30);
+    let dark = linear_rgba(0.17, 0.41, 0.22);
+    let line = linear_rgba(0.88, 0.93, 0.87);
+    // Goal-box fills. These are the same sRGB mixes the old pitch texture used,
+    // not linear blends of the team colours: linear blending pushes a saturated
+    // blue/orange much too hard and the box reads as a painted slab.
+    let blue_fill = linear_rgba(0.20, 0.47, 0.46);
+    let orange_fill = linear_rgba(0.46, 0.50, 0.25);
+
+    let mut pitch = PitchMesh::new();
+
+    // Mowed squares. `PITCH_TILE` divides both pitch dimensions exactly, so the
+    // checkerboard reaches the walls without a cut-off row.
+    let nx = (2.0 * ARENA_HALF_X / PITCH_TILE).round() as i32;
+    let nz = (2.0 * ARENA_HALF_Z / PITCH_TILE).round() as i32;
+    for ix in 0..nx {
+        for iz in 0..nz {
+            let x0 = -ARENA_HALF_X + ix as f32 * PITCH_TILE;
+            let z0 = -ARENA_HALF_Z + iz as f32 * PITCH_TILE;
+            let color = if (ix + iz) & 1 == 0 { light } else { dark };
+            pitch.rect(x0, z0, x0 + PITCH_TILE, z0 + PITCH_TILE, y_grass, color);
+        }
+    }
+
+    let touch = ARENA_HALF_X - PITCH_INSET;
+    let goal_line = ARENA_HALF_Z - PITCH_INSET;
+    let goal_half_w = GOAL_HALF_WIDTH + GOAL_BOX_MARGIN;
+    let goal_half_d = GOAL_BOX_DEPTH * 0.5;
+    let goal_centre = goal_line - goal_half_d;
+
+    // Team-tinted goal box floor, then the white markings on top.
+    for (sign, fill) in [(-1.0_f32, blue_fill), (1.0_f32, orange_fill)] {
+        let zc = sign * goal_centre;
+        pitch.rect(
+            -goal_half_w,
+            zc - goal_half_d,
+            goal_half_w,
+            zc + goal_half_d,
+            y_box,
+            fill,
+        );
+    }
+
+    // Touchline and goal line: one inset rectangle around the pitch.
+    pitch.rect_outline((0.0, 0.0), (touch, goal_line), y_line, line);
+
+    // Halfway line, then the centre circle and spot.
+    let half_line = PITCH_LINE_WIDTH * 0.5;
+    pitch.rect(-touch, -half_line, touch, half_line, y_line, line);
+    pitch.ring(CENTER_CIRCLE_RADIUS, half_line, y_line, line);
+    pitch.disc(0.30, y_line, line);
+
+    // Goal box outlines: the outer edge lies on the goal line, on top of the
+    // touchline (same colour, so the overlap is invisible).
+    for sign in [-1.0_f32, 1.0] {
+        pitch.rect_outline(
+            (0.0, sign * goal_centre),
+            (goal_half_w, goal_half_d),
+            y_line,
+            line,
+        );
+    }
+
+    pitch.into_mesh()
+}
+
+/// Accumulates the pitch's upward-facing, vertex-coloured quads, so the mesh
+/// builder reads as a list of pitches, lines and rings rather than a wall of
+/// buffer arguments.
+struct PitchMesh {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    colors: Vec<[f32; 4]>,
+    indices: Vec<u32>,
+}
+
+impl PitchMesh {
+    fn new() -> Self {
+        Self {
+            positions: Vec::new(),
+            normals: Vec::new(),
+            colors: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    /// Append one upward-facing quad. `corners` must be in counter-clockwise
+    /// order seen from above.
+    fn quad(&mut self, corners: [Vec3; 4], color: [f32; 4]) {
+        let base = self.positions.len() as u32;
+        for p in corners {
+            self.positions.push(p.to_array());
+            self.normals.push([0.0, 1.0, 0.0]);
+            self.colors.push(color);
+        }
+        self.indices
+            .extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+    }
+
+    fn rect(&mut self, x0: f32, z0: f32, x1: f32, z1: f32, y: f32, color: [f32; 4]) {
+        self.quad(pitch_rect(x0, z0, x1, z1, y), color);
+    }
+
+    /// Outline a rectangle with four quads of width `PITCH_LINE_WIDTH`, centred
+    /// on its edges. The long edges take the corners, so they meet cleanly
+    /// without overlapping quads.
+    fn rect_outline(
+        &mut self,
+        (cx, cz): (f32, f32),
+        (hx, hz): (f32, f32),
+        y: f32,
+        color: [f32; 4],
+    ) {
+        let h = PITCH_LINE_WIDTH * 0.5;
+        for z in [cz - hz, cz + hz] {
+            self.rect(cx - hx - h, z - h, cx + hx + h, z + h, y, color);
+        }
+        for x in [cx - hx, cx + hx] {
+            self.rect(x - h, cz - hz + h, x + h, cz + hz - h, y, color);
+        }
+    }
+
+    /// A flat ring of `radius` and line width `2 * half_width`, as a strip of
+    /// quads.
+    fn ring(&mut self, radius: f32, half_width: f32, y: f32, color: [f32; 4]) {
+        const SEGMENTS: usize = 48;
+        let (inner, outer) = (radius - half_width, radius + half_width);
+        for i in 0..SEGMENTS {
+            let a0 = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            let a1 = (i + 1) as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            let (c0, s0) = (a0.cos(), a0.sin());
+            let (c1, s1) = (a1.cos(), a1.sin());
+            self.quad(
+                [
+                    Vec3::new(inner * c0, y, inner * s0),
+                    Vec3::new(outer * c0, y, outer * s0),
+                    Vec3::new(outer * c1, y, outer * s1),
+                    Vec3::new(inner * c1, y, inner * s1),
+                ],
+                color,
+            );
+        }
+    }
+
+    /// A flat disc as a triangle fan.
+    fn disc(&mut self, radius: f32, y: f32, color: [f32; 4]) {
+        const SEGMENTS: usize = 24;
+        let base = self.positions.len() as u32;
+        self.positions.push([0.0, y, 0.0]);
+        self.normals.push([0.0, 1.0, 0.0]);
+        self.colors.push(color);
+        for i in 0..SEGMENTS {
+            let a = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
+            self.positions.push([radius * a.cos(), y, radius * a.sin()]);
+            self.normals.push([0.0, 1.0, 0.0]);
+            self.colors.push(color);
+        }
+        for i in 0..SEGMENTS {
+            let p0 = base + 1 + i as u32;
+            let p1 = base + 1 + ((i + 1) % SEGMENTS) as u32;
+            self.indices.extend_from_slice(&[base, p1, p0]);
+        }
+    }
+
+    fn into_mesh(self) -> Mesh {
+        Mesh::new(
+            PrimitiveTopology::TriangleList,
+            RenderAssetUsages::default(),
+        )
+        .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, self.positions)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, self.normals)
+        .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, self.colors)
+        .with_inserted_indices(Indices::U32(self.indices))
+    }
+}
+
+/// Corners of an axis-aligned rectangle in the XZ plane, counter-clockwise seen
+/// from above (the winding [`PitchMesh::quad`] expects).
+fn pitch_rect(x0: f32, z0: f32, x1: f32, z1: f32, y: f32) -> [Vec3; 4] {
+    [
+        Vec3::new(x0, y, z0),
+        Vec3::new(x1, y, z0),
+        Vec3::new(x1, y, z1),
+        Vec3::new(x0, y, z1),
+    ]
+}
+
+/// The structural grid on the inside of the walls and ceiling: shallow boxes
+/// standing `GRID_DEPTH` proud of the collision surface, one mesh and one
+/// material. The bays are sparse on purpose - a 10 m rhythm on the side walls
+/// and a coarser ceiling grid - so they read as structure rather than noise.
+/// The end-wall grid starts above the crossbar and never crosses the goal mouth.
+fn arena_grid_mesh() -> Mesh {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut indices = Vec::new();
+    let half = GRID_BEAM * 0.5;
+
+    // Side walls: nine uprights and three rails per wall.
+    for side in [-1.0_f32, 1.0] {
+        for k in -4..=4 {
+            let z = k as f32 * PITCH_TILE;
+            let (center, size) = side_wall_beam(side, 2.74, 17.74, z - half, z + half);
+            push_box(&mut positions, &mut normals, &mut indices, center, size);
+        }
+        for y in [5.12, 10.24, 15.36] {
+            let (center, size) = side_wall_beam(side, y - half, y + half, -46.08, 46.08);
+            push_box(&mut positions, &mut normals, &mut indices, center, size);
+        }
+    }
+
+    // Ceiling: a central grid, held clear of the wall fillets.
+    for k in -3..=3 {
+        let x = k as f32 * PITCH_TILE;
+        let (center, size) = ceiling_beam(x - half, x + half, -46.08, 46.08);
+        push_box(&mut positions, &mut normals, &mut indices, center, size);
+    }
+    for k in -4..=4 {
+        let z = k as f32 * PITCH_TILE;
+        let (center, size) = ceiling_beam(-30.72, 30.72, z - half, z + half);
+        push_box(&mut positions, &mut normals, &mut indices, center, size);
+    }
+
+    // End walls: a grid above the crossbar only.
+    for side in [-1.0_f32, 1.0] {
+        for y in [8.0, 11.5, 15.0, 18.0] {
+            let (center, size) = end_wall_beam(side, -30.72, 30.72, y - half, y + half);
+            push_box(&mut positions, &mut normals, &mut indices, center, size);
+        }
+        for k in -3..=3 {
+            let x = k as f32 * PITCH_TILE;
+            let (center, size) = end_wall_beam(side, x - half, x + half, 8.0, 18.0);
+            push_box(&mut positions, &mut normals, &mut indices, center, size);
+        }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// Center and size of a rib on a side wall. It is flush with the shell on the
+/// outside and stands `GRID_DEPTH` proud on the inside.
+fn side_wall_beam(side: f32, y0: f32, y1: f32, z0: f32, z1: f32) -> (Vec3, Vec3) {
+    let center = Vec3::new(
+        side * (ARENA_HALF_X - GRID_DEPTH * 0.5),
+        (y0 + y1) * 0.5,
+        (z0 + z1) * 0.5,
+    );
+    (center, Vec3::new(GRID_DEPTH, y1 - y0, z1 - z0))
+}
+
+/// Center and size of a rib on an end wall.
+fn end_wall_beam(side: f32, x0: f32, x1: f32, y0: f32, y1: f32) -> (Vec3, Vec3) {
+    let center = Vec3::new(
+        (x0 + x1) * 0.5,
+        (y0 + y1) * 0.5,
+        side * (ARENA_HALF_Z - GRID_DEPTH * 0.5),
+    );
+    (center, Vec3::new(x1 - x0, y1 - y0, GRID_DEPTH))
+}
+
+/// Center and size of a rib on the ceiling.
+fn ceiling_beam(x0: f32, x1: f32, z0: f32, z1: f32) -> (Vec3, Vec3) {
+    let center = Vec3::new(
+        (x0 + x1) * 0.5,
+        ARENA_HEIGHT - GRID_DEPTH * 0.5,
+        (z0 + z1) * 0.5,
+    );
+    (center, Vec3::new(x1 - x0, GRID_DEPTH, z1 - z0))
+}
+
+/// Append an axis-aligned box as six outward-facing quads.
+fn push_box(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    indices: &mut Vec<u32>,
+    center: Vec3,
+    size: Vec3,
+) {
+    let h = size * 0.5;
+    let (x0, y0, z0) = (center.x - h.x, center.y - h.y, center.z - h.z);
+    let (x1, y1, z1) = (center.x + h.x, center.y + h.y, center.z + h.z);
+    let faces = [
+        (
+            [
+                Vec3::new(x1, y0, z0),
+                Vec3::new(x1, y1, z0),
+                Vec3::new(x1, y1, z1),
+                Vec3::new(x1, y0, z1),
+            ],
+            Vec3::X,
+        ),
+        (
+            [
+                Vec3::new(x0, y0, z1),
+                Vec3::new(x0, y1, z1),
+                Vec3::new(x0, y1, z0),
+                Vec3::new(x0, y0, z0),
+            ],
+            Vec3::NEG_X,
+        ),
+        (
+            [
+                Vec3::new(x0, y1, z0),
+                Vec3::new(x0, y1, z1),
+                Vec3::new(x1, y1, z1),
+                Vec3::new(x1, y1, z0),
+            ],
+            Vec3::Y,
+        ),
+        (
+            [
+                Vec3::new(x0, y0, z1),
+                Vec3::new(x0, y0, z0),
+                Vec3::new(x1, y0, z0),
+                Vec3::new(x1, y0, z1),
+            ],
+            Vec3::NEG_Y,
+        ),
+        (
+            [
+                Vec3::new(x1, y0, z1),
+                Vec3::new(x1, y1, z1),
+                Vec3::new(x0, y1, z1),
+                Vec3::new(x0, y0, z1),
+            ],
+            Vec3::Z,
+        ),
+        (
+            [
+                Vec3::new(x0, y0, z0),
+                Vec3::new(x0, y1, z0),
+                Vec3::new(x1, y1, z0),
+                Vec3::new(x1, y0, z0),
+            ],
+            Vec3::NEG_Z,
+        ),
+    ];
+    for (corners, normal) in faces {
+        push_detail_quad(positions, normals, indices, corners, normal);
+    }
+}
+
+/// Append one flat quad with an explicit normal.
+fn push_detail_quad(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    indices: &mut Vec<u32>,
+    corners: [Vec3; 4],
+    normal: Vec3,
+) {
+    let base = positions.len() as u32;
+    for p in corners {
+        positions.push(p.to_array());
+        normals.push(normal.to_array());
+    }
+    indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+/// A small tiling chain-link pattern for the walls and ceiling. It is a
+/// multiply map: white lets the region colour through, the lattice lines darken
+/// it. At 128 px across one metre the diamonds are ~25 cm, so a chase camera
+/// only 20 cm from a wall still sees several cells - which is exactly what the
+/// metre-scale ribs cannot give at that angle.
+fn wall_detail_texture() -> Image {
+    const SIZE: usize = 128;
+    const CELL: usize = 32;
+    const LINE: usize = 2;
+    let mut data = vec![0u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            // Two sets of diagonals make the diamonds. `SIZE` is a multiple of
+            // `CELL`, so the pattern tiles without a seam.
+            let on_line = (x + y) % CELL < LINE || (x + SIZE - y) % CELL < LINE;
+            let value = if on_line { 180 } else { 255 };
+            let i = (y * SIZE + x) * 4;
             data[i] = value;
             data[i + 1] = value;
             data[i + 2] = value;
             data[i + 3] = 255;
         }
     }
+
+    // Build the mip chain by hand: runtime images start with one level, and a
+    // repeating 25 cm pattern without mips turns into noise on distant walls.
+    let mut mip = data;
+    let mut mip_size = SIZE;
+    let mut pixels = Vec::new();
+    loop {
+        pixels.extend_from_slice(&mip);
+        if mip_size == 1 {
+            break;
+        }
+        let (next, next_size) = downsample_mip(&mip, mip_size);
+        mip = next;
+        mip_size = next_size;
+    }
+
+    let mut image = Image::new_uninit(
+        Extent3d {
+            width: SIZE as u32,
+            height: SIZE as u32,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::default(),
+    );
+    image.texture_descriptor.mip_level_count = SIZE.trailing_zeros() + 1;
+    image.data = Some(pixels);
+    image.sampler = ImageSampler::Descriptor(ImageSamplerDescriptor {
+        address_mode_u: ImageAddressMode::Repeat,
+        address_mode_v: ImageAddressMode::Repeat,
+        ..default()
+    });
+    image
+}
+
+/// Box-filter a square RGBA mip down by half, returning the new pixels and size.
+fn downsample_mip(src: &[u8], size: usize) -> (Vec<u8>, usize) {
+    let next = size / 2;
+    let mut dst = vec![0u8; next * next * 4];
+    for y in 0..next {
+        for x in 0..next {
+            let mut sum = [0u32; 4];
+            for dy in 0..2 {
+                for dx in 0..2 {
+                    let i = ((y * 2 + dy) * size + x * 2 + dx) * 4;
+                    for (c, s) in sum.iter_mut().enumerate() {
+                        *s += src[i + c] as u32;
+                    }
+                }
+            }
+            let o = (y * next + x) * 4;
+            for (c, s) in sum.iter().enumerate() {
+                dst[o + c] = (s / 4) as u8;
+            }
+        }
+    }
+    (dst, next)
+}
+
+/// Bake a bottom-to-top RGBA gradient into a mesh's vertex colours. The lit
+/// shader path replaces the material's `base_color` with the vertex colour
+/// (alpha included), which is exactly what the unlit additive flames and beams
+/// want: bright and solid at the base, transparent at the tip.
+fn with_vertical_gradient(mut mesh: Mesh, bottom: [f32; 4], top: [f32; 4]) -> Mesh {
+    let colors = {
+        let Some(VertexAttributeValues::Float32x3(positions)) =
+            mesh.attribute(Mesh::ATTRIBUTE_POSITION)
+        else {
+            return mesh;
+        };
+        let min = positions.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min);
+        let max = positions
+            .iter()
+            .map(|p| p[1])
+            .fold(f32::NEG_INFINITY, f32::max);
+        let span = (max - min).max(f32::EPSILON);
+        positions
+            .iter()
+            .map(|p| {
+                let t = ((p[1] - min) / span).clamp(0.0, 1.0);
+                std::array::from_fn(|i| bottom[i] + (top[i] - bottom[i]) * t)
+            })
+            .collect::<Vec<[f32; 4]>>()
+    };
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh
+}
+
+/// The big pad's orb: a low-poly icosphere with low-frequency lumps pushed into
+/// it, so the slow spin is visible and the surface reads as a blob of fire rather
+/// than a billiard ball. Vertex colours run from molten yellow at the bottom to
+/// charred near-black at the top, with a sooty low-frequency pattern. Normals
+/// stay radial, which is correct enough for a star-shaped surface and keeps the
+/// shading soft.
+fn boost_orb_mesh(radius: f32) -> Mesh {
+    let mut mesh: Mesh = Sphere::new(radius)
+        .mesh()
+        .ico(2)
+        .expect("icosphere subdivision is valid");
+    let Some(VertexAttributeValues::Float32x3(positions)) =
+        mesh.attribute_mut(Mesh::ATTRIBUTE_POSITION)
+    else {
+        return mesh;
+    };
+    let mut normals = Vec::with_capacity(positions.len());
+    let mut colors = Vec::with_capacity(positions.len());
+    for position in positions.iter_mut() {
+        let dir = Vec3::from_array(*position).normalize_or_zero();
+        let lump =
+            1.0 + 0.11 * (dir.y * 3.1).sin() * (dir.x * 2.3).cos() + 0.06 * (dir.z * 4.7).cos();
+        *position = (dir * radius * lump).to_array();
+        normals.push(dir.to_array());
+
+        let heat = ((dir.y + 1.0) * 0.5).powf(1.4);
+        let soot = 0.55 + 0.45 * ((dir.x * 5.1).sin() * (dir.z * 4.3).cos()).abs();
+        let dim = soot * (1.0 - 0.65 * heat);
+        colors.push([
+            (1.00 - 0.70 * heat) * dim,
+            (0.55 - 0.50 * heat) * dim,
+            (0.08 - 0.075 * heat) * dim,
+            0.78,
+        ]);
+    }
+    mesh.insert_attribute(Mesh::ATTRIBUTE_NORMAL, normals);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh
+}
+
+/// A transparent cross-hatch used for the goal net. Transparent texels stay
+/// white rather than black so linear filtering does not leave dark fringes, and
+/// the sampler repeats it over each net quad.
+fn net_texture() -> Image {
+    const SIZE: usize = 64;
+    const CELL: usize = 8;
+    let mut data = vec![0u8; SIZE * SIZE * 4];
+    for y in 0..SIZE {
+        for x in 0..SIZE {
+            let i = (y * SIZE + x) * 4;
+            data[i] = 220;
+            data[i + 1] = 226;
+            data[i + 2] = 232;
+            data[i + 3] = if x % CELL == 0 || y % CELL == 0 {
+                210
+            } else {
+                0
+            };
+        }
+    }
     let mut image = Image::new(
         Extent3d {
-            width: GRID_TEXELS,
-            height: GRID_TEXELS,
+            width: SIZE as u32,
+            height: SIZE as u32,
             depth_or_array_layers: 1,
         },
         TextureDimension::D2,
@@ -993,6 +1892,36 @@ fn arena_grid_texture() -> Image {
         ..default()
     });
     image
+}
+
+/// A quad in the XY plane facing +Z, with UVs scaled for a repeating texture.
+/// Used for the net panels, which are then rotated into place.
+fn quad_mesh(width: f32, height: f32, u_repeat: f32, v_repeat: f32) -> Mesh {
+    let (hw, hh) = (width * 0.5, height * 0.5);
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(
+        Mesh::ATTRIBUTE_POSITION,
+        vec![
+            [-hw, -hh, 0.0],
+            [hw, -hh, 0.0],
+            [hw, hh, 0.0],
+            [-hw, hh, 0.0],
+        ],
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, vec![[0.0, 0.0, 1.0]; 4])
+    .with_inserted_attribute(
+        Mesh::ATTRIBUTE_UV_0,
+        vec![
+            [0.0, 0.0],
+            [u_repeat, 0.0],
+            [u_repeat, v_repeat],
+            [0.0, v_repeat],
+        ],
+    )
+    .with_inserted_indices(Indices::U32(vec![0, 1, 2, 0, 2, 3]))
 }
 
 /// A football: the truncated icosahedron - 12 black pentagons and 20 white
@@ -1227,6 +2156,12 @@ fn lerp_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
     ]
 }
 
+/// Hermite ramp from 0 below `edge0` to 1 above `edge1`, clamped at both ends.
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
 // ---------------------------------------------------------------------------
 // Simulation
 // ---------------------------------------------------------------------------
@@ -1361,6 +2296,7 @@ fn step_simulation(
     gamepads: Query<&Gamepad>,
     mut sim: ResMut<Sim>,
     mut last_steer: ResMut<LastSteer>,
+    mut boosting: ResMut<Boosting>,
     mode: Res<Mode>,
 ) {
     let input = match &*mode {
@@ -1369,8 +2305,12 @@ fn step_simulation(
         // the frame rate. See `capture_input` for the schedule.
         Mode::Capture { .. } => capture_input(sim.0.tick()),
     };
+    // The button alone is not enough: with an empty tank the car does not boost,
+    // so the exhaust should not light either.
+    let wants_boost = input.boost && sim.0.car().boost > 0.0;
     last_steer.0 = input.steer;
     sim.0.step(&input);
+    boosting.0 = wants_boost;
 }
 
 /// Logs gamepad connect/disconnect.
@@ -1476,7 +2416,20 @@ fn reset_on_key(keys: Res<ButtonInput<KeyCode>>, gamepads: Query<&Gamepad>, mut 
 // Presentation
 // ---------------------------------------------------------------------------
 
-fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis, &mut Visibility)>) {
+fn sync_visuals(
+    sim: Res<Sim>,
+    boosting: Res<Boosting>,
+    mut query: Query<(&mut Transform, &Vis, &mut Visibility)>,
+    mut flames: Query<&mut Visibility, (With<BoostFlame>, Without<Vis>)>,
+) {
+    for mut visibility in &mut flames {
+        *visibility = if boosting.0 {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+
     for (mut transform, vis, mut visibility) in &mut query {
         match vis {
             Vis::Car => {
@@ -1494,8 +2447,9 @@ fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis, &mut Visi
                 transform.rotate(Quat::from_scaled_axis(ball.spin * (1.0 / 60.0)));
             }
             Vis::BoostPad(index) => {
-                // Hidden while on cooldown, so only the glow leaves when the pad
-                // is taken (the small pads' disc is not tagged, so it stays).
+                // Hidden while on cooldown. For a small pad that is its glow; the
+                // marker carries no `Vis` and stays. A big pad's dark platform
+                // does the same.
                 *visibility = if sim.0.pad(*index).available {
                     Visibility::Inherited
                 } else {
@@ -1503,6 +2457,27 @@ fn sync_visuals(sim: Res<Sim>, mut query: Query<(&mut Transform, &Vis, &mut Visi
                 };
             }
         }
+    }
+}
+
+/// Bob and spin the big pads' orbs, and let the small pads' flame panels breathe.
+/// RL's pads are never quite still, and the motion is what separates them from
+/// painted plates. Phases are offset per pad (see `setup_scene`) so the field
+/// does not pulse in lockstep.
+fn animate_boost_pads(
+    time: Res<Time>,
+    mut orbs: Query<(&mut Transform, &BoostOrb), Without<BoostPulse>>,
+    mut pulses: Query<(&mut Transform, &BoostPulse), Without<BoostOrb>>,
+) {
+    let t = time.elapsed_secs();
+    for (mut transform, orb) in &mut orbs {
+        let bob = (t * std::f32::consts::TAU / BOOST_BOB_PERIOD + orb.phase).sin();
+        transform.translation.y = orb.base_y + bob * BOOST_BOB_AMPLITUDE;
+        transform.rotation = Quat::from_rotation_y(t * BOOST_ORB_SPIN + orb.phase);
+    }
+    for (mut transform, pulse) in &mut pulses {
+        let breathe = (t * std::f32::consts::TAU / BOOST_PULSE_PERIOD + pulse.phase).sin();
+        transform.scale = Vec3::splat(1.0 + breathe * BOOST_PULSE_AMOUNT);
     }
 }
 
@@ -1908,6 +2883,25 @@ mod tests {
             position.z < -ARENA_HALF_Z,
             "the camera should sit outside the wall, got {position:?}"
         );
+    }
+
+    #[test]
+    fn the_mowed_squares_fill_the_pitch_exactly() {
+        // `pitch_texture` tiles the checkerboard in world space, so the tile
+        // size has to divide both pitch dimensions or the pattern gets a cut-off
+        // row at one edge.
+        let across = 2.0 * ARENA_HALF_X / PITCH_TILE;
+        let along = 2.0 * ARENA_HALF_Z / PITCH_TILE;
+        assert!(
+            (across - across.round()).abs() < 1e-4,
+            "{across} squares across"
+        );
+        assert!(
+            (along - along.round()).abs() < 1e-4,
+            "{along} squares along"
+        );
+        assert_eq!(across.round() as u32, 8);
+        assert_eq!(along.round() as u32, 10);
     }
 
     #[test]

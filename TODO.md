@@ -8,21 +8,44 @@
 
 # TODO
 
-- make it look more like RL but keep low-poly:
-  - show agent some images?
+- ignore todo
+- add the project goals:
+  - work on low hardware / low poly
+  - linux/mac compatibility without wine, etc
+  - better bots (using rlbot)
+  - load straight into freeplay without loads of button clicks
+  - better training:
+    - include custom training packs
+    - use AI to help players work on their weak points
+  - eventually, an online mode with zero smurfs (somehow)
+- simplify/remove the collision mesh?:
+  - why can't it be described with equations?
 - sound (engine sound, boost sound)
 - settings:
+  - resolution
+  - bots
+  - unlimited boost
+  - cpu graph
+  - graphics detail
   - as a yaml file? or sqlite?
   - controller, keyboard shortcuts
   - camera
+  - in game using a UI would be good
 - rlbot integration
+- make a release build to see how small/fast it can be
+- show cpu/ram usage, graph?
+- test
+- make sure there is parity:
+  - https://wiki.rlbot.org/v4/botmaking/useful-game-values/
 
 # DOING
 
-- camera parity
+- make it look more like RL but keep low-poly:
+  - show agent some images?
 
 # DONE
 
+- camera parity
 - viewer screenshots: `--cam x,y,z` / `--look x,y,z` pin the camera and skip the
   simulation, so a static shot from a chosen angle (`Mode::Capture { free_cam }`)
   is instant instead of driving the sim to a tick. The driven `--screenshot PATH
