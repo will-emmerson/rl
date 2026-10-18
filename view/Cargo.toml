@@ -20,6 +20,11 @@ toml = "1"
 # (see `view/src/sim.rs`); those are NOT in the repo.
 rocketsim = { git = "https://github.com/ZealanL/RocketSim", rev = "6cf55d33d070ff611a09564885dac230f66fd2f6" }
 
+# The bot-facing half of RLBot v5. The viewer does not run RLBotServer or
+# Rocket League: this crate speaks the same TCP/FlatBuffers protocol that RLBot
+# bots use, so standard v5 bots can connect directly to the simulation.
+rlbot_bridge = { path = "../rlbot_bridge" }
+
 # Feature set is spelled out rather than using bevy's convenient `3d`/`ui`
 # meta-features, because those pull in `default_platform`, which includes
 # `bevy_audio` (needs alsa). Nothing here makes noise, so dropping it keeps the

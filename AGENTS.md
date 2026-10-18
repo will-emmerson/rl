@@ -13,14 +13,22 @@ physics, and draws RocketSim's own arena collision mesh.
   RocketSim: it owns the `Arena`, converts RocketSim's frame and units into the
   viewer's, exposes the car/ball/pads/score the scene reads, and builds the
   collision mesh. `view/src/main.rs` is the scene, input wiring, camera and HUD;
-  `view/src/controls.rs` parses the keyboard/gamepad bindings.
+  `view/src/controls.rs` parses the keyboard/gamepad bindings;
+  `view/src/rlbot.rs` is the viewer-side bridge resource (it converts bot inputs
+  into `sim::Input`, calls `sim::rlbot_snapshot`, and can launch the bot process
+  from `--rlbot-config` (bot name or toml) or `--rlbot-command`).
+- `rlbot_bridge/` — the bot-facing half of RLBot v5 as a standalone crate: TCP
+  framing, FlatBuffers, handshake, per-client threads, packet construction. It
+  knows nothing about Bevy or RocketSim; the viewer hands it `GameSnapshot`s.
+- `tools/rlbot_test_bot.py` — a tiny RLBot v5 Python bot for exercising the
+  bridge end to end.
 - `tools/rlacd.py` — a Linux/Proton port of RLArenaCollisionDumper: dumps RL's
   arena collision meshes, which RocketSim needs at runtime (see below). Upstream
   is Windows-only.
 - `docs/PHYSICS.md` — a write-up of the hand-rolled `rl` simulation that used to
   be this repo's physics. **`rl` is retired**; the doc is kept as history.
 
-The workspace is virtual; `view/` is the only crate.
+The workspace is virtual; the crates are `view/` and `rlbot_bridge/`.
 
 ## RocketSim is the reference
 
@@ -40,6 +48,8 @@ should know RocketSim's frame or units.
 
 ```sh
 cargo run -p rl_view                   # play (dev profile is already playable)
+cargo run -p rl_view -- --rlbot        # same, plus an RLBot v5 bot slot
+cargo run -p rl_view -- --rlbot --rlbot-config bot.toml  # ...and launch the bot
 cargo test --workspace                 # the check that matters
 cargo clippy --workspace --all-targets # kept clean
 ```
@@ -171,6 +181,25 @@ Y * height`, where `heading` is the car's horizontal forward in car cam or the
   mirrors the axis and has bitten before. If an axis ever looks wrong, re-run the
   probe and change the sign where the input is built (`read_input` in `main.rs`),
   not here.
+- **RLBot controls pass straight through, like the state does.** RLBot's
+  `ControllerState` documents positive `steer`/`yaw`/`roll` as "right", but the
+  bridge sends the bot a **RocketSim** world: positions, rotations and angular
+  velocities go over the wire unchanged (the same conversion as
+  `VirxEC/rlbot-rocketsim`). A bot trained on RLGym/RocketSim reads that frame,
+  so its controls must be applied in it too — `protocol::input_from_flat` and
+  `input_to_flat` are **straight copies**. Negating just the controls mirrors
+  them relative to everything the bot sees; Nexto drove in circles until this
+  was fixed. Do not move a negation into `controls_from` either: that would
+  break the viewer's own keyboard/pad path.
+- **RLBot v5 framing is `u16 big-endian length || FlatBuffer`**, with the packet
+  type inside `InterfacePacket`/`CorePacket`; there is no separate type byte.
+  Older RLBotSim drafts used a type prefix, so don't copy their framing. The
+  bridge uses the MIT-licensed `rlbot_flat` crate for the generated types and
+  `planus` builder.
+- **`cargo test` runs from the crate root (`view/`).** The viewer normally runs
+  from the workspace root, where `./collision_meshes` resolves; `sim::init_rocketsim`
+  falls back to `../collision_meshes` so tests keep working without duplicating
+  the meshes.
 - **Pad trigger axes start at `0.0`, not at rest.** Bevy pre-fills every axis with
   `0.0` until the pad sends its first event, but `LeftZ`/`RightZ` rest at `-1.0`,
   so `0.0` reads as half-pressed. `controls::seed_trigger_axes` sets configured

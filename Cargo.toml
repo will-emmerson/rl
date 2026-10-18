@@ -2,7 +2,7 @@
 # hand-rolled `rl` simulation that used to be the root package has been retired;
 # `docs/PHYSICS.md` is kept as a write-up of it.
 [workspace]
-members = ["view"]
+members = ["view", "rlbot_bridge"]
 resolver = "2"
 
 [profile.release]

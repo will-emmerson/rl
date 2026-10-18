@@ -1,0 +1,15 @@
+[package]
+name = "rlbot_bridge"
+version = "0.1.0"
+edition = "2021"
+description = "RLBot v5 bot-facing TCP bridge for a custom simulation"
+
+[dependencies]
+# Generated RLBot v5 flatbuffer types and the planus builder. This is the
+# bot-facing half of the protocol; the game-facing Bridge.dll is closed source
+# and is deliberately not involved.
+rlbot_flat = "0.6"
+
+[dev-dependencies]
+# The integration tests spawn the server and speak the protocol with the same
+# types, so no extra dependency is needed.

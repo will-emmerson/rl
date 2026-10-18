@@ -12,6 +12,9 @@
 //!   cargo run -p rl_view -- --gamepad-debug       # log every raw pad event
 //!   cargo run -p rl_view -- --camera-config cam.toml # use a different camera file
 //!   cargo run -p rl_view -- --controls-config keys.toml # different bindings file
+//!   cargo run -p rl_view -- --rlbot                # listen for one RLBot v5 bot
+//!   cargo run -p rl_view -- --rlbot --rlbot-config Nexto
+//!                                                 # ...and start the bot too
 
 use std::f32::consts::PI;
 use std::path::{Path, PathBuf};
@@ -36,6 +39,9 @@ use sim::{
     Input as SimInput, BALL_RADIUS, CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH,
     CAR_WHEELBASE, GOAL_DEPTH, GOAL_HALF_WIDTH, GOAL_HEIGHT,
 };
+
+mod rlbot;
+use rlbot::{LaunchOptions, Rlbot, RlbotOptions};
 
 mod controls;
 use controls::{button_axis, key_axis, seed_trigger_axes, strongest, Controls};
@@ -328,7 +334,8 @@ struct BallCam(bool);
 
 #[derive(Component)]
 enum Vis {
-    Car,
+    /// A simulated car, indexed in `Sim`/player order. Index 0 is the human.
+    Car(usize),
     Ball,
     /// The glowing part of a boost pad, indexed into `World::boost_pads`.
     /// Hidden while the pad is on cooldown. For a small pad that is its ring,
@@ -359,26 +366,24 @@ struct BoostMeterText;
 struct BoostMeterFill;
 
 /// A visual wheel. `steers` marks the front pair, which also yaw with the
-/// steering input; every wheel rolls about its axle.
+/// steering input; every wheel rolls about its axle. `car` indexes `Sim` so the
+/// opponent's wheels use the opponent's speed and steering, not the human's.
 #[derive(Component)]
 struct Wheel {
     steers: bool,
+    car: usize,
 }
 
-/// The steering input from the most recent tick, so the visual front wheels can
-/// follow the stick. The simulation does not expose the last input, so the viewer
-/// keeps its own copy.
+/// Whether each car was actually boosting on the most recent tick (the button is
+/// held *and* there is boost to spend). Indexed by car; drives the exhaust flames.
 #[derive(Resource, Default)]
-struct LastSteer(f64);
+struct Boosting([bool; 2]);
 
-/// Whether the car was actually boosting on the most recent tick (the button is
-/// held *and* there is boost to spend). Drives the visual exhaust flame.
-#[derive(Resource, Default)]
-struct Boosting(bool);
-
-/// The car's exhaust flame, shown only while boosting.
+/// A car's exhaust flame, shown only while that car is boosting.
 #[derive(Component)]
-struct BoostFlame;
+struct BoostFlame {
+    car: usize,
+}
 
 /// A big pad's orb pivot. It bobs and spins as one, carrying its shell and core.
 #[derive(Component)]
@@ -403,6 +408,15 @@ fn main() {
     let mut look: Option<Vec3> = None;
     let mut camera_config: Option<PathBuf> = None;
     let mut controls_config: Option<PathBuf> = None;
+    let mut rlbot_enabled = false;
+    let mut rlbot_port = rlbot_bridge::DEFAULT_PORT;
+    // `None` means "use the bot config, or the built-in default".
+    let mut rlbot_agent_id: Option<String> = None;
+    let mut rlbot_name: Option<String> = None;
+    // A bot to start, either explicitly or from a `bot.toml`.
+    let mut rlbot_command: Option<String> = None;
+    let mut rlbot_config: Option<String> = None;
+    let mut rlbot_dir: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -435,8 +449,84 @@ fn main() {
                 ));
             }
             "--gamepad-debug" => gamepad_debug = true,
+            "--rlbot" => rlbot_enabled = true,
+            "--rlbot-port" => {
+                let value = args
+                    .next()
+                    .unwrap_or_else(|| panic!("--rlbot-port needs a port"));
+                rlbot_port = value
+                    .parse()
+                    .unwrap_or_else(|_| panic!("--rlbot-port: bad port {value:?}"));
+            }
+            "--rlbot-agent-id" => {
+                rlbot_agent_id = Some(
+                    args.next()
+                        .unwrap_or_else(|| panic!("--rlbot-agent-id needs an id")),
+                );
+            }
+            "--rlbot-name" => {
+                rlbot_name = Some(
+                    args.next()
+                        .unwrap_or_else(|| panic!("--rlbot-name needs a name")),
+                );
+            }
+            "--rlbot-command" => {
+                rlbot_command = Some(
+                    args.next()
+                        .unwrap_or_else(|| panic!("--rlbot-command needs a command")),
+                );
+            }
+            "--rlbot-config" => {
+                rlbot_config = Some(
+                    args.next()
+                        .unwrap_or_else(|| panic!("--rlbot-config needs a path or bot name")),
+                );
+            }
+            "--rlbot-dir" => {
+                rlbot_dir = Some(PathBuf::from(
+                    args.next()
+                        .unwrap_or_else(|| panic!("--rlbot-dir needs a path")),
+                ));
+            }
             _ => {}
         }
+    }
+
+    if rlbot_command.is_some() && rlbot_config.is_some() {
+        panic!("use --rlbot-command or --rlbot-config, not both");
+    }
+    if rlbot_dir.is_some() && rlbot_command.is_none() && rlbot_config.is_none() {
+        panic!("--rlbot-dir needs --rlbot-command or --rlbot-config");
+    }
+
+    // A bot config supplies the agent id, display name and launch command;
+    // explicit flags still win, and the built-in defaults fill any gaps.
+    let bot_config = rlbot_config.as_deref().map(|spec| {
+        let path = rlbot::resolve_bot_config(spec);
+        rlbot::load_bot_config(&path)
+    });
+    let rlbot_agent_id = rlbot_agent_id
+        .or_else(|| bot_config.as_ref().map(|config| config.agent_id.clone()))
+        .unwrap_or_else(|| "rlbot/opponent".to_string());
+    let rlbot_name = rlbot_name
+        .or_else(|| bot_config.as_ref().map(|config| config.name.clone()))
+        .unwrap_or_else(|| "RLBot".to_string());
+    let launch = match (rlbot_command, bot_config) {
+        (Some(command), _) => Some(LaunchOptions {
+            command,
+            working_dir: rlbot_dir,
+            environment: Vec::new(),
+        }),
+        (None, Some(mut config)) => {
+            if rlbot_dir.is_some() {
+                config.launch.working_dir = rlbot_dir;
+            }
+            Some(config.launch)
+        }
+        (None, None) => None,
+    };
+    if launch.is_some() {
+        rlbot_enabled = true;
     }
 
     let free_cam = resolve_free_cam(cam, look);
@@ -459,16 +549,35 @@ fn main() {
     let (camera_settings, camera_config) = initial_camera_settings(camera_config);
     let (controls, controls_config) = initial_controls(controls_config);
 
-    let mut sim = sim::Sim::new();
+    let mut sim = if rlbot_enabled {
+        sim::Sim::with_opponent()
+    } else {
+        sim::Sim::new()
+    };
     // Debug-only wall pose for free-cam screenshots (the sim is skipped in that
     // mode, so the car stays where it is put).
     if std::env::var_os("RL_WALL_DEBUG").is_some() {
         sim.debug_park_on_wall();
     }
 
+    let rlbot = if rlbot_enabled {
+        Rlbot::start(
+            &sim,
+            RlbotOptions {
+                port: rlbot_port,
+                agent_id: rlbot_agent_id,
+                bot_name: rlbot_name,
+                launch,
+            },
+        )
+    } else {
+        Rlbot::disabled()
+    };
+
     App::new()
         .add_plugins(DefaultPlugins)
         .insert_resource(Sim(sim))
+        .insert_resource(rlbot)
         .insert_resource(mode)
         .insert_resource(camera_settings)
         .insert_resource(camera_config)
@@ -476,7 +585,6 @@ fn main() {
         .insert_resource(controls_config)
         .insert_resource(GamepadDebug(gamepad_debug))
         .insert_resource(BallCam(true))
-        .init_resource::<LastSteer>()
         .init_resource::<Boosting>()
         .insert_resource(Time::<Fixed>::from_hz(sim::TICK_HZ))
         .add_systems(
@@ -988,219 +1096,55 @@ fn setup_scene(
         ));
     }
 
-    // --- car ---
-    // Local axes are (+Z forward, +Y up, +X right), matching the simulation, with
-    // the origin at the hitbox centre. The body is a low wedge with the cabin set
-    // back and a small rear wing - the Octane's silhouette in a dozen triangles -
-    // built by extruding Z-Y profiles across the width. The roof reaches the
-    // hitbox ceiling, the nose and tail reach its ends, and the sill sits clear of
-    // the ground with the wheels filling the arches. The collision box is
-    // unchanged; this is only what you see.
-    let (hw, hh, hl) = (CAR_HALF_WIDTH, CAR_HALF_HEIGHT, CAR_HALF_LENGTH);
-    let body_color = linear_rgba(0.10, 0.60, 0.95);
-    let glass_color = linear_rgba(0.04, 0.09, 0.15);
-    let underside_color = linear_rgba(0.07, 0.07, 0.08);
-    // One material for the whole body: the colours come from the vertices.
-    let car_mat = materials.add(StandardMaterial {
-        base_color: Color::WHITE,
-        metallic: 0.35,
-        perceptual_roughness: 0.4,
-        // Both sides, rather than relying on the winding of every extruded strip.
-        cull_mode: None,
-        ..default()
-    });
-    let tyre_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.05, 0.05, 0.06),
-        perceptual_roughness: 0.9,
-        ..default()
-    });
-    let rim_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.74, 0.77, 0.80),
-        metallic: 0.6,
-        perceptual_roughness: 0.4,
-        ..default()
-    });
-    let light_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.93, 0.62),
-        emissive: LinearRgba::rgb(1.1, 0.95, 0.5),
-        ..default()
-    });
-    let tail_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.85, 0.10, 0.10),
-        emissive: LinearRgba::rgb(0.6, 0.05, 0.05),
-        ..default()
-    });
-    let spoiler_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(0.08, 0.48, 0.78),
-        metallic: 0.35,
-        perceptual_roughness: 0.4,
-        ..default()
-    });
-    let flame_mat = materials.add(StandardMaterial {
-        base_color: Color::srgb(1.0, 0.62, 0.18),
-        // Above the bloom threshold, so the exhaust flares rather than just
-        // reading as an orange cone - but not so hot that the halo swallows the
-        // rear of the car.
-        emissive: LinearRgba::rgb(10.0, 3.5, 0.4),
-        ..default()
-    });
+    // --- cars ---
+    spawn_car(
+        &mut commands,
+        &mut meshes,
+        &mut materials,
+        Vis::Car(0),
+        0,
+        linear_rgba(0.10, 0.60, 0.95),
+        Color::srgb(0.08, 0.48, 0.78),
+    );
 
-    // A bare node: the parts hang off it so `sync_visuals` can drive the whole
-    // car from the hitbox transform.
-    let car = commands
-        .spawn((Transform::default(), Visibility::default(), Vis::Car))
-        .id();
-
-    commands.entity(car).with_children(|parent| {
-        // The sill is the underside of the bodywork. It sits at the wheel centre,
-        // so the wheels stand proud of it - flush with the sill they would look
-        // like castors, and the car would appear to have no ground clearance.
-        let sill = -0.09_f32;
-        let beltline = 0.10_f32; // the bonnet/boot top, where the glass begins
-
-        // Lower body: one slab the full hitbox length. The nose is a long low
-        // wedge and the tail falls away quickly, leaving a flat deck between the
-        // cabin and the rear wing.
-        parent.spawn((
-            Mesh3d(meshes.add(extrude_profile(
-                &[
-                    (hl, sill),
-                    (hl, -0.03),
-                    (0.90 * hl, 0.005),
-                    (0.60 * hl, beltline),
-                    (-0.58 * hl, beltline),
-                    (-0.84 * hl, 0.015),
-                    (-hl, -0.02),
-                    (-hl, sill),
-                ],
-                0.83 * hw,
-                body_color,
-                &[
-                    body_color,
-                    body_color,
-                    body_color,
-                    body_color,
-                    body_color,
-                    body_color,
-                    body_color,
-                    underside_color,
-                ],
-            ))),
-            MeshMaterial3d(car_mat.clone()),
-            Transform::default(),
-        ));
-        // Cabin: the greenhouse, sitting on the beltline and narrower than the
-        // body so its flanks show as glass, with a raked windscreen, a flat roof
-        // on the hitbox ceiling and a fast rear window.
-        parent.spawn((
-            Mesh3d(meshes.add(extrude_profile(
-                &[
-                    (0.20 * hl, beltline),
-                    (0.08 * hl, hh),
-                    (-0.40 * hl, hh),
-                    (-0.56 * hl, beltline),
-                ],
-                0.69 * hw,
-                glass_color,
-                &[glass_color, body_color, glass_color, body_color],
-            ))),
-            MeshMaterial3d(car_mat.clone()),
-            Transform::default(),
-        ));
-
-        // Rear wing: the one silhouette cue that reads as an Octane rather than a
-        // generic sedan. A bar on two short supports, all in the body colour.
-        parent.spawn((
-            Mesh3d(meshes.add(Cuboid::new(1.55 * hw, 0.025, 0.10))),
-            MeshMaterial3d(spoiler_mat.clone()),
-            Transform::from_xyz(0.0, beltline + 0.06, -0.86 * hl),
-        ));
-        for x in [-0.6 * hw, 0.6 * hw] {
+    // The RLBot opponent gets a real second car mesh in orange, plus a
+    // translucent disc and a floating marker so it is readable at a distance.
+    if sim.0.num_cars() > 1 {
+        let opponent = spawn_car(
+            &mut commands,
+            &mut meshes,
+            &mut materials,
+            Vis::Car(1),
+            1,
+            linear_rgba(1.0, 0.36, 0.03),
+            Color::srgb(0.90, 0.28, 0.02),
+        );
+        let opponent_ring = materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 0.42, 0.04, 0.55),
+            emissive: LinearRgba::rgb(2.4, 0.8, 0.08),
+            alpha_mode: AlphaMode::Blend,
+            unlit: true,
+            ..default()
+        });
+        let marker = materials.add(StandardMaterial {
+            base_color: Color::srgb(1.0, 0.45, 0.05),
+            emissive: LinearRgba::rgb(4.0, 1.2, 0.1),
+            unlit: true,
+            ..default()
+        });
+        commands.entity(opponent).with_children(|parent| {
             parent.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.035, 0.06, 0.04))),
-                MeshMaterial3d(spoiler_mat.clone()),
-                Transform::from_xyz(x, beltline + 0.03, -0.86 * hl),
+                Mesh3d(meshes.add(Cylinder::new(1.15, 0.02))),
+                MeshMaterial3d(opponent_ring),
+                Transform::from_xyz(0.0, -CAR_HALF_HEIGHT + 0.02, 0.0),
             ));
-        }
-
-        // Wheels. Each is a node that steers (the front pair only) and rolls
-        // about its axle, so tyre, rim and spoke cross turn together - a plain
-        // cylinder looks identical however it is spun, so the rim and spokes are
-        // what make the rotation visible. They sit flush with the body sides, on
-        // the sim's wheelbase.
-        let front_axle = 0.46_f32;
-        let rear_axle = front_axle - CAR_WHEELBASE;
-        let wheel_w = 0.24 * hw;
-        for (x, z, steers) in [
-            (-0.72 * hw, front_axle, true),
-            (0.72 * hw, front_axle, true),
-            (-0.72 * hw, rear_axle, false),
-            (0.72 * hw, rear_axle, false),
-        ] {
-            parent
-                .spawn((
-                    Transform::from_xyz(x, -hh + WHEEL_RADIUS, z),
-                    Visibility::default(),
-                    Wheel { steers },
-                ))
-                .with_children(|wheel| {
-                    let axle = Quat::from_rotation_z(PI / 2.0);
-                    wheel.spawn((
-                        Mesh3d(meshes.add(Cylinder::new(WHEEL_RADIUS, wheel_w))),
-                        MeshMaterial3d(tyre_mat.clone()),
-                        Transform::from_rotation(axle),
-                    ));
-                    wheel.spawn((
-                        Mesh3d(meshes.add(Cylinder::new(0.62 * WHEEL_RADIUS, wheel_w * 1.12))),
-                        MeshMaterial3d(rim_mat.clone()),
-                        Transform::from_rotation(axle),
-                    ));
-                    for angle in [0.0, PI / 2.0] {
-                        wheel.spawn((
-                            Mesh3d(meshes.add(Cuboid::new(
-                                wheel_w * 1.16,
-                                1.4 * WHEEL_RADIUS,
-                                0.04,
-                            ))),
-                            MeshMaterial3d(rim_mat.clone()),
-                            Transform::from_rotation(Quat::from_rotation_x(angle)),
-                        ));
-                    }
-                });
-        }
-
-        // Headlights at the nose and tail lights at the back, so the two ends
-        // read apart.
-        for x in [-0.55 * hw, 0.55 * hw] {
             parent.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.30 * hw, 0.055, 0.05))),
-                MeshMaterial3d(light_mat.clone()),
-                Transform::from_xyz(x, -0.055, hl + 0.005),
+                Mesh3d(meshes.add(Sphere::new(0.16))),
+                MeshMaterial3d(marker),
+                Transform::from_xyz(0.0, CAR_HALF_HEIGHT + 0.55, 0.0),
             ));
-        }
-        for x in [-0.55 * hw, 0.55 * hw] {
-            parent.spawn((
-                Mesh3d(meshes.add(Cuboid::new(0.30 * hw, 0.055, 0.05))),
-                MeshMaterial3d(tail_mat.clone()),
-                Transform::from_xyz(x, -0.055, -hl - 0.005),
-            ));
-        }
-
-        // Exhaust flames, hidden unless the car is actually boosting (see
-        // `sync_visuals`). A cone points +Y; rotating it -90° about X sends the
-        // tip backwards (-Z), with the wide base at the car. Two small cones read
-        // as twin exhausts without adding much geometry.
-        for x in [-0.16, 0.16] {
-            parent.spawn((
-                Mesh3d(meshes.add(Cone::new(0.06, 0.5))),
-                MeshMaterial3d(flame_mat.clone()),
-                Transform::from_xyz(x, -0.085, -hl - 0.18)
-                    .with_rotation(Quat::from_rotation_x(-PI * 0.5)),
-                Visibility::Hidden,
-                BoostFlame,
-            ));
-        }
-    });
+        });
+    }
 
     // --- lighting ---
     // Bright, fairly neutral stadium light: enough contrast to make the pitch
@@ -1303,7 +1247,7 @@ fn setup_scene(
             left: px(12),
             ..default()
         },
-        children![TextSpan::new(""), TextSpan::new("")],
+        children![TextSpan::new(""), TextSpan::new(""), TextSpan::new("")],
         HudText,
     ));
 
@@ -1426,6 +1370,239 @@ fn setup_scene(
             ),
         ],
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Car visuals
+// ---------------------------------------------------------------------------
+
+/// Build one car's visual hierarchy and return its parent entity.
+///
+/// The local axes are (+Z forward, +Y up, +X right), matching the simulation,
+/// with the origin at the hitbox centre. The body is a low wedge with the cabin
+/// set back and a small rear wing - the Octane's silhouette in a dozen triangles -
+/// built by extruding Z-Y profiles across the width. The roof reaches the hitbox
+/// ceiling, the nose and tail reach its ends, and the sill sits clear of the
+/// ground with the wheels filling the arches. The collision box is unchanged;
+/// this is only what you see.
+fn spawn_car(
+    commands: &mut Commands,
+    meshes: &mut Assets<Mesh>,
+    materials: &mut Assets<StandardMaterial>,
+    vis: Vis,
+    car_index: usize,
+    body_color: [f32; 4],
+    spoiler_color: Color,
+) -> Entity {
+    let (hw, hh, hl) = (CAR_HALF_WIDTH, CAR_HALF_HEIGHT, CAR_HALF_LENGTH);
+    let glass_color = linear_rgba(0.04, 0.09, 0.15);
+    let underside_color = linear_rgba(0.07, 0.07, 0.08);
+    // One material for the whole body: the colours come from the vertices.
+    let car_mat = materials.add(StandardMaterial {
+        base_color: Color::WHITE,
+        metallic: 0.35,
+        perceptual_roughness: 0.4,
+        // Both sides, rather than relying on the winding of every extruded strip.
+        cull_mode: None,
+        ..default()
+    });
+    let tyre_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.05, 0.05, 0.06),
+        perceptual_roughness: 0.9,
+        ..default()
+    });
+    let rim_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.74, 0.77, 0.80),
+        metallic: 0.6,
+        perceptual_roughness: 0.4,
+        ..default()
+    });
+    let light_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.93, 0.62),
+        emissive: LinearRgba::rgb(1.1, 0.95, 0.5),
+        ..default()
+    });
+    let tail_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.85, 0.10, 0.10),
+        emissive: LinearRgba::rgb(0.6, 0.05, 0.05),
+        ..default()
+    });
+    let spoiler_mat = materials.add(StandardMaterial {
+        base_color: spoiler_color,
+        metallic: 0.35,
+        perceptual_roughness: 0.4,
+        ..default()
+    });
+    let flame_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.62, 0.18),
+        // Above the bloom threshold, so the exhaust flares rather than just
+        // reading as an orange cone - but not so hot that the halo swallows the
+        // rear of the car.
+        emissive: LinearRgba::rgb(10.0, 3.5, 0.4),
+        ..default()
+    });
+
+    // A bare node: the parts hang off it so `sync_visuals` can drive the whole
+    // car from the hitbox transform.
+    let car = commands
+        .spawn((Transform::default(), Visibility::default(), vis))
+        .id();
+
+    commands.entity(car).with_children(|parent| {
+        // The sill is the underside of the bodywork. It sits at the wheel centre,
+        // so the wheels stand proud of it - flush with the sill they would look
+        // like castors, and the car would appear to have no ground clearance.
+        let sill = -0.09_f32;
+        let beltline = 0.10_f32; // the bonnet/boot top, where the glass begins
+
+        // Lower body: one slab the full hitbox length. The nose is a long low
+        // wedge and the tail falls away quickly, leaving a flat deck between the
+        // cabin and the rear wing.
+        parent.spawn((
+            Mesh3d(meshes.add(extrude_profile(
+                &[
+                    (hl, sill),
+                    (hl, -0.03),
+                    (0.90 * hl, 0.005),
+                    (0.60 * hl, beltline),
+                    (-0.58 * hl, beltline),
+                    (-0.84 * hl, 0.015),
+                    (-hl, -0.02),
+                    (-hl, sill),
+                ],
+                0.83 * hw,
+                body_color,
+                &[
+                    body_color,
+                    body_color,
+                    body_color,
+                    body_color,
+                    body_color,
+                    body_color,
+                    body_color,
+                    underside_color,
+                ],
+            ))),
+            MeshMaterial3d(car_mat.clone()),
+            Transform::default(),
+        ));
+        // Cabin: the greenhouse, sitting on the beltline and narrower than the
+        // body so its flanks show as glass, with a raked windscreen, a flat roof
+        // on the hitbox ceiling and a fast rear window.
+        parent.spawn((
+            Mesh3d(meshes.add(extrude_profile(
+                &[
+                    (0.20 * hl, beltline),
+                    (0.08 * hl, hh),
+                    (-0.40 * hl, hh),
+                    (-0.56 * hl, beltline),
+                ],
+                0.69 * hw,
+                glass_color,
+                &[glass_color, body_color, glass_color, body_color],
+            ))),
+            MeshMaterial3d(car_mat.clone()),
+            Transform::default(),
+        ));
+
+        // Rear wing: the one silhouette cue that reads as an Octane rather than a
+        // generic sedan. A bar on two short supports, all in the body colour.
+        parent.spawn((
+            Mesh3d(meshes.add(Cuboid::new(1.55 * hw, 0.025, 0.10))),
+            MeshMaterial3d(spoiler_mat.clone()),
+            Transform::from_xyz(0.0, beltline + 0.06, -0.86 * hl),
+        ));
+        for x in [-0.6 * hw, 0.6 * hw] {
+            parent.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.035, 0.06, 0.04))),
+                MeshMaterial3d(spoiler_mat.clone()),
+                Transform::from_xyz(x, beltline + 0.03, -0.86 * hl),
+            ));
+        }
+
+        // Wheels. Each is a node that steers (the front pair only) and rolls
+        // about its axle, so tyre, rim and spoke cross turn together - a plain
+        // cylinder looks identical however it is spun, so the rim and spokes are
+        // what make the rotation visible. They sit flush with the body sides, on
+        // the sim's wheelbase.
+        let front_axle = 0.46_f32;
+        let rear_axle = front_axle - CAR_WHEELBASE;
+        let wheel_w = 0.24 * hw;
+        for (x, z, steers) in [
+            (-0.72 * hw, front_axle, true),
+            (0.72 * hw, front_axle, true),
+            (-0.72 * hw, rear_axle, false),
+            (0.72 * hw, rear_axle, false),
+        ] {
+            parent
+                .spawn((
+                    Transform::from_xyz(x, -hh + WHEEL_RADIUS, z),
+                    Visibility::default(),
+                    Wheel {
+                        steers,
+                        car: car_index,
+                    },
+                ))
+                .with_children(|wheel| {
+                    let axle = Quat::from_rotation_z(PI / 2.0);
+                    wheel.spawn((
+                        Mesh3d(meshes.add(Cylinder::new(WHEEL_RADIUS, wheel_w))),
+                        MeshMaterial3d(tyre_mat.clone()),
+                        Transform::from_rotation(axle),
+                    ));
+                    wheel.spawn((
+                        Mesh3d(meshes.add(Cylinder::new(0.62 * WHEEL_RADIUS, wheel_w * 1.12))),
+                        MeshMaterial3d(rim_mat.clone()),
+                        Transform::from_rotation(axle),
+                    ));
+                    for angle in [0.0, PI / 2.0] {
+                        wheel.spawn((
+                            Mesh3d(meshes.add(Cuboid::new(
+                                wheel_w * 1.16,
+                                1.4 * WHEEL_RADIUS,
+                                0.04,
+                            ))),
+                            MeshMaterial3d(rim_mat.clone()),
+                            Transform::from_rotation(Quat::from_rotation_x(angle)),
+                        ));
+                    }
+                });
+        }
+
+        // Headlights at the nose and tail lights at the back, so the two ends
+        // read apart.
+        for x in [-0.55 * hw, 0.55 * hw] {
+            parent.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.30 * hw, 0.055, 0.05))),
+                MeshMaterial3d(light_mat.clone()),
+                Transform::from_xyz(x, -0.055, hl + 0.005),
+            ));
+        }
+        for x in [-0.55 * hw, 0.55 * hw] {
+            parent.spawn((
+                Mesh3d(meshes.add(Cuboid::new(0.30 * hw, 0.055, 0.05))),
+                MeshMaterial3d(tail_mat.clone()),
+                Transform::from_xyz(x, -0.055, -hl - 0.005),
+            ));
+        }
+
+        // Exhaust flames, hidden unless the car is actually boosting (see
+        // `sync_visuals`). A cone points +Y; rotating it -90° about X sends the
+        // tip backwards (-Z), with the wide base at the car. Two small cones read
+        // as twin exhausts without adding much geometry.
+        for x in [-0.16, 0.16] {
+            parent.spawn((
+                Mesh3d(meshes.add(Cone::new(0.06, 0.5))),
+                MeshMaterial3d(flame_mat.clone()),
+                Transform::from_xyz(x, -0.085, -hl - 0.18)
+                    .with_rotation(Quat::from_rotation_x(-PI * 0.5)),
+                Visibility::Hidden,
+                BoostFlame { car: car_index },
+            ));
+        }
+    });
+
+    car
 }
 
 // ---------------------------------------------------------------------------
@@ -2488,22 +2665,41 @@ fn step_simulation(
     gamepads: Query<&Gamepad>,
     controls: Res<Controls>,
     mut sim: ResMut<Sim>,
-    mut last_steer: ResMut<LastSteer>,
     mut boosting: ResMut<Boosting>,
+    mut rlbot: ResMut<Rlbot>,
     mode: Res<Mode>,
 ) {
-    let input = match &*mode {
+    rlbot.poll();
+
+    let mut inputs = vec![SimInput::default(); sim.0.num_cars()];
+    inputs[0] = match &*mode {
         Mode::Play => read_input(&keys, gamepads.iter().next(), &controls),
         // Self-driving, so a capture is reproducible rather than dependent on
         // the frame rate. See `capture_input` for the schedule.
         Mode::Capture { .. } => capture_input(sim.0.tick()),
     };
+    if inputs.len() > 1 {
+        let bot_player_id = rlbot.bot_player_id;
+        if let Some(input) = rlbot.latest_input(bot_player_id) {
+            inputs[1] = rlbot::to_sim_input(input);
+        }
+    }
+
     // The button alone is not enough: with an empty tank the car does not boost,
     // so the exhaust should not light either.
-    let wants_boost = input.boost && sim.0.car().boost > 0.0;
-    last_steer.0 = input.steer;
-    sim.0.step(&input);
-    boosting.0 = wants_boost;
+    for (index, input) in inputs.iter().enumerate() {
+        boosting.0[index] = input.boost && sim.0.car_at(index).boost > 0.0;
+    }
+    sim.0.step(&inputs);
+
+    // Only build (and especially predict) packets when a bot is actually ready
+    // to receive them. The bridge opens the TCP port even before that, but an
+    // unready client must not make the viewer pay for ball prediction.
+    if rlbot.ready_count() > 0 {
+        let wants_prediction = rlbot.any_wants_prediction();
+        let snapshot = sim.0.rlbot_snapshot(wants_prediction);
+        rlbot.broadcast(&snapshot);
+    }
 }
 
 /// Logs gamepad connect/disconnect.
@@ -2619,10 +2815,10 @@ fn sync_visuals(
     sim: Res<Sim>,
     boosting: Res<Boosting>,
     mut query: Query<(&mut Transform, &Vis, &mut Visibility)>,
-    mut flames: Query<&mut Visibility, (With<BoostFlame>, Without<Vis>)>,
+    mut flames: Query<(&mut Visibility, &BoostFlame), Without<Vis>>,
 ) {
-    for mut visibility in &mut flames {
-        *visibility = if boosting.0 {
+    for (mut visibility, flame) in &mut flames {
+        *visibility = if boosting.0.get(flame.car).copied().unwrap_or(false) {
             Visibility::Inherited
         } else {
             Visibility::Hidden
@@ -2631,8 +2827,8 @@ fn sync_visuals(
 
     for (mut transform, vis, mut visibility) in &mut query {
         match vis {
-            Vis::Car => {
-                let car = sim.0.car();
+            Vis::Car(index) => {
+                let car = sim.0.car_at(*index);
                 let (f, u) = (car.forward, car.up);
                 transform.translation = car.pos;
                 // Full 3D attitude, so flips and air control are visible. The
@@ -2686,16 +2882,17 @@ fn animate_boost_pads(
 fn spin_wheels(
     time: Res<Time>,
     sim: Res<Sim>,
-    steer: Res<LastSteer>,
-    mut rolled: Local<f32>,
+    mut rolled: Local<[f32; 2]>,
     mut wheels: Query<(&mut Transform, &Wheel)>,
 ) {
-    let speed = sim.0.car().forward_speed;
-    *rolled = (*rolled + speed * time.delta_secs() / WHEEL_RADIUS) % std::f32::consts::TAU;
-    let steer_angle = steer.0 as f32 * MAX_WHEEL_STEER;
+    let dt = time.delta_secs();
     for (mut transform, wheel) in &mut wheels {
+        let car = sim.0.car_at(wheel.car);
+        rolled[wheel.car] =
+            (rolled[wheel.car] + car.forward_speed * dt / WHEEL_RADIUS) % std::f32::consts::TAU;
+        let steer_angle = sim.0.last_input(wheel.car).steer as f32 * MAX_WHEEL_STEER;
         let yaw = if wheel.steers { steer_angle } else { 0.0 };
-        transform.rotation = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(*rolled);
+        transform.rotation = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(rolled[wheel.car]);
     }
 }
 
@@ -3052,6 +3249,12 @@ fn update_hud(
         ball.pos.y,
         ball.spin.length()
     );
+    *writer.text(entity, 3) = if sim.0.num_cars() > 1 {
+        let bot = sim.0.car_at(1);
+        format!("bot  {:>5.1} m/s   boost {:>3.0}\n", bot.speed, bot.boost)
+    } else {
+        String::new()
+    };
 }
 
 /// Fill the bottom-right bar and its number from the car's boost (0..100).

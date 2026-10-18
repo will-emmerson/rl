@@ -23,6 +23,79 @@ cargo run --release -p rl_view   # smoother, but the first run rebuilds Bevy
 The dev profile is set up to be playable (this crate at `opt-level = 1`, all
 dependencies at `opt-level = 3`), so plain `cargo run` is the one to reach for.
 
+### Play against an RLBot v5 bot
+
+The viewer can expose the bot-facing half of RLBot v5 over TCP, so ordinary
+RLBot v5 bots can connect directly to the RocketSim simulation. RLBotServer,
+Rocket League and the closed-source `Bridge.dll` are **not** involved.
+
+```sh
+# terminal 1: human on Blue, a bot slot on Orange, listening on 23234
+cargo run -p rl_view -- --rlbot
+
+# terminal 2: install the v5 Python interface (the stable `rlbot` on PyPI is
+# still v4, so ask pip for the pre-release) and connect the test bot
+python3 -m venv /tmp/rlbot-venv
+/tmp/rlbot-venv/bin/pip install --pre "rlbot==2.0.0b56"
+RLBOT_SERVER_IP=127.0.0.1 RLBOT_SERVER_PORT=23234 \
+  RLBOT_AGENT_ID=rlbot/opponent \
+  /tmp/rlbot-venv/bin/python tools/rlbot_test_bot.py
+```
+
+The viewer can also start the bot itself, so no second terminal is needed:
+
+```sh
+# A bot name from the installed botpack is enough: it is matched against the
+# bot's directory, config filename, display name and agent id. A bot directory
+# or a bot.toml path works too.
+cargo run -p rl_view -- --rlbot --rlbot-config Nexto
+cargo run -p rl_view -- --rlbot \
+  --rlbot-config ~/.local/share/RLBot5/bots/bob_build_x86_64-linux/Nexto/bot.toml
+
+# Or run any shell command. The viewer supplies RLBOT_SERVER_IP,
+# RLBOT_SERVER_PORT and RLBOT_AGENT_ID in its environment.
+cargo run -p rl_view -- --rlbot --rlbot-command "python src/bot.py" --rlbot-dir /tmp/bot
+```
+
+A bare name is looked up under the RLBot botpack root, `$XDG_DATA_HOME/RLBot5/bots`
+(or `~/.local/share/RLBot5/bots`) on Linux and `%LOCALAPPDATA%\RLBot5\bots` on
+Windows. It is case-insensitive and accepts `Nexto`, `rlgym/nexto`, `nexto`, …;
+if two bots match, the viewer lists them instead of guessing.
+
+`--rlbot-config` reads the `[settings]` section (`name`, `agent_id`,
+`run_command_linux`/`run_command`, `root_dir`, `environment`) and adds the
+botpack's shared `torch-archive` to `LD_LIBRARY_PATH` when it finds one, which
+is what the RLBot GUI does for ML bots. Explicit `--rlbot-agent-id` and
+`--rlbot-name` override the config. Either launch flag implies `--rlbot`, and
+the bot process is killed when the viewer exits.
+
+The bot sees the normal `MatchConfiguration`, `FieldInfo`, `GamePacket` and
+(if it asks) `BallPrediction`, and sends `PlayerInput` back. `tools/rlbot_test_bot.py`
+is deliberately tiny; a real bot connects the same way. Useful flags:
+
+| Flag                  | Meaning                                                                 |
+| --------------------- | ----------------------------------------------------------------------- |
+| `--rlbot`             | Start the bridge and add an Orange opponent.                            |
+| `--rlbot-port PORT`   | TCP port (default `23234`).                                             |
+| `--rlbot-agent-id ID` | Agent id the bot must announce (default `rlbot/opponent`).              |
+| `--rlbot-name NAME`   | Display name in the match configuration (default `RLBot`).              |
+| `--rlbot-command CMD` | Shell command to start as the bot. Implies `--rlbot`.                   |
+| `--rlbot-config SPEC` | Bot name, directory or `bot.toml` to read and start. Implies `--rlbot`. |
+| `--rlbot-dir DIR`     | Working directory for the launched bot (defaults to its toml's).        |
+
+The [RLBot GUI](https://rlbot.org/) is the easiest way to get compiled bots
+without setting up each bot's runtime: its official botpack installs to
+`~/.local/share/RLBot5/bots` on Linux, and every bot has a `*.bot.toml` or
+`bot.toml` that `--rlbot-config` can read. The GUI's own "Start Match" cannot
+drive this viewer (it talks to RLBotServer), and RLBotServer occupies port
+23234, so quit the GUI before playing against the bridge or start the viewer
+with a different `--rlbot-port`.
+
+The bridge is deliberately an MVP: one bot, no match orchestration, no
+debug rendering, match comms or state setting, and a `Kickoff` phase that lasts
+one second after every reset. The RLBot v5 protocol is still pre-release, so
+pin a client version you have tested.
+
 ### RocketSim physics
 
 The viewer's physics come from
@@ -120,6 +193,7 @@ and pick one, or `task: rerun` to repeat the last one.
 | Task                                  | What it does                                       |
 | ------------------------------------- | -------------------------------------------------- |
 | `RL: play 3D (Bevy)`                  | the viewer                                         |
+| `RL: play 3D (Bevy, RLBot slot)`      | the viewer with a bot slot on port 23234           |
 | `RL: play 3D (Bevy, release)`         | same, optimised (first run rebuilds Bevy: minutes) |
 | `RL: play 3D (Bevy, gamepad debug)`   | viewer, plus a log of every pad event              |
 | `RL: gamepad probe (mapping report)`  | how gilrs mapped the connected pad                 |
@@ -198,12 +272,15 @@ lighting and camera framing, not a dynamic pose. The tick is ignored when
 ## Layout
 
 ```
-Cargo.toml        virtual workspace; the game crate is `view`
+Cargo.toml        virtual workspace; `view/` is the game and `rlbot_bridge/` the bot API
 camera.toml       camera settings, hot-reloaded (RL defaults; see the file)
 view/             the game: Bevy 3D viewer + RocketSim (`rl_view`)
   src/main.rs     scene, input, camera, HUD
   src/sim.rs      the RocketSim backend (the only place that knows about it)
+  src/rlbot.rs    viewer-side bridge resource and input plumbing
+rlbot_bridge/     RLBot v5 bot-facing TCP/FlatBuffers server (no Bevy)
 tools/rlacd.py    Linux/Proton arena-mesh dumper (a RLArenaCollisionDumper port)
+tools/rlbot_test_bot.py  minimal RLBot v5 Python bot for exercising the bridge
 docs/             the retired-sim write-up (PHYSICS.md) and the screenshot above
 ```
 
