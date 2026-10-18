@@ -344,6 +344,13 @@ struct ChaseCam;
 #[derive(Component)]
 struct HudText;
 
+/// The two goal totals in the top-centre scoreboard.
+#[derive(Component)]
+struct BlueScoreText;
+
+#[derive(Component)]
+struct OrangeScoreText;
+
 /// The boost meter's numbered readout and its fill bar, bottom right as in RL.
 #[derive(Component)]
 struct BoostMeterText;
@@ -1292,12 +1299,74 @@ fn setup_scene(
         Text::default(),
         Node {
             position_type: PositionType::Absolute,
-            top: px(12),
+            top: px(64),
             left: px(12),
             ..default()
         },
-        children![TextSpan::new(""), TextSpan::new(""), TextSpan::new("")],
+        children![TextSpan::new(""), TextSpan::new("")],
         HudText,
+    ));
+
+    // RL's scoreboard sits top-centre: a team-coloured panel per side with the
+    // goals scored. `update_hud` fills in the numbers.
+    commands.spawn((
+        Node {
+            position_type: PositionType::Absolute,
+            top: px(12),
+            left: px(0),
+            right: px(0),
+            justify_content: JustifyContent::Center,
+            ..default()
+        },
+        children![(
+            Node {
+                flex_direction: FlexDirection::Row,
+                align_items: AlignItems::Center,
+                column_gap: px(8),
+                ..default()
+            },
+            children![
+                (
+                    Node {
+                        width: px(96),
+                        height: px(44),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border_radius: BorderRadius::all(px(6)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(0.20, 0.45, 0.95)),
+                    children![(
+                        Text::new("0"),
+                        TextFont::from_font_size(28.0),
+                        TextColor(Color::WHITE),
+                        BlueScoreText,
+                    )],
+                ),
+                (
+                    Text::new("-"),
+                    TextFont::from_font_size(22.0),
+                    TextColor(Color::srgba(0.85, 0.9, 1.0, 0.75)),
+                ),
+                (
+                    Node {
+                        width: px(96),
+                        height: px(44),
+                        justify_content: JustifyContent::Center,
+                        align_items: AlignItems::Center,
+                        border_radius: BorderRadius::all(px(6)),
+                        ..default()
+                    },
+                    BackgroundColor(Color::srgb(1.00, 0.45, 0.12)),
+                    children![(
+                        Text::new("0"),
+                        TextFont::from_font_size(28.0),
+                        TextColor(Color::WHITE),
+                        OrangeScoreText,
+                    )],
+                ),
+            ],
+        )],
     ));
 
     // RL's boost gauge lives in the bottom-right corner. The fill is a plain
@@ -2961,20 +3030,23 @@ fn update_hud(
     sim: Res<Sim>,
     ball_cam: Res<BallCam>,
     hud: Single<Entity, With<HudText>>,
+    blue_score: Single<Entity, With<BlueScoreText>>,
+    orange_score: Single<Entity, With<OrangeScoreText>>,
     mut writer: TextUiWriter,
 ) {
     let entity = *hud;
     let car = sim.0.car();
     let ball = sim.0.ball();
     let score = sim.0.score();
-    *writer.text(entity, 1) = format!("BLUE {:>2} - {:<2} ORANGE\n", score[0], score[1]);
-    *writer.text(entity, 2) = format!(
+    *writer.text(*blue_score, 0) = score[0].to_string();
+    *writer.text(*orange_score, 0) = score[1].to_string();
+    *writer.text(entity, 1) = format!(
         "speed {:>5.1} m/s   tick {:>6}   cam {}\n",
         car.speed,
         sim.0.tick(),
         if ball_cam.0 { "ball" } else { "car" }
     );
-    *writer.text(entity, 3) = format!(
+    *writer.text(entity, 2) = format!(
         "ball {:>5.1} m/s   height {:>5.2} m   spin {:>5.1} rad/s\n",
         ball.speed,
         ball.pos.y,
