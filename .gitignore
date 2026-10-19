@@ -1,6 +1,9 @@
 # Rust build output
 target/
 
+# Scratch screenshots (tools/shot.sh writes here).
+screenshots/
+
 # Rocket League's arena collision meshes (dumped by tools/rlacd.py). RL assets,
 # not ours to redistribute — keep them out of the repo.
 collision_meshes/

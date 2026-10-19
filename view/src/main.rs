@@ -65,10 +65,14 @@ const ARENA_HEIGHT: f32 = 20.48;
 const GRID_DEPTH: f32 = 0.03;
 const GRID_BEAM: f32 = 0.14;
 
-/// World size of one repeat of the wall chain-link texture, in metres. Small
-/// cells are the point: a chase camera on a wall is only ~20 cm from it, so a
-/// fine pattern still shows several cells, while metre-scale ribs do not.
-const WALL_TEX_WORLD: f32 = 1.0;
+/// World size of one repeat of the arena glass texture, in metres. The texture
+/// is a hex lattice, and the same texture is used at two scales: a fine mesh on
+/// the walls, where a chase camera can be 20 cm away, and large hexagonal panels
+/// on the roof, matching RL's ceiling. Four metres puts a wall hex at ~44 cm;
+/// the roof uses [`CEILING_TEX_WORLD`].
+const WALL_TEX_WORLD: f32 = 4.0;
+/// Roof repeat, in metres. Large hexes, like the ones in RL's dome.
+const CEILING_TEX_WORLD: f32 = 20.0;
 
 /// The pitch is a single quad laid just above the collision floor. The offset
 /// only has to beat z-fighting, not fill a hole: the collision floor is beneath
@@ -88,6 +92,38 @@ const CENTER_CIRCLE_RADIUS: f32 = 9.0;
 /// Goal box: how far it reaches into the pitch, and how far past each post.
 const GOAL_BOX_DEPTH: f32 = 8.0;
 const GOAL_BOX_MARGIN: f32 = 2.5;
+// Corner arcs painted on the pitch, in metres. RL's markings turn the corner
+// where the touchline meets the goal line.
+const PITCH_CORNER_RADIUS: f32 = 2.0;
+/// How far the team wash reaches in from each end wall, in metres. The goal
+/// box sits inside this, so the ends read blue/orange across the full width
+/// without losing the green pitch in midfield.
+const TEAM_WASH_DEPTH: f32 = 24.0;
+/// Strength of that wash at the end wall. The goal box is stronger still.
+const TEAM_WASH_STRENGTH: f32 = 0.45;
+
+/// The curved wall base: RL's floor-to-wall fillet is a 2.5 m quarter circle,
+/// and the coloured boards follow it rather than standing on the flat wall. A
+/// board placed at the wall plane would float over the ramp and foul the car.
+const BOARD_FILLET_RADIUS: f32 = 2.5;
+/// The pitch is a rounded rectangle in plan too: the straight walls stop 12.8 m
+/// short of the corner, which is where the corner arc begins.
+const BOARD_CORNER_RADIUS: f32 = 12.8;
+/// The team-coloured band on the base boards, in metres above the floor. It sits
+/// on the upper part of the fillet, leaving a green lip at the foot of the wall.
+const BOARD_BOTTOM: f32 = 0.28;
+const BOARD_TOP: f32 = 1.50;
+/// A bright trim line and a dark capping rail above the team band.
+const BOARD_TRIM_TOP: f32 = 1.57;
+const BOARD_RAIL_TOP: f32 = 1.68;
+/// How far the boards float off the collision surface, in metres. Enough to
+/// beat z-fighting without letting the car clip them.
+const BOARD_LIFT: f32 = 0.018;
+
+/// Floodlight masts at the four corners. They stand just outside the shell, so
+/// they read through the glass but never intrude on the play volume.
+const LIGHT_TOWER_OFFSET: f32 = 0.8;
+const LIGHT_TOWER_HEIGHT: f32 = 25.0;
 
 /// Visual wheel radius, in metres. A fraction of the hitbox half height, so the
 /// tyre reaches the hitbox floor.
@@ -1148,8 +1184,14 @@ fn setup_scene(
         Mesh3d(meshes.add(arena_surface_mesh())),
         MeshMaterial3d(materials.add(StandardMaterial {
             base_color: Color::WHITE,
-            base_color_texture: Some(images.add(wall_detail_texture())),
-            perceptual_roughness: 0.9,
+            base_color_texture: Some(images.add(arena_detail_texture())),
+            perceptual_roughness: 0.55,
+            // RL's walls and roof are dark glass with a bright lattice, not an
+            // opaque box. The texture's alpha carries the difference: the hex
+            // panels are almost clear, the lattice is nearly solid. That keeps
+            // the cage readable from inside while still letting the camera see
+            // through it from the walls and roof.
+            alpha_mode: AlphaMode::Blend,
             // The shell is a cage the camera can see through from outside: the
             // mesh is wound so its front faces inward, so back-face culling hides
             // it from outside and the camera may leave the arena (see
@@ -1157,6 +1199,10 @@ fn setup_scene(
             cull_mode: Some(Face::Back),
             ..default()
         })),
+        // The shell is glass, but the shadow pass ignores alpha and would treat it
+        // as a solid box: the goal recess in particular threw a black slab across
+        // the goal box. Only opaque objects (cars, ball, goal frame) cast shadows.
+        NotShadowCaster,
     ));
 
     // --- pitch ---
@@ -1169,6 +1215,25 @@ fn setup_scene(
             perceptual_roughness: 0.95,
             ..default()
         })),
+    ));
+
+    // --- wall base boards ---
+    // A low, team-coloured band skirting the whole arena, following the curved
+    // wall base. This is the single biggest cue that the cage has a floor: the
+    // glass above it is nearly clear, so without a solid base the walls appear
+    // to float. Blue takes the -Z half, orange the +Z half, as in RL.
+    commands.spawn((
+        Mesh3d(meshes.add(arena_boards_mesh())),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::WHITE,
+            perceptual_roughness: 0.7,
+            metallic: 0.15,
+            // The band wraps the fillet, so it is seen from odd angles while
+            // driving on a wall; do not let a winding slip hide part of it.
+            cull_mode: None,
+            ..default()
+        })),
+        NotShadowCaster,
     ));
 
     // --- wall and ceiling grid ---
@@ -1186,6 +1251,50 @@ fn setup_scene(
             emissive: LinearRgba::rgb(0.035, 0.040, 0.050),
             ..default()
         })),
+        NotShadowCaster,
+    ));
+
+    // --- ceiling lights and corner floodlights ---
+    // RL's roof is not blank: it has light banks and corner floodlights. Both are
+    // emissive geometry rather than real lights, so the cost stays at a couple of
+    // draw calls and the lighting rig does not change. They are also what gives
+    // the transparent roof something to read against.
+    let ceiling_lights_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.95, 0.97, 1.0),
+        // Bright on the HDR target but below the bloom prefilter, so the strips
+        // read as white light without blooming the whole roof.
+        emissive: LinearRgba::rgb(3.2, 3.5, 4.0),
+        perceptual_roughness: 0.5,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(ceiling_lights_mesh())),
+        MeshMaterial3d(ceiling_lights_mat),
+        NotShadowCaster,
+    ));
+
+    let tower_frame_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(0.46, 0.49, 0.55),
+        metallic: 0.6,
+        perceptual_roughness: 0.45,
+        ..default()
+    });
+    let tower_lamp_mat = materials.add(StandardMaterial {
+        base_color: Color::srgb(1.0, 0.97, 0.88),
+        // Just clears the bloom threshold (6.0) so the lamp heads glow, like the
+        // big boost pads, without washing the arena out.
+        emissive: LinearRgba::rgb(7.5, 7.0, 6.0),
+        perceptual_roughness: 0.35,
+        ..default()
+    });
+    commands.spawn((
+        Mesh3d(meshes.add(light_tower_frame_mesh())),
+        MeshMaterial3d(tower_frame_mat),
+        NotShadowCaster,
+    ));
+    commands.spawn((
+        Mesh3d(meshes.add(light_tower_lamp_mesh())),
+        MeshMaterial3d(tower_lamp_mat),
         NotShadowCaster,
     ));
 
@@ -1568,6 +1677,10 @@ fn setup_scene(
             MeshMaterial3d(net_mat.clone()),
             Transform::from_xyz(0.0, h * 0.5, sign * (ARENA_HALF_Z + GOAL_DEPTH - 0.15))
                 .with_rotation(Quat::from_rotation_y(if sign > 0.0 { PI } else { 0.0 })),
+            // The mesh is alpha-blended and mostly empty; the shadow pass still
+            // treats it as a solid quad and throws a black slab across the goal
+            // box. The frame casts the useful shadow.
+            NotShadowCaster,
         ));
     }
 
@@ -2116,8 +2229,12 @@ fn arena_surface_mesh() -> Mesh {
     let centre = (lo + hi) * 0.5;
 
     let floor_color = linear_rgba(0.20, 0.46, 0.27);
-    let wall_color = linear_rgba(0.34, 0.38, 0.46);
-    let ceiling_color = linear_rgba(0.15, 0.17, 0.21);
+    // The glass texture darkens the panels and brightens the lattice, so the
+    // region colours here are the lattice's colour. The roof is slightly darker
+    // than the walls, as in RL, but not black: with transparency the background
+    // already supplies the darkness.
+    let wall_color = linear_rgba(0.40, 0.45, 0.55);
+    let ceiling_color = linear_rgba(0.30, 0.34, 0.42);
     let blue_team = linear_rgba(0.10, 0.30, 0.82);
     let orange_team = linear_rgba(0.92, 0.36, 0.08);
 
@@ -2157,10 +2274,20 @@ fn arena_surface_mesh() -> Mesh {
         };
         uvs.push([u / WALL_TEX_WORLD, w / WALL_TEX_WORLD]);
 
+        // The roof uses the same lattice at a much larger scale, so the walls
+        // read as fine mesh and the roof as big hex panels. The switch happens
+        // on the roof fillet, out of the way at the top of the cage.
+        let ceiling = smoothstep(0.55, 0.90, -n.y);
+        if ceiling > 0.5 {
+            // The projection in this branch is (x, z), so the scaling only needs
+            // the roof's repeat.
+            let i = uvs.len() - 1;
+            uvs[i] = [u / CEILING_TEX_WORLD, w / CEILING_TEX_WORLD];
+        }
+
         // Blend floor -> wall -> roof by how directly the surface faces up or
         // down. The fillets between them get a smooth transition for free.
         let floor = smoothstep(0.55, 0.90, n.y);
-        let ceiling = smoothstep(0.55, 0.90, -n.y);
         let mut color = lerp_rgba(wall_color, floor_color, floor);
         color = lerp_rgba(color, ceiling_color, ceiling);
 
@@ -2169,14 +2296,14 @@ fn arena_surface_mesh() -> Mesh {
         // reach the ends, and tinting them smeared a band up each side. It fades
         // out toward the corners and the roof.
         let endness = ((v.z.abs() - 0.65 * ARENA_HALF_Z) / (0.35 * ARENA_HALF_Z)).clamp(0.0, 1.0);
-        let low = ((5.0 - v.y) / 5.0).clamp(0.0, 1.0);
+        let low = ((7.0 - v.y) / 7.0).clamp(0.0, 1.0);
         // The goal-recess floor is upward-facing, so include it explicitly; it
         // otherwise stays grass-green inside the net.
         let in_recess = v.z.abs() > ARENA_HALF_Z && v.y < 0.5;
         let end_facing = smoothstep(0.55, 0.9, n.z.abs()).max(if in_recess { 1.0 } else { 0.0 });
         let accent = endness * low * end_facing * (1.0 - ceiling);
         let team = if v.z < 0.0 { blue_team } else { orange_team };
-        color = lerp_rgba(color, team, 0.5 * accent);
+        color = lerp_rgba(color, team, 0.75 * accent);
         colors.push(color);
     }
 
@@ -2206,14 +2333,27 @@ fn pitch_mesh() -> Mesh {
     let y_box = PITCH_OFFSET + 0.001;
     let y_line = PITCH_OFFSET + 0.002;
 
-    let light = linear_rgba(0.24, 0.54, 0.30);
-    let dark = linear_rgba(0.17, 0.41, 0.22);
+    // Four green tones, not two. The checkerboard stays, but each square picks
+    // one of two shades for its parity and darkens toward the touchlines, so the
+    // pitch has the patchy, mown look of RL's turf instead of flat vector art.
+    let light = [linear_rgba(0.30, 0.62, 0.35), linear_rgba(0.25, 0.56, 0.30)];
+    let dark = [linear_rgba(0.15, 0.38, 0.21), linear_rgba(0.12, 0.33, 0.18)];
+    let edge_green = linear_rgba(0.08, 0.25, 0.14);
     let line = linear_rgba(0.88, 0.93, 0.87);
-    // Goal-box fills. These are the same sRGB mixes the old pitch texture used,
-    // not linear blends of the team colours: linear blending pushes a saturated
-    // blue/orange much too hard and the box reads as a painted slab.
-    let blue_fill = linear_rgba(0.20, 0.47, 0.46);
-    let orange_fill = linear_rgba(0.46, 0.50, 0.25);
+    // Team targets for the end-zone wash and the painted apron outside the
+    // touchlines. They are intentionally deeper than the goal-box fill: the box
+    // is the strongest team colour, the apron the most graphic, and this wash the
+    // transition between the coloured end and the green middle.
+    let blue_wash = linear_rgba(0.10, 0.30, 0.50);
+    let orange_wash = linear_rgba(0.62, 0.38, 0.12);
+    let blue_apron = linear_rgba(0.08, 0.24, 0.54);
+    let orange_apron = linear_rgba(0.66, 0.28, 0.05);
+    // Goal-box fills, stronger at the goal line and fading toward the pitch so
+    // they read as painted turf rather than a flat coloured slab.
+    let blue_fill = linear_rgba(0.06, 0.24, 0.66);
+    let blue_fill_front = linear_rgba(0.14, 0.39, 0.39);
+    let orange_fill = linear_rgba(0.84, 0.30, 0.03);
+    let orange_fill_front = linear_rgba(0.56, 0.43, 0.15);
 
     let mut pitch = PitchMesh::new();
 
@@ -2225,7 +2365,26 @@ fn pitch_mesh() -> Mesh {
         for iz in 0..nz {
             let x0 = -ARENA_HALF_X + ix as f32 * PITCH_TILE;
             let z0 = -ARENA_HALF_Z + iz as f32 * PITCH_TILE;
-            let color = if (ix + iz) & 1 == 0 { light } else { dark };
+            let parity = ((ix + iz) & 1) as usize;
+            // A cheap deterministic hash picks one of the two shades for this
+            // parity. It must not animate or use the RNG: the pitch is built once.
+            let pick = ((ix.rem_euclid(7) * 3 + iz.rem_euclid(5)) & 1) as usize;
+            let mut color = if parity == 0 { light[pick] } else { dark[pick] };
+            // Darken the apron outside the touchline rather than tinting the
+            // whole tile: the boundary sits only 1.2 m in, well inside a tile.
+            let cx = (x0 + PITCH_TILE * 0.5).abs();
+            let cz = (z0 + PITCH_TILE * 0.5).abs();
+            let d = (ARENA_HALF_X - cx).min(ARENA_HALF_Z - cz);
+            let edge = (1.0 - d / 12.0).clamp(0.0, 1.0);
+            color = lerp_rgba(color, edge_green, 0.35 * smoothstep(0.0, 1.0, edge));
+            // Fade each end toward its team colour. Doing it in the tile colours
+            // keeps the mow pattern underneath and avoids a transparent overlay
+            // layer on the pitch.
+            let zc = z0 + PITCH_TILE * 0.5;
+            let depth = (ARENA_HALF_Z - zc.abs()).max(0.0);
+            let wash = (1.0 - depth / TEAM_WASH_DEPTH).clamp(0.0, 1.0) * TEAM_WASH_STRENGTH;
+            let wash_color = if zc < 0.0 { blue_wash } else { orange_wash };
+            color = lerp_rgba(color, wash_color, wash);
             pitch.rect(x0, z0, x0 + PITCH_TILE, z0 + PITCH_TILE, y_grass, color);
         }
     }
@@ -2236,25 +2395,59 @@ fn pitch_mesh() -> Mesh {
     let goal_half_d = GOAL_BOX_DEPTH * 0.5;
     let goal_centre = goal_line - goal_half_d;
 
-    // Team-tinted goal box floor, then the white markings on top.
-    for (sign, fill) in [(-1.0_f32, blue_fill), (1.0_f32, orange_fill)] {
+    // Painted apron between the touchline/goal line and the walls. It is split at
+    // the halfway line on the sides (blue -Z, orange +Z) and team-coloured end to
+    // end behind each goal, which is the strongest colour cue on the floor.
+    let y_apron = PITCH_OFFSET + 0.0005;
+    for (x0, x1) in [(-ARENA_HALF_X, -touch), (touch, ARENA_HALF_X)] {
+        pitch.rect(x0, -ARENA_HALF_Z, x1, 0.0, y_apron, blue_apron);
+        pitch.rect(x0, 0.0, x1, ARENA_HALF_Z, y_apron, orange_apron);
+    }
+    for (z0, z1, color) in [
+        (-ARENA_HALF_Z, -goal_line, blue_apron),
+        (goal_line, ARENA_HALF_Z, orange_apron),
+    ] {
+        pitch.rect(-touch, z0, touch, z1, y_apron, color);
+    }
+
+    // Team-tinted goal box floor, then the white markings on top. The tint is
+    // strongest at the goal line and fades into the grass at the box's front.
+    for (sign, back, front) in [
+        (-1.0_f32, blue_fill, blue_fill_front),
+        (1.0, orange_fill, orange_fill_front),
+    ] {
         let zc = sign * goal_centre;
-        pitch.rect(
+        // Corner order is (x0,z0), (x1,z0), (x1,z1), (x0,z1). The goal line is
+        // the high-z edge for +Z and the low-z edge for -Z.
+        let colors = if sign > 0.0 {
+            [front, front, back, back]
+        } else {
+            [back, back, front, front]
+        };
+        pitch.rect_gradient(
             -goal_half_w,
             zc - goal_half_d,
             goal_half_w,
             zc + goal_half_d,
             y_box,
-            fill,
+            colors,
         );
     }
 
     // Touchline and goal line: one inset rectangle around the pitch.
     pitch.rect_outline((0.0, 0.0), (touch, goal_line), y_line, line);
 
-    // Halfway line, then the centre circle and spot.
+    // Halfway line, then the centre circle and spot. The line runs through the
+    // painted apron to the boards, so the blue/orange split reads as deliberate.
     let half_line = PITCH_LINE_WIDTH * 0.5;
-    pitch.rect(-touch, -half_line, touch, half_line, y_line, line);
+    pitch.rect(
+        -ARENA_HALF_X,
+        -half_line,
+        ARENA_HALF_X,
+        half_line,
+        y_line,
+        line,
+    );
     pitch.ring(CENTER_CIRCLE_RADIUS, half_line, y_line, line);
     pitch.disc(0.30, y_line, line);
 
@@ -2267,6 +2460,21 @@ fn pitch_mesh() -> Mesh {
             y_line,
             line,
         );
+    }
+
+    // Corner arcs, where the touchline turns into the goal line.
+    let arc_radius = PITCH_CORNER_RADIUS;
+    let arc_half = PITCH_LINE_WIDTH * 0.5;
+    for (sx, sz) in [(-1.0_f32, -1.0_f32), (-1.0, 1.0), (1.0, -1.0), (1.0, 1.0)] {
+        let centre = (sx * touch, sz * goal_line);
+        // Pick the quarter of the circle that curves into the pitch.
+        let (a0, a1) = match (sx > 0.0, sz > 0.0) {
+            (true, true) => (PI, 1.5 * PI),
+            (false, true) => (1.5 * PI, 2.0 * PI),
+            (false, false) => (0.0, 0.5 * PI),
+            (true, false) => (0.5 * PI, PI),
+        };
+        pitch.arc(centre, arc_radius, a0, a1, arc_half, y_line, line);
     }
 
     pitch.into_mesh()
@@ -2309,6 +2517,19 @@ impl PitchMesh {
         self.quad(pitch_rect(x0, z0, x1, z1, y), color);
     }
 
+    /// Like [`Self::rect`], but with one colour per corner. The corner order is
+    /// `(x0,z0), (x1,z0), (x1,z1), (x0,z1)`.
+    fn rect_gradient(&mut self, x0: f32, z0: f32, x1: f32, z1: f32, y: f32, colors: [[f32; 4]; 4]) {
+        let base = self.positions.len() as u32;
+        for (corner, color) in pitch_rect(x0, z0, x1, z1, y).into_iter().zip(colors) {
+            self.positions.push(corner.to_array());
+            self.normals.push([0.0, 1.0, 0.0]);
+            self.colors.push(color);
+        }
+        self.indices
+            .extend_from_slice(&[base, base + 2, base + 1, base, base + 3, base + 2]);
+    }
+
     /// Outline a rectangle with four quads of width `PITCH_LINE_WIDTH`, centred
     /// on its edges. The long edges take the corners, so they meet cleanly
     /// without overlapping quads.
@@ -2331,19 +2552,49 @@ impl PitchMesh {
     /// A flat ring of `radius` and line width `2 * half_width`, as a strip of
     /// quads.
     fn ring(&mut self, radius: f32, half_width: f32, y: f32, color: [f32; 4]) {
+        self.arc(
+            (0.0, 0.0),
+            radius,
+            0.0,
+            std::f32::consts::TAU,
+            half_width,
+            y,
+            color,
+        );
+    }
+
+    /// A flat arc of `radius`, from `a0` to `a1` radians, as a strip of quads.
+    #[allow(clippy::too_many_arguments)]
+    fn arc(
+        &mut self,
+        (cx, cz): (f32, f32),
+        radius: f32,
+        a0: f32,
+        a1: f32,
+        half_width: f32,
+        y: f32,
+        color: [f32; 4],
+    ) {
         const SEGMENTS: usize = 48;
         let (inner, outer) = (radius - half_width, radius + half_width);
-        for i in 0..SEGMENTS {
-            let a0 = i as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
-            let a1 = (i + 1) as f32 / SEGMENTS as f32 * std::f32::consts::TAU;
-            let (c0, s0) = (a0.cos(), a0.sin());
-            let (c1, s1) = (a1.cos(), a1.sin());
+        // Keep the tessellation proportional for short corner arcs; a 48-segment
+        // quarter circle is wasted geometry.
+        let segments = (((a1 - a0).abs() / std::f32::consts::TAU) * SEGMENTS as f32)
+            .ceil()
+            .max(4.0) as usize;
+        for i in 0..segments {
+            let t0 = i as f32 / segments as f32;
+            let t1 = (i + 1) as f32 / segments as f32;
+            let astart = a0 + (a1 - a0) * t0;
+            let aend = a0 + (a1 - a0) * t1;
+            let (c0, s0) = (astart.cos(), astart.sin());
+            let (c1, s1) = (aend.cos(), aend.sin());
             self.quad(
                 [
-                    Vec3::new(inner * c0, y, inner * s0),
-                    Vec3::new(outer * c0, y, outer * s0),
-                    Vec3::new(outer * c1, y, outer * s1),
-                    Vec3::new(inner * c1, y, inner * s1),
+                    Vec3::new(cx + inner * c0, y, cz + inner * s0),
+                    Vec3::new(cx + outer * c0, y, cz + outer * s0),
+                    Vec3::new(cx + outer * c1, y, cz + outer * s1),
+                    Vec3::new(cx + inner * c1, y, cz + inner * s1),
                 ],
                 color,
             );
@@ -2570,32 +2821,586 @@ fn push_detail_quad(
     indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
 }
 
-/// A small tiling chain-link pattern for the walls and ceiling. It is a
-/// multiply map: white lets the region colour through, the lattice lines darken
-/// it. At 128 px across one metre the diamonds are ~25 cm, so a chase camera
-/// only 20 cm from a wall still sees several cells - which is exactly what the
-/// metre-scale ribs cannot give at that angle.
-fn wall_detail_texture() -> Image {
-    const SIZE: usize = 128;
-    const CELL: usize = 32;
-    const LINE: usize = 2;
+/// One point on the arena's base path, already inset from the wall by the
+/// fillet profile. `inward` is the unit horizontal direction toward the pitch.
+#[derive(Clone, Copy)]
+struct PerimeterPoint {
+    pos: Vec2,
+    inward: Vec2,
+}
+
+/// A straight run or corner arc of the rounded-rectangle perimeter. Sections are
+/// sampled independently: the goal mouths are gaps, so there is no single closed
+/// polyline. The same section (and therefore the same point count) is sampled at
+/// every height of the board profile, which keeps the quads connected.
+enum PerimeterSection {
+    Line {
+        from: Vec2,
+        to: Vec2,
+        inward: Vec2,
+        steps: usize,
+    },
+    Arc {
+        center: Vec2,
+        radius: f32,
+        a0: f32,
+        a1: f32,
+        steps: usize,
+    },
+}
+
+impl PerimeterSection {
+    /// Sample this section `inset` metres in from the nominal wall plane. The
+    /// corner radius shrinks by the inset, exactly as a parallel offset of a
+    /// rounded rectangle does, so every profile level lands on the collision
+    /// surface.
+    fn sample(&self, inset: f32) -> Vec<PerimeterPoint> {
+        match *self {
+            Self::Line {
+                from,
+                to,
+                inward,
+                steps,
+            } => {
+                let from = from + inward * inset;
+                let to = to + inward * inset;
+                (0..=steps)
+                    .map(|i| {
+                        let t = i as f32 / steps as f32;
+                        PerimeterPoint {
+                            pos: from.lerp(to, t),
+                            inward,
+                        }
+                    })
+                    .collect()
+            }
+            Self::Arc {
+                center,
+                radius,
+                a0,
+                a1,
+                steps,
+            } => {
+                let radius = (radius - inset).max(0.0);
+                (0..=steps)
+                    .map(|i| {
+                        let t = i as f32 / steps as f32;
+                        let angle = a0 + (a1 - a0) * t;
+                        let (sin, cos) = angle.sin_cos();
+                        let outward = Vec2::new(cos, sin);
+                        PerimeterPoint {
+                            pos: center + outward * radius,
+                            inward: -outward,
+                        }
+                    })
+                    .collect()
+            }
+        }
+    }
+}
+
+/// The arena perimeter split into the straight side walls, the end-wall pieces
+/// beside each goal mouth, and the four corner arcs. `BOARD_CORNER_RADIUS` is
+/// where the straight walls stop, matching the collision mesh's rounded corners.
+fn perimeter_sections() -> Vec<PerimeterSection> {
+    let w = ARENA_HALF_X;
+    let l = ARENA_HALF_Z;
+    let r = BOARD_CORNER_RADIUS;
+    // The tangency points where the straight walls become corner arcs.
+    let sx = w - r;
+    let sz = l - r;
+    let goal = GOAL_HALF_WIDTH;
+    // Roughly 4 m of board per segment on the sides, 2.5 m on the ends.
+    let side_steps = 20;
+    let end_steps = 8;
+    let arc_steps = 6;
+    vec![
+        PerimeterSection::Line {
+            from: Vec2::new(w, -sz),
+            to: Vec2::new(w, sz),
+            inward: Vec2::NEG_X,
+            steps: side_steps,
+        },
+        PerimeterSection::Line {
+            from: Vec2::new(-w, sz),
+            to: Vec2::new(-w, -sz),
+            inward: Vec2::X,
+            steps: side_steps,
+        },
+        // +Z end wall, split at the goal mouth.
+        PerimeterSection::Line {
+            from: Vec2::new(sx, l),
+            to: Vec2::new(goal, l),
+            inward: Vec2::NEG_Y,
+            steps: end_steps,
+        },
+        PerimeterSection::Line {
+            from: Vec2::new(-goal, l),
+            to: Vec2::new(-sx, l),
+            inward: Vec2::NEG_Y,
+            steps: end_steps,
+        },
+        // -Z end wall.
+        PerimeterSection::Line {
+            from: Vec2::new(goal, -l),
+            to: Vec2::new(sx, -l),
+            inward: Vec2::Y,
+            steps: end_steps,
+        },
+        PerimeterSection::Line {
+            from: Vec2::new(-sx, -l),
+            to: Vec2::new(-goal, -l),
+            inward: Vec2::Y,
+            steps: end_steps,
+        },
+        // Corner arcs, wound so their inward normals meet the wall sections.
+        PerimeterSection::Arc {
+            center: Vec2::new(sx, sz),
+            radius: r,
+            a0: 0.0,
+            a1: PI * 0.5,
+            steps: arc_steps,
+        },
+        PerimeterSection::Arc {
+            center: Vec2::new(sx, -sz),
+            radius: r,
+            a0: -PI * 0.5,
+            a1: 0.0,
+            steps: arc_steps,
+        },
+        PerimeterSection::Arc {
+            center: Vec2::new(-sx, sz),
+            radius: r,
+            a0: PI * 0.5,
+            a1: PI,
+            steps: arc_steps,
+        },
+        PerimeterSection::Arc {
+            center: Vec2::new(-sx, -sz),
+            radius: r,
+            a0: PI,
+            a1: 1.5 * PI,
+            steps: arc_steps,
+        },
+    ]
+}
+
+/// One cross-section of the base boards: height, horizontal inset from the wall
+/// plane, and the surface normal's inward/up components. The profile is the
+/// collision mesh's 2.5 m floor-to-wall fillet, so the boards lie on the ramp
+/// instead of floating over it.
+#[derive(Clone, Copy)]
+struct BoardLevel {
+    y: f32,
+    inset: f32,
+    normal_h: f32,
+    normal_y: f32,
+}
+
+/// Number of strips in the team-coloured part of the board. The trim and rail
+/// add one strip each above it.
+const BOARD_BAND_STEPS: usize = 6;
+
+fn board_levels() -> Vec<BoardLevel> {
+    let r = BOARD_FILLET_RADIUS;
+    let bottom = (1.0 - BOARD_BOTTOM / r).clamp(-1.0, 1.0).acos();
+    let top = (1.0 - BOARD_TOP / r).clamp(-1.0, 1.0).acos();
+    let mut levels = Vec::with_capacity(BOARD_BAND_STEPS + 3);
+    for i in 0..=BOARD_BAND_STEPS {
+        let t = i as f32 / BOARD_BAND_STEPS as f32;
+        let theta = bottom + (top - bottom) * t;
+        levels.push(BoardLevel {
+            y: r * (1.0 - theta.cos()),
+            inset: r * (1.0 - theta.sin()),
+            normal_h: theta.sin(),
+            normal_y: theta.cos(),
+        });
+    }
+    // The trim and rail continue straight up from the top of the fillet, so
+    // they keep the top level's inset and normal.
+    let inset = r * (1.0 - top.sin());
+    let (normal_h, normal_y) = (top.sin(), top.cos());
+    levels.push(BoardLevel {
+        y: BOARD_TRIM_TOP,
+        inset,
+        normal_h,
+        normal_y,
+    });
+    levels.push(BoardLevel {
+        y: BOARD_RAIL_TOP,
+        inset,
+        normal_h,
+        normal_y,
+    });
+    levels
+}
+
+fn board_vertex(point: PerimeterPoint, level: BoardLevel) -> (Vec3, Vec3) {
+    let normal = (Vec3::new(point.inward.x, 0.0, point.inward.y) * level.normal_h
+        + Vec3::Y * level.normal_y)
+        .normalize_or_zero();
+    let pos = Vec3::new(point.pos.x, level.y, point.pos.y) + normal * BOARD_LIFT;
+    (pos, normal)
+}
+
+/// The team-coloured boards that skirt the arena. They are vertex-coloured quads
+/// following the wall fillet: blue on the -Z half, orange on the +Z half, with a
+/// slightly darker alternating panel and a dark capping rail.
+fn arena_boards_mesh() -> Mesh {
+    let sections = perimeter_sections();
+    let levels = board_levels();
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut colors = Vec::new();
+    let mut indices = Vec::new();
+
+    let blue = linear_rgba(0.10, 0.32, 0.78);
+    let orange = linear_rgba(0.95, 0.38, 0.08);
+    let trim = linear_rgba(0.74, 0.78, 0.82);
+    let rail = linear_rgba(0.05, 0.06, 0.08);
+
+    for (section_index, section) in sections.iter().enumerate() {
+        // One polyline per profile level, all with the same point count.
+        let paths: Vec<Vec<PerimeterPoint>> = levels
+            .iter()
+            .map(|level| section.sample(level.inset))
+            .collect();
+        for band in 0..levels.len() - 1 {
+            let lower = &paths[band];
+            let upper = &paths[band + 1];
+            for i in 0..lower.len() - 1 {
+                let color = if band < BOARD_BAND_STEPS {
+                    let mid_z = (lower[i].pos.y + lower[i + 1].pos.y) * 0.5;
+                    let team = if mid_z < 0.0 { blue } else { orange };
+                    let shade = if (i + section_index) & 1 == 0 {
+                        1.0
+                    } else {
+                        0.82
+                    };
+                    scale_rgba(team, shade)
+                } else if band == BOARD_BAND_STEPS {
+                    trim
+                } else {
+                    rail
+                };
+                let (p0, n0) = board_vertex(lower[i], levels[band]);
+                let (p1, n1) = board_vertex(lower[i + 1], levels[band]);
+                let (p2, n2) = board_vertex(upper[i + 1], levels[band + 1]);
+                let (p3, n3) = board_vertex(upper[i], levels[band + 1]);
+                let base = positions.len() as u32;
+                for (p, n) in [(p0, n0), (p1, n1), (p2, n2), (p3, n3)] {
+                    positions.push(p.to_array());
+                    normals.push(n.to_array());
+                    colors.push(color);
+                }
+                indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+            }
+        }
+    }
+
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_COLOR, colors)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// The four floodlight masts, as (position, yaw) pairs. They stand just outside
+/// the corners and their local -Z faces the arena centre.
+fn light_tower_poses() -> [(Vec3, Quat); 4] {
+    let mut poses = [(Vec3::ZERO, Quat::IDENTITY); 4];
+    for (n, (sx, sz)) in [(-1.0_f32, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let pos = Vec3::new(
+            sx * (ARENA_HALF_X + LIGHT_TOWER_OFFSET),
+            0.0,
+            sz * (ARENA_HALF_Z + LIGHT_TOWER_OFFSET),
+        );
+        poses[n] = (pos, Quat::from_rotation_y(f32::atan2(sx, sz)));
+    }
+    poses
+}
+
+/// Dark structure of the corner floodlights: base, mast, crossbar and the
+/// backing plate for the lamp array.
+fn light_tower_frame_mesh() -> Mesh {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut indices = Vec::new();
+    let mast = LIGHT_TOWER_HEIGHT;
+    let plate_y = mast - 1.0;
+    for (pos, yaw) in light_tower_poses() {
+        let place = |local: Vec3| pos + yaw * local;
+        let plate_rotation = yaw * Quat::from_rotation_x(-0.28);
+        push_oriented_box(
+            &mut positions,
+            &mut normals,
+            &mut indices,
+            place(Vec3::new(0.0, 0.3, 0.0)),
+            Vec3::new(1.5, 0.6, 1.5),
+            yaw,
+        );
+        push_oriented_box(
+            &mut positions,
+            &mut normals,
+            &mut indices,
+            place(Vec3::new(0.0, mast * 0.5, 0.0)),
+            Vec3::new(0.46, mast, 0.46),
+            yaw,
+        );
+        push_oriented_box(
+            &mut positions,
+            &mut normals,
+            &mut indices,
+            place(Vec3::new(0.0, mast - 1.4, 0.0)),
+            Vec3::new(5.2, 0.26, 0.26),
+            yaw,
+        );
+        push_oriented_box(
+            &mut positions,
+            &mut normals,
+            &mut indices,
+            place(Vec3::new(0.0, plate_y, 0.0)),
+            Vec3::new(4.8, 1.6, 0.16),
+            plate_rotation,
+        );
+    }
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// The six lamp heads on each floodlight, baked into one mesh so the whole set is
+/// a single draw call. They are separate geometry because they use an emissive
+/// material; the dark frame is the mesh above.
+fn light_tower_lamp_mesh() -> Mesh {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut indices = Vec::new();
+    let mast = LIGHT_TOWER_HEIGHT;
+    let plate_y = mast - 1.0;
+    for (pos, yaw) in light_tower_poses() {
+        let plate_center = pos + yaw * Vec3::new(0.0, plate_y, 0.0);
+        let plate_rotation = yaw * Quat::from_rotation_x(-0.28);
+        for dx in [-1.55_f32, 0.0, 1.55] {
+            for dy in [-0.38_f32, 0.38] {
+                let center = plate_center + plate_rotation * Vec3::new(dx, dy, -0.14);
+                push_oriented_box(
+                    &mut positions,
+                    &mut normals,
+                    &mut indices,
+                    center,
+                    Vec3::new(1.25, 0.5, 0.12),
+                    plate_rotation,
+                );
+            }
+        }
+    }
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// Ceiling light banks: four lines of four short strips, so the roof reads as
+/// recessed lighting rather than one fluorescent tube per line. Baked into one
+/// mesh; the whole roof is a single draw call.
+fn ceiling_lights_mesh() -> Mesh {
+    let mut positions = Vec::new();
+    let mut normals = Vec::new();
+    let mut indices = Vec::new();
+    let y = ARENA_HEIGHT - 0.22;
+    for x in [-30.72_f32, -10.24, 10.24, 30.72] {
+        for z in [-30.0_f32, -10.0, 10.0, 30.0] {
+            push_box(
+                &mut positions,
+                &mut normals,
+                &mut indices,
+                Vec3::new(x, y, z),
+                Vec3::new(0.42, 0.10, 18.0),
+            );
+        }
+    }
+    Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    )
+    .with_inserted_attribute(Mesh::ATTRIBUTE_POSITION, positions)
+    .with_inserted_attribute(Mesh::ATTRIBUTE_NORMAL, normals)
+    .with_inserted_indices(Indices::U32(indices))
+}
+
+/// Append an axis-aligned box, rotated about its centre.
+fn push_oriented_box(
+    positions: &mut Vec<[f32; 3]>,
+    normals: &mut Vec<[f32; 3]>,
+    indices: &mut Vec<u32>,
+    center: Vec3,
+    size: Vec3,
+    rotation: Quat,
+) {
+    let h = size * 0.5;
+    let faces = [
+        (
+            [
+                Vec3::new(h.x, -h.y, -h.z),
+                Vec3::new(h.x, h.y, -h.z),
+                Vec3::new(h.x, h.y, h.z),
+                Vec3::new(h.x, -h.y, h.z),
+            ],
+            Vec3::X,
+        ),
+        (
+            [
+                Vec3::new(-h.x, -h.y, h.z),
+                Vec3::new(-h.x, h.y, h.z),
+                Vec3::new(-h.x, h.y, -h.z),
+                Vec3::new(-h.x, -h.y, -h.z),
+            ],
+            Vec3::NEG_X,
+        ),
+        (
+            [
+                Vec3::new(-h.x, h.y, -h.z),
+                Vec3::new(-h.x, h.y, h.z),
+                Vec3::new(h.x, h.y, h.z),
+                Vec3::new(h.x, h.y, -h.z),
+            ],
+            Vec3::Y,
+        ),
+        (
+            [
+                Vec3::new(-h.x, -h.y, h.z),
+                Vec3::new(-h.x, -h.y, -h.z),
+                Vec3::new(h.x, -h.y, -h.z),
+                Vec3::new(h.x, -h.y, h.z),
+            ],
+            Vec3::NEG_Y,
+        ),
+        (
+            [
+                Vec3::new(h.x, -h.y, h.z),
+                Vec3::new(h.x, h.y, h.z),
+                Vec3::new(-h.x, h.y, h.z),
+                Vec3::new(-h.x, -h.y, h.z),
+            ],
+            Vec3::Z,
+        ),
+        (
+            [
+                Vec3::new(-h.x, -h.y, -h.z),
+                Vec3::new(-h.x, h.y, -h.z),
+                Vec3::new(h.x, h.y, -h.z),
+                Vec3::new(h.x, -h.y, -h.z),
+            ],
+            Vec3::NEG_Z,
+        ),
+    ];
+    for (corners, normal) in faces {
+        let corners = corners.map(|c| center + rotation * c);
+        push_detail_quad(positions, normals, indices, corners, rotation * normal);
+    }
+}
+
+/// The arena glass: a tiling hex lattice with the panels almost clear and the
+/// lattice lines nearly solid. Untextured transparency reads as a flat tint and
+/// disappears against the dark background; the hexes give the walls and roof the
+/// structure RL's cage has without adding a single triangle.
+///
+/// The lattice is built for wrapping: 12 hex columns across the tile and 10 rows
+/// down it, with alternating rows offset by half a cell. Sampling considers the
+/// neighbouring centres with toroidal deltas, so a hex straddling the edge is
+/// completed by its wrapped copy and the texture tiles without a seam.
+fn arena_detail_texture() -> Image {
+    const SIZE: usize = 512;
+    /// Hex columns across the tile. Even, so a whole number of rows fits the
+    /// alternating offset and the pattern is invariant after one wrap.
+    const COLUMNS: f32 = 12.0;
+    const ROWS: f32 = 10.0;
+    /// Lattice line width, in texels.
+    const LINE: f32 = 2.0;
+
+    let span = SIZE as f32;
+    let dx = span / COLUMNS;
+    let dy = span / ROWS;
+    let radius = dx / 1.5;
+    // Distance from a flat-top hex's centre to the middle of an edge.
+    let apothem = radius * 1.5_f32.sqrt();
+    // Edge normals sit half a step between the vertex directions (0, 60, ...).
+    let edge_normals: [[f32; 2]; 6] = std::array::from_fn(|k| {
+        let angle = (30.0 + 60.0 * k as f32).to_radians();
+        [angle.cos(), angle.sin()]
+    });
+
     let mut data = vec![0u8; SIZE * SIZE * 4];
     for y in 0..SIZE {
         for x in 0..SIZE {
-            // Two sets of diagonals make the diamonds. `SIZE` is a multiple of
-            // `CELL`, so the pattern tiles without a seam.
-            let on_line = (x + y) % CELL < LINE || (x + SIZE - y) % CELL < LINE;
-            let value = if on_line { 180 } else { 255 };
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let mut nearest = f32::MAX;
+
+            // The point's own cell plus its eight neighbours covers every hex
+            // whose boundary could be nearest; the toroidal deltas below also
+            // bring in the copy wrapped from the other side of the tile.
+            let column = (px / dx).floor() as i32;
+            for i in (column - 1)..=(column + 1) {
+                let offset = (i & 1) as f32 * 0.5;
+                let row = (py / dy - offset).floor() as i32;
+                for j in (row - 1)..=(row + 1) {
+                    let cx = i as f32 * dx;
+                    let cy = (j as f32 + offset) * dy;
+                    // Wrap the delta into [-span/2, span/2) so the copy from the
+                    // other side of the tile is considered.
+                    let mut ox = px - cx;
+                    ox -= span * (ox / span).round();
+                    let mut oy = py - cy;
+                    oy -= span * (oy / span).round();
+
+                    // Signed distance to the hex boundary: the largest distance
+                    // past any of the six edge planes.
+                    let mut outside = f32::MIN;
+                    for [nx, ny] in edge_normals {
+                        outside = outside.max(ox * nx + oy * ny - apothem);
+                    }
+                    nearest = nearest.min(outside.abs());
+                }
+            }
+
+            let edge = LINE * 0.5;
+            // One-and-a-half texel feather. A hard threshold gives the lines a
+            // beaded, stair-stepped edge when the camera is close to a wall; the
+            // feather is cheap and the mip chain handles the rest.
+            let t = ((edge - nearest) / 1.5 + 0.5).clamp(0.0, 1.0);
+            let line_rgb = [218.0_f32, 226.0, 240.0];
+            let panel_rgb = [52.0_f32, 62.0, 82.0];
+            let rgb = [
+                (panel_rgb[0] + (line_rgb[0] - panel_rgb[0]) * t) as u8,
+                (panel_rgb[1] + (line_rgb[1] - panel_rgb[1]) * t) as u8,
+                (panel_rgb[2] + (line_rgb[2] - panel_rgb[2]) * t) as u8,
+            ];
+            let alpha = (30.0 + (224.0 - 30.0) * t) as u8;
             let i = (y * SIZE + x) * 4;
-            data[i] = value;
-            data[i + 1] = value;
-            data[i + 2] = value;
-            data[i + 3] = 255;
+            data[i] = rgb[0];
+            data[i + 1] = rgb[1];
+            data[i + 2] = rgb[2];
+            data[i + 3] = alpha;
         }
     }
 
     // Build the mip chain by hand: runtime images start with one level, and a
-    // repeating 25 cm pattern without mips turns into noise on distant walls.
+    // repeating pattern without mips turns into noise on distant walls.
     let mut mip = data;
     let mut mip_size = SIZE;
     let mut pixels = Vec::new();
@@ -3021,6 +3826,11 @@ fn lerp_rgba(a: [f32; 4], b: [f32; 4], t: f32) -> [f32; 4] {
         a[2] + (b[2] - a[2]) * t,
         a[3] + (b[3] - a[3]) * t,
     ]
+}
+
+/// Scale an RGBA colour's brightness without touching its alpha.
+fn scale_rgba(c: [f32; 4], scale: f32) -> [f32; 4] {
+    [c[0] * scale, c[1] * scale, c[2] * scale, c[3]]
 }
 
 /// Hermite ramp from 0 below `edge0` to 1 above `edge1`, clamped at both ends.
@@ -4629,6 +5439,43 @@ mod tests {
         );
         assert_eq!(across.round() as u32, 8);
         assert_eq!(along.round() as u32, 10);
+    }
+
+    #[test]
+    fn board_profile_follows_the_wall_fillet() {
+        // The boards sit on the collision surface, so every team-band level has
+        // to lie on the 2.5 m quarter circle. A board placed at the wall plane
+        // instead would float over the ramp.
+        let r = BOARD_FILLET_RADIUS;
+        for level in board_levels().into_iter().take(BOARD_BAND_STEPS + 1) {
+            let on_circle = (r - level.inset).powi(2) + (r - level.y).powi(2);
+            assert!(
+                (on_circle - r * r).abs() < 1e-4,
+                "level at y={} inset={} is {on_circle} from the circle",
+                level.y,
+                level.inset
+            );
+            assert!(level.inset >= 0.0, "board pokes through the wall");
+        }
+    }
+
+    #[test]
+    fn boards_skip_goal_mouths_and_stay_inside_the_walls() {
+        let inset = board_levels()[0].inset;
+        for section in perimeter_sections() {
+            for point in section.sample(inset) {
+                let (x, z) = (point.pos.x, point.pos.y);
+                assert!(x.abs() <= ARENA_HALF_X + 1e-3, "board outside +X wall");
+                assert!(z.abs() <= ARENA_HALF_Z + 1e-3, "board outside +Z wall");
+                // Any sample at the end wall must sit beside the goal opening.
+                if z.abs() > ARENA_HALF_Z - 2.0 {
+                    assert!(
+                        x.abs() >= GOAL_HALF_WIDTH - 1e-3,
+                        "board crosses the goal mouth at x={x}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

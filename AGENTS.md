@@ -97,6 +97,13 @@ cargo run -p rl_view -- --screenshot out.png [TICK]          # chase cam, drives
 cargo run -p rl_view -- --screenshot out.png --cam X,Y,Z --look X,Y,Z  # free cam
 ```
 
+- **An agent must review a downscaled JPEG, not the PNG.** A capture is ~1 MB on
+  disk but ~1.4 MB of base64 in the thread, and it is re-sent on every turn; see
+  the screenshot trap below. `tools/shot.sh out.jpg [TICK]` (or the same
+  `--cam`/`--look` flags) renders and downscales in one step and deletes the
+  PNG; for an existing capture use
+  `ffmpeg -y -i out.png -vf scale=1280:-1 -q:v 4 out.jpg` (~100 KB).
+
 - `--screenshot PATH [TICK]` drives the self-driving script to `TICK` (default
   **250**) and shoots the chase cam — a _dynamic_ pose. With no `PATH`,
   `screenshot.png` is used.
@@ -129,6 +136,29 @@ Upgrading Bevy is a deliberate migration, not a version-string bump.
   _frames_, not seconds. Never leave a server or watcher running unbounded.
 
 ## Traps already paid for
+
+- **The arena shell is glass, and the shadow pass cannot tell.** The shell
+  material is `AlphaMode::Blend` with a procedural hex-lattice texture: a 4 m
+  repeat on the walls, a 20 m repeat on the roof (the scale switches on the roof
+  fillet). It is also `NotShadowCaster` on purpose. Alpha-blended meshes are
+  treated as opaque in the shadow pass, and the goal recess threw a solid black
+  slab across the goal box until the shell was excluded. The goal net is excluded
+  for the same reason; the frame still casts its thin shadow.
+- **The base boards follow the collision fillet, not the wall plane.**
+  `arena_boards_mesh` samples the 2.5 m floor-to-wall fillet (`BOARD_FILLET_RADIUS`)
+  and the 12.8 m plan corner radius (`BOARD_CORNER_RADIUS`). A board placed at the
+  wall plane floats over the ramp and can intersect the car; do not "simplify"
+  it back to a vertical band. All profile levels use the same section point count
+  so the quads stay connected, and the band is left/right split at the halfway
+  line (blue -Z, orange +Z).
+- **Pitch layers are flat, vertex-coloured quads.** The four greens, the gradient
+  team goal boxes and the corner arcs are all in `pitch_mesh`; they are separated
+  by 1 mm steps to avoid z-fighting. Keep the markings 16 cm wide and the corner
+  arcs as strip quads, not another texture.
+- **Corner floodlights stand just outside the shell.** They are static meshes
+  (`light_tower_frame_mesh` / `light_tower_lamp_mesh`) with emissive lamps aimed
+  at the pitch; the ceiling light banks are one more baked mesh. They are visual
+  only (no lights, no collision) and `NotShadowCaster`, so they stay cheap.
 
 - **Chase camera:** RL parity means a world-upright, yaw-only boom, not a boom
   built in the car's frame. The camera sits at `car - heading * distance +
@@ -254,3 +284,14 @@ Y * height`, where `heading` is the car's horizontal forward in car cam or the
   (~125 frames), and the free-cam path gates on `FREE_SHOT_MIN_FRAMES` +
   `FREE_SHOT_MIN_SECS`. Don't "speed up" a capture by grabbing an early frame.
   The sim isn't what's slow — the frames are.
+- **Never `read_file` a full-size screenshot.** Tool results keep the image as
+  base64 in the thread's history, and the whole history is re-sent on every
+  request, so a few dozen captures is enough to blow the provider's body limit:
+  one thread reached 107 MB and DeepSeek answered `413 Payload Too Large`
+  (report pasted by the client as "something went wrong"). Compaction does not
+  rescue it — it summarises tokens, not the image bytes in the request. Read a
+  `ffmpeg`-downscaled JPEG instead (~100 KB), keep only a couple per thread, and
+  start a fresh thread for each round of visual iteration; the images in an old
+  thread can never be dropped. Better still, delegate a multi-shot review to a
+  subagent: its images stay in the subagent's thread and only its text report
+  comes back.
