@@ -20,9 +20,15 @@
 // project load (metadata, build scripts, proc macros) can never lock the
 // `target/` directory your builds use.
 //
+// `format_on_save: "off"` stops Zed from starting Prettier for JSON/Markdown
+// and from rewriting files on save. Prettier's language server does not
+// implement LSP `shutdown`, so every Zed quit logs a shutdown failure and
+// waits on it. Format explicitly when wanted (e.g. `cargo fmt`).
+//
 // See https://zed.dev/docs/languages/rust and
 // https://rust-analyzer.github.io/book/configuration.html
 {
+  "format_on_save": "off",
   "lsp": {
     "rust-analyzer": {
       "initialization_options": {
