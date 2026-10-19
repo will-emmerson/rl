@@ -41,8 +41,8 @@ use serde::Deserialize;
 
 mod sim;
 use sim::{
-    Input as SimInput, BALL_RADIUS, CAR_HALF_HEIGHT, CAR_HALF_LENGTH, CAR_HALF_WIDTH,
-    CAR_WHEELBASE, GOAL_DEPTH, GOAL_HALF_WIDTH, GOAL_HEIGHT,
+    BallView, CarView, Input as SimInput, BALL_RADIUS, CAR_HALF_HEIGHT, CAR_HALF_LENGTH,
+    CAR_HALF_WIDTH, CAR_WHEELBASE, GOAL_DEPTH, GOAL_HALF_WIDTH, GOAL_HEIGHT,
 };
 
 mod rlbot;
@@ -95,6 +95,36 @@ const WHEEL_RADIUS: f32 = 0.52 * CAR_HALF_HEIGHT;
 /// Full-lock angle for the visual front wheels, in radians. RL's real front-wheel
 /// angle is speed-dependent; this is a fixed stand-in.
 const MAX_WHEEL_STEER: f32 = 0.5;
+/// Free-spin speed of the wheels at full throttle while airborne, in m/s. Only a
+/// visual: the rolling maths converts it to a wheel angle like a ground speed.
+const AIR_WHEEL_SPIN_SPEED: f32 = 6.0;
+
+/// RL's ball indicator: a thin white ring projected on the pitch below the ball.
+/// It is how you find the ball when it is high or against the ceiling. The ring
+/// is a flat torus just above the pitch markings, slightly wider than the ball
+/// so it still peeks out when the ball is resting on the pitch.
+const BALL_INDICATOR_INNER: f32 = 0.95;
+const BALL_INDICATOR_OUTER: f32 = 1.15;
+const BALL_INDICATOR_Y: f32 = 0.04;
+
+/// The ball trail: a burst of long, thin streaks around the ball, aligned with
+/// its velocity, like RL's hard-hit trail. Hidden below `MIN_SPEED`, full
+/// strength at `FULL_SPEED`; lengths are in game time, so slow motion stretches
+/// them and pause freezes them.
+const BALL_TRAIL_STREAKS: usize = 18;
+const BALL_TRAIL_MIN_SPEED: f32 = 15.0;
+const BALL_TRAIL_FULL_SPEED: f32 = 40.0;
+/// How far the streaks reach, in seconds of ball travel.
+const BALL_TRAIL_SECS: f32 = 0.35;
+const BALL_TRAIL_MIN_LENGTH: f32 = 1.5;
+const BALL_TRAIL_MAX_LENGTH: f32 = 18.0;
+/// Half-width of a streak at the head, in metres. Thin lines, not a ribbon.
+const BALL_TRAIL_WIDTH: f32 = 0.12;
+/// How far the streaks are spread around the ball, in metres.
+const BALL_TRAIL_SPREAD: f32 = 1.25;
+const BALL_TRAIL_ALPHA: f32 = 0.4;
+/// How quickly the trail fades in/out as the ball crosses the speed gate.
+const BALL_TRAIL_RESPONSE: f32 = 12.0;
 
 /// Boost pad visuals. The pickup hitboxes (RLBot's useful game values: 144 uu
 /// radius for a small pad, 208 uu for a big one) are much larger than the glow,
@@ -156,6 +186,19 @@ const CAR_HEADING_MIN_HORIZONTAL: f32 = 0.1;
 /// Below this (about 18° of pitch or roll) the car is mid-flip, and the camera
 /// holds its yaw: RL's car cam does not swing through a dodge's pitch/roll.
 const CAR_UPRIGHT_MIN_UP_Y: f32 = 0.95;
+
+/// Simulation playback controls (pause and slow motion). These are viewer-level
+/// keys like F3, not gameplay bindings, so they stay out of `controls.toml`.
+///
+/// The speeds are a ladder rather than a fixed step: 0.1x rungs around normal
+/// speed make slow motion adjustable, while the fast end is coarser so reaching
+/// 10x does not take dozens of key presses. A fixed step cannot do both, and a
+/// 0.5x step bottoms out at 0.5x after one press.
+const PLAYBACK_SPEEDS: [f32; 21] = [
+    0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 2.0, 2.5, 3.0, 4.0,
+    5.0, 10.0,
+];
+const PLAYBACK_DEFAULT_SPEED: f32 = 1.0;
 
 // ---------------------------------------------------------------------------
 // Resources / components
@@ -337,11 +380,156 @@ struct GamepadDebug(bool);
 #[derive(Resource)]
 struct BallCam(bool);
 
+/// Simulation playback state: `P` freezes the physics, and `+`/`-` scale how
+/// many simulation ticks a real second contains.
+///
+/// Pause is a run condition on `step_simulation`, *not* `Time<Virtual>::pause`,
+/// so the render clock keeps running: the chase camera, the settings hot-reload
+/// and the HUD stay responsive while the car is frozen. Game speed, on the other
+/// hand, *is* `Time<Virtual>`'s relative speed, because that is the clock
+/// `Time<Fixed>` accumulates - scaling it changes the sim tick rate without
+/// duplicating the fixed-timestep logic here.
+#[derive(Resource)]
+struct Playback {
+    paused: bool,
+    /// Index into [`PLAYBACK_SPEEDS`]. Keeping an index rather than an `f32`
+    /// makes the ladder exact (no float drift from repeated `+= 0.5`) and makes
+    /// the rungs trivial to test.
+    speed_index: usize,
+}
+
+impl Default for Playback {
+    fn default() -> Self {
+        Self {
+            paused: false,
+            speed_index: Self::default_speed_index(),
+        }
+    }
+}
+
+impl Playback {
+    fn default_speed_index() -> usize {
+        PLAYBACK_SPEEDS
+            .iter()
+            .position(|&speed| speed == PLAYBACK_DEFAULT_SPEED)
+            .expect("PLAYBACK_SPEEDS contains the default 1x speed")
+    }
+
+    fn speed(&self) -> f32 {
+        PLAYBACK_SPEEDS[self.speed_index]
+    }
+
+    /// One rung slower, stopping at the slowest rung.
+    fn slower(&mut self) {
+        self.speed_index = self.speed_index.saturating_sub(1);
+    }
+
+    /// One rung faster, stopping at the fastest rung.
+    fn faster(&mut self) {
+        self.speed_index = (self.speed_index + 1).min(PLAYBACK_SPEEDS.len() - 1);
+    }
+
+    /// Back to 1x without touching the paused flag.
+    fn reset_speed(&mut self) {
+        self.speed_index = Self::default_speed_index();
+    }
+}
+
+/// The last two completed fixed ticks, kept for render interpolation.
+///
+/// Drawing the newest simulation state directly makes motion advance in whole
+/// ticks: at 120 Hz a 60 fps display gets a steady 2 ticks per frame, but at
+/// 1.1x it alternates 2/2/2/2/3 and visibly beats. Blending the last two ticks
+/// by the fixed clock's overstep gives the renderer a continuous pose without
+/// changing the physics or introducing a variable timestep.
+#[derive(Resource)]
+struct TickHistory {
+    previous_cars: Vec<CarView>,
+    current_cars: Vec<CarView>,
+    previous_ball: BallView,
+    current_ball: BallView,
+}
+
+impl TickHistory {
+    fn new(sim: &sim::Sim) -> Self {
+        let mut cars = Vec::with_capacity(sim.num_cars());
+        fill_car_views(sim, &mut cars);
+        Self {
+            previous_cars: cars.clone(),
+            current_cars: cars,
+            previous_ball: sim.ball(),
+            current_ball: sim.ball(),
+        }
+    }
+
+    /// Advance the history by one simulation tick. The two vectors are swapped,
+    /// not cloned, so the steady state does not allocate.
+    fn push(&mut self, sim: &sim::Sim) {
+        std::mem::swap(&mut self.previous_cars, &mut self.current_cars);
+        self.previous_ball = self.current_ball;
+        fill_car_views(sim, &mut self.current_cars);
+        self.current_ball = sim.ball();
+    }
+
+    /// Collapse the history onto the current state after a reset, so the render
+    /// does not blend across the teleport back to kickoff.
+    fn snap(&mut self, sim: &sim::Sim) {
+        fill_car_views(sim, &mut self.current_cars);
+        self.current_ball = sim.ball();
+        self.previous_cars.clear();
+        self.previous_cars.extend_from_slice(&self.current_cars);
+        self.previous_ball = self.current_ball;
+    }
+}
+
+fn fill_car_views(sim: &sim::Sim, cars: &mut Vec<CarView>) {
+    cars.clear();
+    cars.extend((0..sim.num_cars()).map(|index| sim.car_at(index)));
+}
+
+/// The pose the renderer and camera should use for this frame, sampled between
+/// the last two ticks. `ball` is `None` only before the first sample.
+#[derive(Resource, Default)]
+struct RenderViews {
+    cars: Vec<CarView>,
+    ball: Option<BallView>,
+}
+
+/// One streak in the ball trail. The values are fixed per streak so the pattern
+/// does not shimmer from frame to frame.
+#[derive(Clone, Copy)]
+struct TrailStreak {
+    /// Position around the velocity axis, in radians.
+    angle: f32,
+    /// Distance from the ball's centre, in metres.
+    radius: f32,
+    /// Fraction of the speed-derived length this streak uses.
+    length_scale: f32,
+    /// Multiplier on the overall trail opacity.
+    alpha_scale: f32,
+}
+
+/// The trail mesh and its per-streak pattern. The mesh is rebuilt each frame
+/// from the ball's velocity; the entity is hidden while the trail is inactive.
+#[derive(Resource)]
+struct BallTrail {
+    mesh: Handle<Mesh>,
+    /// 0..=1, eased from the ball's speed so the trail fades rather than pops.
+    strength: f32,
+    streaks: Vec<TrailStreak>,
+}
+
+/// Marks the single entity that draws the ball trail.
+#[derive(Component)]
+struct BallTrailVisual;
+
 #[derive(Component)]
 enum Vis {
     /// A simulated car, indexed in `Sim`/player order. Index 0 is the human.
     Car(usize),
     Ball,
+    /// RL's ball indicator: a ring on the pitch directly below the ball.
+    BallIndicator,
     /// The glowing part of a boost pad, indexed into `World::boost_pads`.
     /// Hidden while the pad is on cooldown. For a small pad that is its ring,
     /// core and flame panels; the hexagonal marker stays on the pitch. For a big
@@ -686,6 +874,7 @@ fn main() {
     if std::env::var_os("RL_WALL_DEBUG").is_some() {
         sim.debug_park_on_wall();
     }
+    let tick_history = TickHistory::new(&sim);
 
     let rlbot = if rlbot_enabled {
         Rlbot::start(
@@ -725,6 +914,8 @@ fn main() {
             ..default()
         }))
         .insert_resource(Sim(sim))
+        .insert_resource(tick_history)
+        .init_resource::<RenderViews>()
         .insert_resource(render_quality)
         .insert_resource(DirectionalLightShadowMap {
             size: render_quality.shadow_map_size,
@@ -742,26 +933,34 @@ fn main() {
             ..default()
         })
         .init_resource::<Boosting>()
+        .init_resource::<Playback>()
         .insert_resource(Time::<Fixed>::from_hz(sim::TICK_HZ))
         .add_systems(
             PreUpdate,
             seed_gamepad_triggers.after(bevy::input::InputSystems),
         )
         .add_systems(Startup, setup_scene)
-        .add_systems(FixedUpdate, step_simulation.run_if(simulating))
+        .add_systems(
+            FixedUpdate,
+            step_simulation.run_if(simulating).run_if(not_paused),
+        )
         .add_systems(
             Update,
             (
                 toggle_camera_mode,
+                control_playback,
+                poll_rlbot_while_paused.run_if(paused),
                 reset_on_key,
                 report_gamepads,
                 report_gamepad_events,
-                sync_visuals,
+                sample_views,
+                sync_visuals.after(sample_views),
                 animate_boost_pads,
                 spin_wheels,
+                update_ball_trail.after(sample_views),
                 (reload_camera_settings, apply_camera_fov).chain(),
                 reload_controls,
-                chase_camera.run_if(simulating),
+                chase_camera.run_if(simulating).after(sample_views),
                 track_performance.before(update_hud),
                 update_hud,
                 update_boost_meter,
@@ -913,6 +1112,17 @@ fn simulating(mode: Res<Mode>) -> bool {
     !is_free_shot(&mode)
 }
 
+/// Run condition for `step_simulation`: paused means the clock keeps ticking but
+/// no physics step is taken. The fixed schedule still consumes its accumulated
+/// time, so unpausing cannot replay a backlog of ticks.
+fn not_paused(playback: Res<Playback>) -> bool {
+    !playback.paused
+}
+
+fn paused(playback: Res<Playback>) -> bool {
+    playback.paused
+}
+
 // ---------------------------------------------------------------------------
 // Scene
 // ---------------------------------------------------------------------------
@@ -992,6 +1202,69 @@ fn setup_scene(
         Transform::default(),
         Vis::Ball,
     ));
+
+    // RL's ball indicator: a white ring on the pitch under the ball. It is
+    // always visible, at any ball height, which is what makes it useful in ball
+    // cam when the ball is above the frame.
+    commands.spawn((
+        Mesh3d(
+            meshes.add(
+                Torus::new(BALL_INDICATOR_INNER, BALL_INDICATOR_OUTER)
+                    .mesh()
+                    .minor_resolution(6)
+                    .major_resolution(48),
+            ),
+        ),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            base_color: Color::srgba(1.0, 1.0, 1.0, 0.65),
+            unlit: true,
+            alpha_mode: AlphaMode::Blend,
+            cull_mode: None,
+            ..default()
+        })),
+        Transform::from_xyz(0.0, BALL_INDICATOR_Y, 0.0),
+        Vis::BallIndicator,
+        NotShadowCaster,
+    ));
+
+    // --- ball trail ---
+    // The mesh starts as a hidden degenerate quad; `update_ball_trail` replaces
+    // it with a camera-facing ribbon made from the ball's recent positions.
+    let mut trail_mesh = Mesh::new(
+        PrimitiveTopology::TriangleList,
+        RenderAssetUsages::default(),
+    );
+    // Start with a degenerate (zero-area) quad rather than empty buffers. Bevy's
+    // render asset allocator does not like a mesh with no vertices, and the
+    // entity is hidden until the first real trail is built anyway.
+    trail_mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, vec![[0.0f32; 3]; 4]);
+    trail_mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, vec![[1.0f32, 1.0, 1.0, 0.0]; 4]);
+    trail_mesh.insert_indices(Indices::U32(vec![0, 1, 2, 1, 3, 2]));
+    let trail_mesh = meshes.add(trail_mesh);
+    commands.spawn((
+        Mesh3d(trail_mesh.clone()),
+        MeshMaterial3d(materials.add(StandardMaterial {
+            // Unlit and additive: the vertex colours carry the fade, and the
+            // trail must not pick up the stadium lights.
+            base_color: Color::WHITE,
+            alpha_mode: AlphaMode::Add,
+            unlit: true,
+            cull_mode: None,
+            ..default()
+        })),
+        Transform::default(),
+        Visibility::Hidden,
+        BallTrailVisual,
+        NotShadowCaster,
+        // The mesh is rebuilt every frame and spans wherever the ball is; a
+        // stale AABB would cull it, and one mesh is not worth culling anyway.
+        bevy::camera::visibility::NoFrustumCulling,
+    ));
+    commands.insert_resource(BallTrail {
+        mesh: trail_mesh,
+        strength: 0.0,
+        streaks: trail_streaks(),
+    });
 
     // --- boost pads ---
     // RL has two distinct pickups. A small pad is a light hexagonal plate with a
@@ -2871,11 +3144,13 @@ fn seed_gamepad_triggers(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn step_simulation(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
     controls: Res<Controls>,
     mut sim: ResMut<Sim>,
+    mut history: ResMut<TickHistory>,
     mut boosting: ResMut<Boosting>,
     mut rlbot: ResMut<Rlbot>,
     mode: Res<Mode>,
@@ -2902,6 +3177,8 @@ fn step_simulation(
         boosting.0[index] = input.boost && sim.0.car_at(index).boost > 0.0;
     }
     sim.0.step(&inputs);
+    // The renderer blends the previous and current tick; see `TickHistory`.
+    history.push(&sim.0);
 
     // Only build (and especially predict) packets when a bot is actually ready
     // to receive them. The bridge opens the TCP port even before that, but an
@@ -3009,21 +3286,328 @@ fn reset_on_key(
     gamepads: Query<&Gamepad>,
     controls: Res<Controls>,
     mut sim: ResMut<Sim>,
+    mut history: ResMut<TickHistory>,
 ) {
     let pad_reset = gamepads
         .iter()
         .any(|pad| controls.gamepad.reset.just_pressed(pad));
     if controls.keyboard.reset.just_pressed(&keys) || pad_reset {
         sim.0.reset();
+        history.snap(&sim.0);
     }
+}
+
+/// Viewer-level playback keys:
+///
+/// - `P` pauses/resumes;
+/// - `+` (`NumpadAdd`, or shift+`=`) and `-` (`NumpadSubtract`, or the minus
+///   key) move one rung along [`PLAYBACK_SPEEDS`];
+/// - `=` (or `NumpadEqual`) returns to 1x.
+///
+/// Only in `Mode::Play`: a capture is driven by `capture_input` and must run to
+/// its tick, so pausing one would stall the shot.
+fn control_playback(
+    keys: Res<ButtonInput<KeyCode>>,
+    mode: Res<Mode>,
+    mut playback: ResMut<Playback>,
+    mut time: ResMut<Time<Virtual>>,
+) {
+    if !matches!(*mode, Mode::Play) {
+        return;
+    }
+
+    if keys.just_pressed(KeyCode::KeyP) {
+        playback.paused = !playback.paused;
+        if playback.paused {
+            info!("simulation paused (P to resume)");
+        } else {
+            info!("simulation resumed at {:.1}x", playback.speed());
+        }
+    }
+
+    let shift = keys.pressed(KeyCode::ShiftLeft) || keys.pressed(KeyCode::ShiftRight);
+    let faster =
+        keys.just_pressed(KeyCode::NumpadAdd) || (shift && keys.just_pressed(KeyCode::Equal));
+    let slower = keys.just_pressed(KeyCode::NumpadSubtract) || keys.just_pressed(KeyCode::Minus);
+    let reset =
+        keys.just_pressed(KeyCode::NumpadEqual) || (!shift && keys.just_pressed(KeyCode::Equal));
+
+    let before = playback.speed_index;
+    if faster {
+        playback.faster();
+    } else if slower {
+        playback.slower();
+    } else if reset {
+        playback.reset_speed();
+    }
+
+    if playback.speed_index != before {
+        let speed = playback.speed();
+        // `Time<Virtual>` is what `Time<Fixed>` accumulates, so this changes the
+        // number of simulation ticks per real second (and scales the render-side
+        // `Time` too, which keeps the camera's smoothing in step with the car).
+        time.set_relative_speed(speed);
+        info!("game speed {speed:.1}x");
+    }
+}
+
+/// Keep the bridge's event queue drained while paused.
+///
+/// `Rlbot::poll` normally runs inside `step_simulation`; while paused that system
+/// is skipped, and the bridge's event channel is unbounded, so a long pause
+/// would otherwise accumulate the bot's inputs (and hold its latest one).
+fn poll_rlbot_while_paused(mut rlbot: ResMut<Rlbot>) {
+    rlbot.poll();
 }
 
 // ---------------------------------------------------------------------------
 // Presentation
 // ---------------------------------------------------------------------------
 
+/// Build a car's world rotation from the simulation's basis. The columns are
+/// `(right, up, forward)`, so local `Z` is the nose and local `Y` is the roof.
+fn car_rotation(car: CarView) -> Quat {
+    Quat::from_mat3(&Mat3::from_cols(
+        car.up.cross(car.forward),
+        car.up,
+        car.forward,
+    ))
+}
+
+/// Blend one car pose between the last two ticks. Position is linear; attitude
+/// is slerped, which keeps flips reading as rotations rather than squashes.
+fn sample_car(previous: &CarView, current: &CarView, alpha: f32) -> CarView {
+    let rotation = car_rotation(*previous).slerp(car_rotation(*current), alpha);
+    CarView {
+        pos: previous.pos.lerp(current.pos, alpha),
+        forward: rotation * Vec3::Z,
+        up: rotation * Vec3::Y,
+        // Discrete state belongs to the newest tick: using a blend would make
+        // the camera switch modes halfway between ticks.
+        is_on_ground: current.is_on_ground,
+        is_demoed: current.is_demoed,
+        speed: previous.speed + (current.speed - previous.speed) * alpha,
+        forward_speed: previous.forward_speed
+            + (current.forward_speed - previous.forward_speed) * alpha,
+        boost: current.boost,
+    }
+}
+
+fn sample_ball(previous: &BallView, current: &BallView, alpha: f32) -> BallView {
+    BallView {
+        pos: previous.pos.lerp(current.pos, alpha),
+        vel: previous.vel.lerp(current.vel, alpha),
+        speed: previous.speed + (current.speed - previous.speed) * alpha,
+        spin: current.spin,
+    }
+}
+
+/// Sample the two most recent ticks for this frame.
+///
+/// The fixed clock's overstep is the fraction of a tick that has accumulated
+/// since the last one, so `previous + alpha * (current - previous)` is the pose
+/// at the frame's actual time. Paused frames and captures use `alpha = 1`:
+/// a capture must render the exact tick it stopped on, and a paused sim must
+/// not drift between the last two ticks.
+fn sample_views(
+    mode: Res<Mode>,
+    playback: Res<Playback>,
+    fixed: Res<Time<Fixed>>,
+    history: Res<TickHistory>,
+    mut views: ResMut<RenderViews>,
+) {
+    let alpha = if matches!(*mode, Mode::Play) && !playback.paused {
+        fixed.overstep_fraction()
+    } else {
+        1.0
+    };
+
+    views.cars.clear();
+    views.cars.extend(
+        history
+            .previous_cars
+            .iter()
+            .zip(&history.current_cars)
+            .map(|(previous, current)| sample_car(previous, current, alpha)),
+    );
+    views.ball = Some(sample_ball(
+        &history.previous_ball,
+        &history.current_ball,
+        alpha,
+    ));
+}
+
+/// Deterministic pattern for the trail: evenly spaced angles (golden angle)
+/// with hashed radius, length and opacity, so the streaks stay put from frame
+/// to frame instead of shimmering.
+fn trail_streaks() -> Vec<TrailStreak> {
+    const GOLDEN_ANGLE: f32 = 2.399_963_2;
+
+    let hash = |index: usize, salt: u32| {
+        let mut x = (index as u32)
+            .wrapping_mul(0x9E37_79B9)
+            .wrapping_add(salt.wrapping_mul(0x85EB_CA6B));
+        x ^= x >> 16;
+        x = x.wrapping_mul(0x7FEB_352D);
+        x ^= x >> 15;
+        x = x.wrapping_mul(0x846C_A68B);
+        x ^= x >> 16;
+        (x & 0xFFFF) as f32 / 65_535.0
+    };
+
+    (0..BALL_TRAIL_STREAKS)
+        .map(|index| TrailStreak {
+            angle: index as f32 * GOLDEN_ANGLE,
+            radius: 0.4 + hash(index, 1) * (BALL_TRAIL_SPREAD - 0.4),
+            length_scale: 0.5 + hash(index, 2) * 0.5,
+            alpha_scale: 0.45 + hash(index, 3) * 0.55,
+        })
+        .collect()
+}
+
+/// Build the trail geometry: one thin, camera-facing quad per streak, pointing
+/// backwards along the ball's velocity. The head is bright white and the tail
+/// fades to orange, matching RL's hard-hit streak.
+fn trail_mesh_data(
+    ball: &BallView,
+    view: Vec3,
+    strength: f32,
+    streaks: &[TrailStreak],
+) -> (Vec<[f32; 3]>, Vec<[f32; 4]>, Vec<u32>) {
+    let mut positions = Vec::with_capacity(streaks.len() * 4);
+    let mut colors = Vec::with_capacity(streaks.len() * 4);
+    let mut indices = Vec::with_capacity(streaks.len() * 6);
+
+    let direction = ball.vel.normalize_or_zero();
+    if direction.length_squared() < 1e-6 {
+        return (positions, colors, indices);
+    }
+
+    // A basis perpendicular to the motion, used to distribute the streaks
+    // around the ball rather than stacking them on one line.
+    let mut across = direction.cross(Vec3::Y).normalize_or_zero();
+    if across.length_squared() < 1e-6 {
+        across = direction.cross(Vec3::X).normalize_or_zero();
+    }
+    let up = direction.cross(across).normalize_or_zero();
+
+    let view = view.normalize_or_zero();
+    let length = (ball.speed * BALL_TRAIL_SECS).clamp(BALL_TRAIL_MIN_LENGTH, BALL_TRAIL_MAX_LENGTH);
+
+    for (index, streak) in streaks.iter().enumerate() {
+        let (sin, cos) = streak.angle.sin_cos();
+        let start = ball.pos + (across * cos + up * sin) * streak.radius;
+        let end = start - direction * (length * streak.length_scale);
+
+        // Face the camera: the quad's width axis is perpendicular to both the
+        // streak and the view.
+        let mut side = direction.cross(view).normalize_or_zero();
+        if side.length_squared() < 1e-6 {
+            side = across;
+        }
+
+        let head = BALL_TRAIL_WIDTH;
+        let tail = BALL_TRAIL_WIDTH * 0.15;
+        let alpha = strength * streak.alpha_scale * BALL_TRAIL_ALPHA;
+        let base = index as u32 * 4;
+        positions.push((start - side * head).to_array());
+        positions.push((start + side * head).to_array());
+        positions.push((end - side * tail).to_array());
+        positions.push((end + side * tail).to_array());
+        // Additive: the tail's zero alpha is what makes the streak fade out
+        // instead of ending in a hard edge.
+        colors.push([1.0, 0.96, 0.88, alpha]);
+        colors.push([1.0, 0.96, 0.88, alpha]);
+        colors.push([1.0, 0.42, 0.10, 0.0]);
+        colors.push([1.0, 0.42, 0.10, 0.0]);
+        indices.extend_from_slice(&[base, base + 1, base + 2, base + 1, base + 3, base + 2]);
+    }
+
+    (positions, colors, indices)
+}
+
+/// Trail strength for a given ball speed: off below the minimum, full at the
+/// top, linear in between so a medium hit gets a medium trail.
+fn trail_target(speed: f32) -> f32 {
+    ((speed - BALL_TRAIL_MIN_SPEED) / (BALL_TRAIL_FULL_SPEED - BALL_TRAIL_MIN_SPEED))
+        .clamp(0.0, 1.0)
+}
+
+/// Rebuild the trail whenever the ball is fast enough to deserve one.
+///
+/// The effect is generated from the ball's instantaneous velocity, not its
+/// history: RL's trail is a set of straight streaks aligned with the shot, not
+/// a ribbon through the path. Time only eases the opacity, so pause freezes the
+/// trail and slow motion fades it in more gently.
+fn update_ball_trail(
+    time: Res<Time>,
+    playback: Res<Playback>,
+    views: Res<RenderViews>,
+    mut trail: ResMut<BallTrail>,
+    mut meshes: ResMut<Assets<Mesh>>,
+    cameras: Query<&GlobalTransform, With<Camera3d>>,
+    mut visual: Query<&mut Visibility, With<BallTrailVisual>>,
+) {
+    let Some(ball) = views.ball else {
+        return;
+    };
+
+    let dt = if playback.paused {
+        0.0
+    } else {
+        time.delta_secs()
+    };
+    let target = trail_target(ball.speed);
+    let response = 1.0 - (-BALL_TRAIL_RESPONSE * dt).exp();
+    trail.strength += (target - trail.strength) * response;
+
+    let active =
+        trail.strength > 0.01 && ball.vel.length_squared() > 1e-6 && !trail.streaks.is_empty();
+    for mut visibility in &mut visual {
+        *visibility = if active {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+    }
+    if !active {
+        return;
+    }
+
+    let view = cameras
+        .iter()
+        .next()
+        .map_or(Vec3::Z, |camera| camera.forward().as_vec3());
+    let (positions, colors, indices) = trail_mesh_data(&ball, view, trail.strength, &trail.streaks);
+    if positions.is_empty() {
+        return;
+    }
+    let Some(mut mesh) = meshes.get_mut(&trail.mesh) else {
+        return;
+    };
+    mesh.insert_attribute(Mesh::ATTRIBUTE_POSITION, positions);
+    mesh.insert_attribute(Mesh::ATTRIBUTE_COLOR, colors);
+    mesh.insert_indices(Indices::U32(indices));
+    // StandardMaterial's pipeline expects a normal attribute even when it is
+    // unlit; without one the mesh is not drawn at all.
+    mesh.compute_normals();
+}
+
+/// A demolished car is still in the world (and still simulated); hide it rather
+/// than drawing an idle car that later teleports back to kickoff.
+fn car_visibility(is_demoed: bool) -> Visibility {
+    if is_demoed {
+        Visibility::Hidden
+    } else {
+        Visibility::Inherited
+    }
+}
+
 fn sync_visuals(
     sim: Res<Sim>,
+    views: Res<RenderViews>,
+    playback: Res<Playback>,
+    time: Res<Time>,
     boosting: Res<Boosting>,
     mut query: Query<(&mut Transform, &Vis, &mut Visibility)>,
     mut flames: Query<(&mut Visibility, &BoostFlame), Without<Vis>>,
@@ -3036,21 +3620,44 @@ fn sync_visuals(
         };
     }
 
+    // Ball spin is view-only and integrated per frame. Scaling by the virtual
+    // delta makes it slow down with the game and stop when paused.
+    let spin_dt = if playback.paused {
+        0.0
+    } else {
+        time.delta_secs()
+    };
+
     for (mut transform, vis, mut visibility) in &mut query {
         match vis {
             Vis::Car(index) => {
-                let car = sim.0.car_at(*index);
-                let (f, u) = (car.forward, car.up);
+                let Some(car) = views.cars.get(*index).copied() else {
+                    continue;
+                };
+                // RocketSim keeps a demolished car in the world until it
+                // respawns. Hiding the parent also hides its wheels, exhaust,
+                // opponent ring and marker, which all inherit the visibility.
+                *visibility = car_visibility(car.is_demoed);
                 transform.translation = car.pos;
-                // Full 3D attitude, so flips and air control are visible. The
-                // basis columns are (right, up, forward).
-                transform.rotation = Quat::from_mat3(&Mat3::from_cols(u.cross(f), u, f));
+                // Full 3D attitude, so flips and air control are visible.
+                transform.rotation = car_rotation(car);
             }
             Vis::Ball => {
-                let ball = sim.0.ball();
+                let Some(ball) = views.ball else {
+                    continue;
+                };
                 transform.translation = ball.pos;
                 // Rolling looks wrong without spin, and the angle is free.
-                transform.rotate(Quat::from_scaled_axis(ball.spin * (1.0 / 60.0)));
+                transform.rotate(Quat::from_scaled_axis(ball.spin * spin_dt));
+            }
+            Vis::BallIndicator => {
+                let Some(ball) = views.ball else {
+                    continue;
+                };
+                // Project onto the pitch; the height of the ball is irrelevant,
+                // which is the point of the indicator.
+                transform.translation = Vec3::new(ball.pos.x, BALL_INDICATOR_Y, ball.pos.z);
+                *visibility = Visibility::Inherited;
             }
             Vis::BoostPad(index) => {
                 // Hidden while on cooldown. For a small pad that is its glow; the
@@ -3087,21 +3694,40 @@ fn animate_boost_pads(
     }
 }
 
+/// How fast the wheels should be rolling, as a signed ground speed. On the
+/// ground that is the car's forward speed; in the air there is no contact patch,
+/// so they free-spin with the throttle instead (a flip with the stick held still
+/// turns them, which is what sells the manoeuvre).
+fn wheel_roll_speed(car: CarView, input: SimInput) -> f32 {
+    if car.is_on_ground {
+        car.forward_speed
+    } else {
+        input.throttle as f32 * AIR_WHEEL_SPIN_SPEED
+    }
+}
+
 /// Roll and steer the visual wheels. View-only: the simulation has no wheels, so
 /// the roll integrates the distance the car has travelled over the wheel radius,
 /// and the steer angle comes from the last input.
 fn spin_wheels(
     time: Res<Time>,
+    playback: Res<Playback>,
     sim: Res<Sim>,
     mut rolled: Local<[f32; 2]>,
     mut wheels: Query<(&mut Transform, &Wheel)>,
 ) {
-    let dt = time.delta_secs();
+    // Frozen sim means frozen wheels, even if the car was moving when paused.
+    let dt = if playback.paused {
+        0.0
+    } else {
+        time.delta_secs()
+    };
     for (mut transform, wheel) in &mut wheels {
         let car = sim.0.car_at(wheel.car);
-        rolled[wheel.car] =
-            (rolled[wheel.car] + car.forward_speed * dt / WHEEL_RADIUS) % std::f32::consts::TAU;
-        let steer_angle = sim.0.last_input(wheel.car).steer as f32 * MAX_WHEEL_STEER;
+        let input = sim.0.last_input(wheel.car);
+        rolled[wheel.car] = (rolled[wheel.car] + wheel_roll_speed(car, input) * dt / WHEEL_RADIUS)
+            % std::f32::consts::TAU;
+        let steer_angle = input.steer as f32 * MAX_WHEEL_STEER;
         let yaw = if wheel.steers { steer_angle } else { 0.0 };
         transform.rotation = Quat::from_rotation_y(yaw) * Quat::from_rotation_x(rolled[wheel.car]);
     }
@@ -3332,7 +3958,7 @@ fn chase_camera(
     keys: Res<ButtonInput<KeyCode>>,
     gamepads: Query<&Gamepad>,
     controls: Res<Controls>,
-    sim: Res<Sim>,
+    views: Res<RenderViews>,
     ball_cam: Res<BallCam>,
     settings: Res<CameraSettings>,
     time: Res<Time>,
@@ -3341,8 +3967,15 @@ fn chase_camera(
     mut swivel: Local<f32>,
     mut behind_last: Local<bool>,
 ) {
-    let car = sim.0.car();
-    let ball_pos = sim.0.ball().pos;
+    // Follow the interpolated pose, not the newest tick, or the car would move
+    // smoothly while the camera tracked a stuttering target.
+    let Some(car) = views.cars.first().copied() else {
+        return;
+    };
+    let Some(ball) = views.ball else {
+        return;
+    };
+    let ball_pos = ball.pos;
     let car_pos = car.pos;
     let dt = time.delta_secs();
 
@@ -3492,9 +4125,11 @@ fn track_performance(
     perf.height = window.physical_height();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn update_hud(
     sim: Res<Sim>,
     ball_cam: Res<BallCam>,
+    playback: Res<Playback>,
     perf: Res<PerfStats>,
     hud: Single<Entity, With<HudText>>,
     blue_score: Single<Entity, With<BlueScoreText>>,
@@ -3507,12 +4142,23 @@ fn update_hud(
     let score = sim.0.score();
     *writer.text(*blue_score, 0) = score[0].to_string();
     *writer.text(*orange_score, 0) = score[1].to_string();
-    *writer.text(entity, 1) = format!(
-        "speed {:>5.1} m/s   tick {:>6}   cam {}\n",
+
+    // Only shout about playback when it is not plain 1x running, so the normal
+    // HUD stays uncluttered.
+    let mut first_line = format!(
+        "speed {:>5.1} m/s   tick {:>6}   cam {}",
         car.speed,
         sim.0.tick(),
         if ball_cam.0 { "ball" } else { "car" }
     );
+    if playback.paused {
+        first_line.push_str("   PAUSED");
+    }
+    if playback.speed() != PLAYBACK_DEFAULT_SPEED {
+        first_line.push_str(&format!("   {:.1}x", playback.speed()));
+    }
+    first_line.push('\n');
+    *writer.text(entity, 1) = first_line;
     *writer.text(entity, 2) = format!(
         "ball {:>5.1} m/s   height {:>5.2} m   spin {:>5.1} rad/s\n",
         ball.speed,
@@ -3646,6 +4292,253 @@ mod tests {
         assert_eq!(parse_resolution("1920x1080"), (1920, 1080));
         assert_eq!(parse_resolution("2560X1440"), (2560, 1440));
         assert_eq!(parse_resolution(" 3840x2160 "), (3840, 2160));
+    }
+
+    #[test]
+    fn playback_speeds_are_ascending_and_include_one_x() {
+        assert!(PLAYBACK_SPEEDS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(
+            PLAYBACK_SPEEDS[Playback::default_speed_index()],
+            PLAYBACK_DEFAULT_SPEED
+        );
+    }
+
+    #[test]
+    fn playback_speed_walks_below_one_x_in_small_steps() {
+        // Regression: a fixed 0.5x step stopped at 0.5x after one press of `-`.
+        let mut playback = Playback::default();
+        assert_eq!(playback.speed(), 1.0);
+
+        let mut seen = Vec::new();
+        for _ in 0..PLAYBACK_SPEEDS.len() {
+            playback.slower();
+            seen.push(playback.speed());
+        }
+
+        assert_eq!(&seen[..9], &[0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1]);
+        assert_eq!(playback.speed(), 0.1);
+
+        // The bottom rung is sticky.
+        playback.slower();
+        assert_eq!(playback.speed(), 0.1);
+    }
+
+    #[test]
+    fn playback_speed_walks_up_from_one_x() {
+        // Regression: `+` used to jump straight from 1x to 1.5x.
+        let mut playback = Playback::default();
+        playback.faster();
+        assert_eq!(playback.speed(), 1.1);
+
+        let mut seen = Vec::new();
+        for _ in 0..PLAYBACK_SPEEDS.len() {
+            playback.faster();
+            seen.push(playback.speed());
+        }
+
+        assert_eq!(&seen[..4], &[1.2, 1.3, 1.4, 1.5]);
+        assert_eq!(playback.speed(), 10.0);
+
+        // The top rung is sticky.
+        playback.faster();
+        assert_eq!(playback.speed(), 10.0);
+    }
+
+    fn pose_car(pos: Vec3, forward: Vec3, up: Vec3, speed: f32) -> CarView {
+        CarView {
+            pos,
+            forward,
+            up,
+            is_on_ground: true,
+            is_demoed: false,
+            speed,
+            forward_speed: speed,
+            boost: 0.0,
+        }
+    }
+
+    #[test]
+    fn car_interpolation_blends_position_and_attitude() {
+        // Tick A faces +Z; tick B has moved +2 on X and yawed 90 degrees.
+        let previous = pose_car(Vec3::ZERO, Vec3::Z, Vec3::Y, 0.0);
+        let current = pose_car(Vec3::new(2.0, 0.0, 0.0), Vec3::X, Vec3::Y, 4.0);
+
+        let start = sample_car(&previous, &current, 0.0);
+        assert!((start.pos - previous.pos).length() < 1e-6);
+        assert!((start.forward - previous.forward).length() < 1e-6);
+
+        let end = sample_car(&previous, &current, 1.0);
+        assert!((end.pos - current.pos).length() < 1e-6);
+        assert!((end.forward - current.forward).length() < 1e-6);
+
+        let half = sample_car(&previous, &current, 0.5);
+        assert!((half.pos - Vec3::new(1.0, 0.0, 0.0)).length() < 1e-6);
+        assert!((half.speed - 2.0).abs() < 1e-6);
+        // Slerp, not lerp: half way is a 45 degree yaw, so the nose still points
+        // between the two ticks instead of collapsing toward the origin.
+        let expected = Quat::from_rotation_y(PI / 4.0) * Vec3::Z;
+        assert!(
+            (half.forward - expected).length() < 1e-5,
+            "half-way forward {:?}, expected {expected:?}",
+            half.forward
+        );
+        assert!((half.up - Vec3::Y).length() < 1e-6);
+    }
+
+    #[test]
+    fn demolished_cars_are_hidden() {
+        assert_eq!(car_visibility(true), Visibility::Hidden);
+        assert_eq!(car_visibility(false), Visibility::Inherited);
+    }
+
+    #[test]
+    fn demo_state_follows_the_newest_tick() {
+        let previous = pose_car(Vec3::ZERO, Vec3::Z, Vec3::Y, 0.0);
+        let mut current = pose_car(Vec3::ZERO, Vec3::Z, Vec3::Y, 0.0);
+        assert!(!sample_car(&previous, &current, 0.5).is_demoed);
+
+        current.is_demoed = true;
+        // Hidden as soon as the newest tick says so, even while the position is
+        // still being interpolated from the previous tick.
+        assert!(sample_car(&previous, &current, 0.0).is_demoed);
+        assert!(sample_car(&previous, &current, 0.5).is_demoed);
+
+        current.is_demoed = false;
+        assert!(!sample_car(&previous, &current, 1.0).is_demoed);
+    }
+
+    #[test]
+    fn wheels_roll_with_ground_speed_and_free_spin_in_the_air() {
+        let input = SimInput::new(1.0, 0.0, false, false, false);
+
+        // On the ground the signed forward speed rolls them, including reverse.
+        let forward = pose_car(Vec3::ZERO, Vec3::Z, Vec3::Y, 4.0);
+        assert_eq!(wheel_roll_speed(forward, input), 4.0);
+        let reversing = pose_car(Vec3::ZERO, Vec3::Z, Vec3::Y, -4.0);
+        assert_eq!(wheel_roll_speed(reversing, input), -4.0);
+
+        // In the air the throttle drives them, even with no motion.
+        let mut airborne = pose_car(Vec3::ZERO, Vec3::Z, Vec3::Y, 0.0);
+        airborne.is_on_ground = false;
+        assert_eq!(wheel_roll_speed(airborne, input), AIR_WHEEL_SPIN_SPEED);
+        let reverse = SimInput::new(-1.0, 0.0, false, false, false);
+        assert_eq!(wheel_roll_speed(airborne, reverse), -AIR_WHEEL_SPIN_SPEED);
+        assert_eq!(wheel_roll_speed(airborne, SimInput::default()), 0.0);
+    }
+
+    #[test]
+    fn trail_strength_follows_ball_speed() {
+        assert_eq!(trail_target(0.0), 0.0);
+        assert_eq!(trail_target(BALL_TRAIL_MIN_SPEED), 0.0);
+        assert_eq!(trail_target(BALL_TRAIL_FULL_SPEED), 1.0);
+        assert_eq!(trail_target(BALL_TRAIL_FULL_SPEED * 2.0), 1.0);
+        let middle = (BALL_TRAIL_MIN_SPEED + BALL_TRAIL_FULL_SPEED) * 0.5;
+        assert!((trail_target(middle) - 0.5).abs() < 1e-6);
+    }
+
+    fn trail_ball(speed: f32, direction: Vec3) -> BallView {
+        BallView {
+            pos: Vec3::ZERO,
+            vel: direction * speed,
+            speed,
+            spin: Vec3::ZERO,
+        }
+    }
+
+    #[test]
+    fn trail_streaks_are_camera_facing_quads_that_fade_to_the_tail() {
+        let ball = trail_ball(40.0, Vec3::X);
+        let streaks = trail_streaks();
+        assert_eq!(streaks.len(), BALL_TRAIL_STREAKS);
+
+        let (positions, colors, indices) = trail_mesh_data(&ball, Vec3::Z, 1.0, &streaks);
+        assert_eq!(positions.len(), BALL_TRAIL_STREAKS * 4);
+        assert_eq!(colors.len(), BALL_TRAIL_STREAKS * 4);
+        assert_eq!(indices.len(), BALL_TRAIL_STREAKS * 6);
+
+        for index in 0..BALL_TRAIL_STREAKS {
+            let base = index * 4;
+            // The head is opaque and the tail is fully transparent, so the
+            // streak fades out instead of ending in a hard edge.
+            assert!(colors[base][3] > 0.0);
+            assert_eq!(colors[base + 2][3], 0.0);
+            // The streak runs backwards along -X.
+            assert!(positions[base + 2][0] < positions[base][0]);
+            // Each quad has a nonzero width.
+            assert!(positions[base] != positions[base + 1]);
+        }
+
+        // Streaks are spread around the velocity axis, not stacked on one line.
+        assert!(positions
+            .iter()
+            .any(|point| point[1].abs() > 0.1 || point[2].abs() > 0.1));
+    }
+
+    #[test]
+    fn trail_needs_a_velocity_direction() {
+        let ball = trail_ball(0.0, Vec3::ZERO);
+        let (positions, colors, indices) = trail_mesh_data(&ball, Vec3::Z, 1.0, &trail_streaks());
+        assert!(positions.is_empty());
+        assert!(colors.is_empty());
+        assert!(indices.is_empty());
+    }
+
+    #[test]
+    fn trail_streak_pattern_is_stable_and_varied() {
+        let first = trail_streaks();
+        let second = trail_streaks();
+        assert_eq!(first.len(), second.len());
+        for (a, b) in first.iter().zip(&second) {
+            assert_eq!(a.angle, b.angle);
+            assert_eq!(a.radius, b.radius);
+            assert_eq!(a.length_scale, b.length_scale);
+            assert_eq!(a.alpha_scale, b.alpha_scale);
+        }
+        assert!(first
+            .iter()
+            .all(|streak| (0.4..=BALL_TRAIL_SPREAD).contains(&streak.radius)));
+        assert!(first.iter().any(|streak| streak.length_scale < 0.6));
+        assert!(first.iter().any(|streak| streak.length_scale > 0.9));
+    }
+
+    #[test]
+    fn ball_interpolation_blends_position_velocity_and_speed() {
+        let previous = BallView {
+            pos: Vec3::ZERO,
+            vel: Vec3::ZERO,
+            speed: 0.0,
+            spin: Vec3::Y,
+        };
+        let current = BallView {
+            pos: Vec3::new(0.0, 4.0, 0.0),
+            vel: Vec3::new(0.0, 8.0, 0.0),
+            speed: 8.0,
+            spin: Vec3::Y,
+        };
+
+        let half = sample_ball(&previous, &current, 0.5);
+        assert!((half.pos - Vec3::new(0.0, 2.0, 0.0)).length() < 1e-6);
+        assert!((half.vel - Vec3::new(0.0, 4.0, 0.0)).length() < 1e-6);
+        assert!((half.speed - 4.0).abs() < 1e-6);
+
+        assert!((sample_ball(&previous, &current, 0.0).pos - previous.pos).length() < 1e-6);
+        assert!((sample_ball(&previous, &current, 1.0).pos - current.pos).length() < 1e-6);
+    }
+
+    #[test]
+    fn playback_reset_returns_to_one_x_without_resuming() {
+        let mut playback = Playback {
+            paused: true,
+            ..Default::default()
+        };
+        playback.faster();
+        playback.reset_speed();
+        assert_eq!(playback.speed(), 1.0);
+        assert!(playback.paused, "`=` must not resume a paused simulation");
+
+        playback.slower();
+        playback.reset_speed();
+        assert_eq!(playback.speed(), 1.0);
     }
 
     #[test]

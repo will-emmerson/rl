@@ -60,6 +60,13 @@ cargo clippy --workspace --all-targets # kept clean
   resolution. `--resolution WxH` sets a windowed physical-pixel size (ignored
   by fullscreen), and `--no-vsync` uncaps the frame rate. `--stats` adds a
   frame-time/FPS/max/1%-low line to the HUD; **F3** toggles it at runtime.
+- **`P`** pauses/resumes the simulation; **`+`/`-`** (numpad, or shift+`=` / `-`)
+  step along `PLAYBACK_SPEEDS` (0.1x rungs between 0.1x and 1.5x, coarser to
+  10x), and **`=`** returns to 1x. Pause is a run condition on
+  `step_simulation` (the render clock keeps running, so the camera and hot
+  reload stay live); speed scales `Time<Virtual>`, which is what `Time<Fixed>`
+  accumulates. These are viewer-level keys like F3, not `controls.toml`
+  bindings.
 - `--quality low|medium|high` selects the render-cost preset (`high` is the
   normal look; `low` is MSAA-off, no shadows, no bloom). `--msaa off|2|4|8`
   overrides just the MSAA level. At 1080p, 4x MSAA + shadows + bloom on an
@@ -181,6 +188,30 @@ Y * height`, where `heading` is the car's horizontal forward in car cam or the
 - **Seed RocketSim.** `ArenaConfig::with_rng_seed(0)` in `Sim::new`. Unseeded,
   RocketSim draws from the RNG (per tick), so a run — and even the self-driving
   capture — varies launch to launch.
+- **Render state is interpolated between fixed ticks.** `TickHistory` keeps the
+  last two ticks and `sample_views` blends them by
+  `Time<Fixed>::overstep_fraction()`; `sync_visuals` and `chase_camera` read
+  `RenderViews`, not `Sim` directly. Drawing the newest tick is smooth only when
+  the tick rate divides the frame rate (120 Hz into 60 fps): at 1.1x it
+  alternates 2/2/2/2/3 ticks per frame and visibly beats, and a 144 Hz panel has
+  the same problem at 1x. Add another render path? Read `RenderViews`. Captures
+  and paused frames sample `alpha = 1` so a screenshot is the exact captured
+  tick and pause does not creep; `reset_on_key` calls `TickHistory::snap` so the
+  render does not blend across the kickoff teleport.
+- **Demo and ball-readability visuals.** `CarView::is_demoed` (read from
+  RocketSim in `sim.rs`) hides the whole `Vis::Car` parent in `sync_visuals`,
+  including wheels, exhaust, opponent ring and marker, because they inherit
+  visibility. The ball has RL's ground indicator (a flat torus projected onto
+  the pitch by `Vis::BallIndicator`) and a speed-gated trail of long, thin
+  streaks. `update_ball_trail` rebuilds one camera-facing mesh from the ball's
+  **velocity** (not its history): each streak is a quad offset around the
+  velocity axis, with a white head fading to orange. The material uses
+  vertex-colour alpha with `AlphaMode::Add`, and the mesh needs
+  `compute_normals()` even though it is unlit - `StandardMaterial`'s pipeline
+  expects a normal attribute and silently skips the mesh without one. Its
+  initial mesh must be a valid degenerate quad, not empty buffers (Bevy's slab
+  allocator logs use-after-free errors for an empty mesh). Streaks are 0.24 m
+  wide for a reason: thinner quads alias away at chase-camera distances.
 - **Input signs are measured, not reasoned.** `sim.rs::controls_from` passes the
   viewer's `Input` straight into RocketSim's `CarControls` with **no** sign
   changes, and that is correct. `examples/axis_probe.rs` measures RocketSim

@@ -165,6 +165,10 @@ pub struct CarView {
     /// Whether at least three wheels are in contact with a surface, so the car
     /// is driving rather than flying. True on the walls as well as the floor.
     pub is_on_ground: bool,
+    /// Whether the car has been demolished. RocketSim keeps the car in the
+    /// world while `demo_respawn_timer` runs; the viewer hides it until it
+    /// respawns, so a demolition does not look like an idle car teleporting.
+    pub is_demoed: bool,
     /// Total speed, m/s.
     pub speed: f32,
     /// Speed along the car's forward axis, m/s (negative when reversing).
@@ -177,6 +181,8 @@ pub struct CarView {
 #[derive(Clone, Copy)]
 pub struct BallView {
     pub pos: Vec3,
+    /// Velocity, m/s, in the viewer's frame.
+    pub vel: Vec3,
     /// Total speed, m/s.
     pub speed: f32,
     /// Angular velocity (spin), rad/s.
@@ -366,6 +372,7 @@ impl Sim {
             forward: dir_view(forward.x, forward.y, forward.z),
             up: dir_view(up.x, up.y, up.z),
             is_on_ground: car.is_on_ground,
+            is_demoed: car.is_demoed,
             speed: car.vel.length() * UU_TO_M,
             forward_speed: car.vel.dot(forward) * UU_TO_M,
             boost: car.boost,
@@ -536,6 +543,7 @@ impl Sim {
         let ball = self.arena.get_ball_state();
         BallView {
             pos: pos_view(ball.pos.x, ball.pos.y, ball.pos.z),
+            vel: dir_view(ball.vel.x, ball.vel.y, ball.vel.z) * UU_TO_M,
             speed: ball.vel.length() * UU_TO_M,
             spin: dir_view(ball.ang_vel.x, ball.ang_vel.y, ball.ang_vel.z),
         }

@@ -188,7 +188,18 @@ buttons, which work alongside drift + stick. The right stick (or `IJKL`) swivels
 the camera and pitches it, and
 clicking the right stick in (`R3`) looks behind you; everything springs back when
 released. (If your pad reports nothing, see the gamepad section under "A note on
-Bevy's features" below.)
+Bevy's features" below.) The ball has Rocket League's ground indicator — a white
+ring projected on the pitch under it — and leaves long white-to-orange speed
+streaks behind it once it is moving fast, like RL's hard-hit trail. A demolished
+car is hidden until RocketSim respawns it, rather than sitting still and then
+teleporting.
+
+**`P`** pauses and resumes the simulation. **`+`**/**`-`** (numpad, or
+shift+`=` / `-`) step through a speed ladder: 0.1x increments between 0.1x and
+1.5x, then 2x, 2.5x, 3x, 4x, 5x and 10x. **`=`** returns to 1x; the HUD shows
+`PAUSED` or the active multiplier. Pausing freezes the physics only — the camera
+keeps looking around, and `camera.toml` / `controls.toml` hot reloads keep
+working.
 
 The camera follows Rocket League's model rather than the old car-frame boom:
 the boom is world-upright, a fixed distance behind and height above the car, and
