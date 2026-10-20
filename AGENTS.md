@@ -12,8 +12,10 @@ physics, and draws RocketSim's own arena collision mesh.
 - `view/` — `rl_view`. `view/src/sim.rs` is the **only** place that knows about
   RocketSim: it owns the `Arena`, converts RocketSim's frame and units into the
   viewer's, exposes the car/ball/pads/score the scene reads, and builds the
-  collision mesh. `view/src/main.rs` is the scene, input wiring, camera and HUD;
+  collision mesh. It also reports the tick's audible contacts as `SimEvent`s.
+  `view/src/main.rs` is the scene, input wiring, camera and HUD;
   `view/src/controls.rs` parses the keyboard/gamepad bindings;
+  `view/src/audio.rs` models the engine and drives the sound effects;
   `view/src/rlbot.rs` is the viewer-side bridge resource (it converts bot inputs
   into `sim::Input`, calls `sim::rlbot_snapshot`, and can launch the bot process
   from `--rlbot-config` (bot name or toml) or `--rlbot-command`).
@@ -75,8 +77,13 @@ cargo clippy --workspace --all-targets # kept clean
 - The dev profile is tuned on purpose (own crates `opt-level = 1`, deps `3`).
   **Don't default to `--release`**: it uses a separate target dir and rebuilds
   Bevy, which takes minutes.
-- Linux needs **`libudev-dev`** (gamepad via `bevy_gilrs`). Audio/ALSA is
-  deliberately excluded; Bevy features are listed explicitly in `view/Cargo.toml`.
+- Linux needs **`libudev-dev`** (gamepad via `bevy_gilrs`) and
+  **`libasound2-dev`** (audio via `bevy_audio`); Bevy features are spelled out
+  explicitly in `view/Cargo.toml`.
+
+  ```sh
+  sudo apt-get install libudev-dev libasound2-dev
+  ```
 - The viewer needs RL's dumped arena meshes in `RL/collision_meshes/soccar/` at
   runtime or it exits with a message. Dump them with `tools/rlacd.py`
   (Linux/Proton) or RLArenaCollisionDumper (Windows).
@@ -278,6 +285,27 @@ Y * height`, where `heading` is the car's horizontal forward in car cam or the
   trigger axes to `-1.0` when a pad connects or bindings reload; without it, using
   and releasing one trigger makes the untouched one look half-pressed and the car
   creeps backwards.
+- **Sound: modelled engine, recorded thruster, synthesised impacts.**
+  `view/src/audio.rs` streams the MIT **enginesound** physical model through a
+  custom rodio source (`EngineSource`), so the engine follows RPM continuously
+  instead of crossfading static loops. The game thread writes a target RPM into
+  an `AtomicU32`; the decoder reads it every 128-sample block. The target is a
+  rate-limited, smoothed mapping of car speed/throttle onto 850–7000 RPM, which
+  is what makes speed changes glide. The preset is the embedded
+  `assets/audio/engine.esc` (enginesound's `default.esc`; see
+  `assets/audio/README.md` and `ENGINESOUND-LICENSE`). The boost loop is
+  `assets/audio/boost.wav`, cut from the project owner's `boost2.wav` to a
+  seamless 2.5 s loop and embedded with `include_bytes!`; its license/provenance
+  still needs recording in `assets/audio/README.md`. Car/ball impacts, bounces
+  and demolitions are synthesised one-shots from `SimEvent`s, which
+  `step_simulation` forwards through Bevy messages. Keep `Mode::Capture` silent and pause the engine sink
+  when paused/capturing. If an impact sound repeats every tick, fix the
+  physics-side threshold/cooldown in `sim::collect_events`, not the audio
+  system. To audition a change, `cargo run -p rl_view -- --dump-audio /tmp/sfx`
+  writes the WAVs and exits without loading RocketSim or opening a window.
+  Recorded assets are license-checked: keep the attribution/license note next
+  to the file and do not ship a recording whose license does not allow
+  redistribution.
 - **Screenshots need a render warm-up.** The first ~second of 3D frames is the
   bare clear colour (pipeline compilation + window bring-up); a frame grabbed
   before that is blank. The driven `--screenshot N` clears it by running to tick N

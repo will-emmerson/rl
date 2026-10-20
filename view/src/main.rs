@@ -51,6 +51,9 @@ use rlbot::{LaunchOptions, Rlbot, RlbotOptions};
 mod controls;
 use controls::{button_axis, key_axis, seed_trigger_axes, strongest, Controls};
 
+mod audio;
+use audio::SfxPlugin;
+
 /// Soccar arena half-extents, in metres. The long axis is Z in the viewer.
 /// RocketSim's `consts::arena::get_aabb(Soccar)` gives 4096 x 5120 x 2048 uu;
 /// the goal line, frame and net sit at `ARENA_HALF_Z`.
@@ -741,6 +744,8 @@ fn main() {
     let mut rlbot_command: Option<String> = None;
     let mut rlbot_config: Option<String> = None;
     let mut rlbot_dir: Option<PathBuf> = None;
+    // Write the synthesised sound clips and exit; see `audio::dump_clips`.
+    let mut dump_audio: Option<PathBuf> = None;
 
     let mut args = std::env::args().skip(1).peekable();
     while let Some(arg) = args.next() {
@@ -833,6 +838,12 @@ fn main() {
                         .unwrap_or_else(|| panic!("--rlbot-dir needs a path")),
                 ));
             }
+            "--dump-audio" => {
+                dump_audio = Some(PathBuf::from(
+                    args.next()
+                        .unwrap_or_else(|| panic!("--dump-audio needs a directory")),
+                ));
+            }
             _ => {}
         }
     }
@@ -848,6 +859,15 @@ fn main() {
     }
     if rlbot_dir.is_some() && rlbot_command.is_none() && rlbot_config.is_none() {
         panic!("--rlbot-dir needs --rlbot-command or --rlbot-config");
+    }
+
+    // Audio dumping is a standalone tool: no window, no RocketSim, no meshes.
+    if let Some(dir) = dump_audio {
+        if let Err(error) = audio::dump_clips(&dir) {
+            panic!("--dump-audio: {error}");
+        }
+        eprintln!("wrote sound effects to {}", dir.display());
+        return;
     }
 
     // A bot config supplies the agent id, display name and launch command;
@@ -971,6 +991,7 @@ fn main() {
         .init_resource::<Boosting>()
         .init_resource::<Playback>()
         .insert_resource(Time::<Fixed>::from_hz(sim::TICK_HZ))
+        .add_plugins(SfxPlugin)
         .add_systems(
             PreUpdate,
             seed_gamepad_triggers.after(bevy::input::InputSystems),
@@ -3964,6 +3985,7 @@ fn step_simulation(
     mut boosting: ResMut<Boosting>,
     mut rlbot: ResMut<Rlbot>,
     mode: Res<Mode>,
+    mut sfx: MessageWriter<sim::SimEvent>,
 ) {
     rlbot.poll();
 
@@ -3987,6 +4009,12 @@ fn step_simulation(
         boosting.0[index] = input.boost && sim.0.car_at(index).boost > 0.0;
     }
     sim.0.step(&inputs);
+    // Bounces and demolitions are one-shot sounds; `audio.rs` turns these into
+    // clips. Reading them here (rather than polling state) keeps the trigger
+    // tick-accurate.
+    for event in sim.0.events() {
+        sfx.write(*event);
+    }
     // The renderer blends the previous and current tick; see `TickHistory`.
     history.push(&sim.0);
 

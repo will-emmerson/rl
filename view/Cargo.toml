@@ -25,13 +25,25 @@ rocketsim = { git = "https://github.com/ZealanL/RocketSim", rev = "6cf55d33d070f
 # bots use, so standard v5 bots can connect directly to the simulation.
 rlbot_bridge = { path = "../rlbot_bridge" }
 
+# Physically-informed engine synthesis (MIT). The viewer uses its `Generator`
+# as a streaming rodio source, so the engine follows RPM continuously instead
+# of crossfading pre-rendered loops. `default-features = false` drops the GUI.
+# Pinned to the commit the embedded `assets/audio/engine.esc` was taken from.
+enginesound = { git = "https://github.com/DasEtwas/enginesound", rev = "e5fcca587397c0c8ba9c9d24874b951fed74d260", default-features = false }
+# Deserialises the embedded enginesound preset. The preset was written for
+# ron 0.6, so stay on that major version.
+ron = "0.6"
+
 # Feature set is spelled out rather than using bevy's convenient `3d`/`ui`
-# meta-features, because those pull in `default_platform`, which includes
-# `bevy_audio` (needs alsa). Nothing here makes noise, so dropping it keeps the
-# build free of a system package. `bevy_gilrs` is listed explicitly because it
-# needs libudev-dev, which is the one system package this build does require:
+# meta-features, because those pull in `default_platform`, which includes a
+# lot more than this viewer needs. `bevy_gilrs` is listed explicitly because it
+# needs libudev-dev, and `bevy_audio` because it needs ALSA; those are the two
+# system packages this build requires:
 #
-#     sudo apt-get install libudev-dev
+#     sudo apt-get install libudev-dev libasound2-dev
+#
+# `wav` lets `AudioSource` decode the small PCM clips that `audio.rs`
+# synthesises at startup, so the viewer ships no sound files.
 #
 # Everything else in `default_platform` is either unneeded or pulled in anyway.
 [dependencies.bevy]
@@ -50,6 +62,8 @@ features = [
     "multi_threaded",
     "std",
     "png",             # --screenshot
+    "bevy_audio",       # procedural engine/boost/impact sounds (needs ALSA)
+    "wav",             # decode the generated PCM clips
 ]
 
 [dev-dependencies]

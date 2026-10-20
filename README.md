@@ -321,7 +321,9 @@ camera.toml       camera settings, hot-reloaded (RL defaults; see the file)
 view/             the game: Bevy 3D viewer + RocketSim (`rl_view`)
   src/main.rs     scene, input, camera, HUD
   src/sim.rs      the RocketSim backend (the only place that knows about it)
+  src/audio.rs    engine model and sound effects
   src/rlbot.rs    viewer-side bridge resource and input plumbing
+assets/audio/     enginesound preset (MIT), boost recording, license notes
 rlbot_bridge/     RLBot v5 bot-facing TCP/FlatBuffers server (no Bevy)
 tools/rlacd.py    Linux/Proton arena-mesh dumper (a RLArenaCollisionDumper port)
 tools/rlbot_test_bot.py  minimal RLBot v5 Python bot for exercising the bridge
@@ -331,15 +333,28 @@ docs/             the retired-sim write-up (PHYSICS.md) and the screenshot above
 ## A note on Bevy's features
 
 `view/Cargo.toml` spells out its Bevy features rather than using the `3d`/`ui`
-meta-features, because those pull in `default_platform`, which drags in
-`bevy_audio` (needs ALSA). Nothing here makes noise, so audio is left out and the
-viewer builds without it.
+meta-features, because those pull in `default_platform`, which drags in much more
+than this viewer uses.
 
-Gamepad support _is_ included, via the `bevy_gilrs` feature. On Linux, gilrs needs
-`libudev`, so building the viewer requires one system package:
+Gamepad support is included via `bevy_gilrs`, and audio via `bevy_audio`; on
+Linux those need `libudev` and ALSA, so building the viewer requires two system
+packages:
 
 ```sh
-sudo apt-get install libudev-dev
+sudo apt-get install libudev-dev libasound2-dev
+```
+
+The engine is a live physical model from the MIT
+[**enginesound**](https://github.com/DasEtwas/enginesound) crate, driven by RPM
+and streamed through a custom rodio source. The boost loop is a recording
+supplied by the project owner (processed into `boost.wav`); car/ball impacts,
+ball bounces and demolitions are synthesised.
+Sources, licenses and edits are documented in `assets/audio/README.md` (the
+boost recording's provenance still needs to be filled in). To audition the clips
+without launching the viewer:
+
+```sh
+cargo run -p rl_view -- --dump-audio /tmp/sfx
 ```
 
 A pad is mapped through gilrs' copy of the SDL controller database, keyed by

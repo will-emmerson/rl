@@ -35,11 +35,12 @@
 //! `RLArenaCollisionDumper`; without them [`Sim::new`] panics with instructions.
 
 use bevy::math::Vec3;
+use bevy::prelude::Message;
 use rlbot_bridge::{
     BallSnapshot, BodyState, CarSnapshot, FieldSpec, GameSnapshot, GoalSpec,
     InputState as BridgeInput, PadSpec, PadState, Phase, PredictionSlice,
 };
-use rocketsim::{Arena, ArenaConfig, CarBodyConfig, CarControls, GameMode, Team};
+use rocketsim::{Arena, ArenaConfig, ArenaEvent, CarBodyConfig, CarControls, GameMode, Team};
 
 /// RocketSim length unit (uu = 1 cm) to metres.
 const UU_TO_M: f32 = 1.0 / 100.0;
@@ -87,6 +88,21 @@ pub const CAR_HALF_HEIGHT: f32 = 0.193_295_5;
 /// Octane wheelbase, from RocketSim's front/back wheel offsets (51.25 and
 /// -33.75 uu, i.e. 85 uu = 0.85 m apart). Visual wheel placement only.
 pub const CAR_WHEELBASE: f32 = 0.85;
+
+/// Normal impact speed at which a ball contact starts sounding like a bounce
+/// rather than a roll. Rolling on the floor has almost no normal velocity.
+const BALL_BOUNCE_MIN_SPEED: f32 = 1.2;
+
+/// Minimum ticks between bounce sounds. A hard contact is reported for several
+/// consecutive ticks; without this a single bounce would thud four times.
+const BALL_BOUNCE_COOLDOWN_TICKS: u64 = 3;
+
+/// Ball speed change (m/s) below which a car/ball contact is a nudge, not a hit.
+const CAR_HIT_MIN_SPEED: f32 = 0.8;
+
+/// Minimum ticks between car/ball impact sounds, for the same reason as the
+/// bounce cooldown: a car pushing the ball reports a contact every tick.
+const CAR_HIT_COOLDOWN_TICKS: u64 = 4;
 
 /// RocketSim position (uu) -> viewer position (metres). See the module docs.
 fn pos_view(x: f32, y: f32, z: f32) -> Vec3 {
@@ -198,6 +214,36 @@ pub struct PadView {
     pub available: bool,
 }
 
+/// A physics event the viewer can hear. Positions and speeds are already in the
+/// viewer's frame and units (metres), like the rest of this module's output.
+///
+/// `main.rs` forwards these to Bevy's message stream and `audio.rs` turns each
+/// one into a one-shot sound.
+#[derive(Clone, Copy, Debug, Message)]
+pub enum SimEvent {
+    /// The ball hit a wall, floor, ceiling or goal mesh.
+    BallBounce {
+        /// Contact point.
+        pos: Vec3,
+        /// Impact speed along the surface normal, m/s.
+        speed: f32,
+    },
+    /// A car touched the ball.
+    CarHitBall {
+        /// Contact point.
+        pos: Vec3,
+        /// Impact strength in m/s (the larger of the added hit velocity and the
+        /// ball's velocity change, so a stationary car struck by a fast ball
+        /// still registers).
+        strength: f32,
+    },
+    /// A car was demolished by another car.
+    Demolition {
+        /// Contact point.
+        pos: Vec3,
+    },
+}
+
 /// Fold the viewer's [`Input`] into RocketSim's `CarControls`.
 ///
 /// Every axis passes straight through: the viewer's `Input` is already in
@@ -238,6 +284,15 @@ pub struct Sim {
     pad_order: Vec<usize>,
     /// Goals scored, indexed `[blue, orange]`.
     score: [u32; 2],
+    /// Events produced by the most recent [`Sim::step`], for the audio layer.
+    events: Vec<SimEvent>,
+    /// Earliest tick at which another ball-bounce event may be emitted.
+    next_bounce_tick: u64,
+    /// Ball velocity before the current tick, so a car/ball contact can be
+    /// scored by how much the ball's velocity changed.
+    prev_ball_vel: rocketsim::Vec3A,
+    /// Earliest tick at which another car/ball impact sound may be emitted.
+    next_car_hit_tick: u64,
 }
 
 impl Sim {
@@ -284,6 +339,7 @@ impl Sim {
         });
 
         let kickoff_until = arena.tick_count() + KICKOFF_TICKS;
+        let prev_ball_vel = arena.get_ball_state().vel;
         Self {
             arena,
             last_inputs: vec![Input::default(); cars.len()],
@@ -292,20 +348,29 @@ impl Sim {
             prediction_arena,
             pad_order,
             score: [0, 0],
+            events: Vec::new(),
+            next_bounce_tick: 0,
+            prev_ball_vel,
+            next_car_hit_tick: 0,
         }
     }
 
     /// Advance one tick (1/120 s), scoring and resetting on a goal.
     ///
     /// `inputs` must be in car order; index 0 is the human car. Missing entries
-    /// are treated as neutral, which keeps a bot-less run working.
+    /// are treated as neutral, which keeps a bot-less run working. Afterwards
+    /// [`Sim::events`] holds the tick's audible contacts.
     pub fn step(&mut self, inputs: &[Input]) {
+        self.events.clear();
+
         for (index, &car) in self.cars.iter().enumerate() {
             let input = inputs.get(index).copied().unwrap_or_default();
             self.last_inputs[index] = input;
             self.arena.set_car_controls(car, controls_from(&input));
         }
+        self.prev_ball_vel = self.arena.get_ball_state().vel;
         self.arena.step_tick();
+        self.collect_events();
 
         // RocketSim reports a goal but does not score it or reset itself, so we
         // do both here. Blue defends -Y, so a ball at +Y is in Orange's net.
@@ -319,6 +384,73 @@ impl Sim {
         }
     }
 
+    /// Translate the tick's RocketSim contacts into viewer-space events.
+    ///
+    /// Only contacts with an audible impact are kept: a ball resting or rolling
+    /// on the floor reports `BallHitWorld` every tick, but its normal speed is
+    /// near zero and it must stay silent.
+    fn collect_events(&mut self) {
+        let ball = *self.arena.get_ball_state();
+        let tick = self.arena.tick_count();
+        let ball_delta = (ball.vel - self.prev_ball_vel).length() * UU_TO_M;
+
+        for event in self.arena.get_last_step_events() {
+            match *event {
+                ArenaEvent::BallHitWorld(hit) => {
+                    // The normal points off the surface, and after the solver
+                    // runs the ball is moving away from it, so this is the
+                    // impact speed (whoosh along the wall is ignored).
+                    let speed = ball.vel.dot(hit.contact_normal).abs() * UU_TO_M;
+                    if speed >= BALL_BOUNCE_MIN_SPEED && tick >= self.next_bounce_tick {
+                        self.next_bounce_tick = tick + BALL_BOUNCE_COOLDOWN_TICKS;
+                        self.events.push(SimEvent::BallBounce {
+                            pos: pos_view(
+                                hit.contact_point.x,
+                                hit.contact_point.y,
+                                hit.contact_point.z,
+                            ),
+                            speed,
+                        });
+                    }
+                }
+                ArenaEvent::CarHitBall(hit) => {
+                    // `extra_hit_vel` is the impulse the car added; a stationary
+                    // car struck by a moving ball adds none, so also use half
+                    // the ball's velocity change (the solver bounce is counted
+                    // twice in the change: in and out).
+                    let added = hit.extra_hit_vel.length() * UU_TO_M;
+                    let strength = added.max(ball_delta * 0.5);
+                    if strength >= CAR_HIT_MIN_SPEED && tick >= self.next_car_hit_tick {
+                        self.next_car_hit_tick = tick + CAR_HIT_COOLDOWN_TICKS;
+                        self.events.push(SimEvent::CarHitBall {
+                            pos: pos_view(
+                                hit.contact_point.x,
+                                hit.contact_point.y,
+                                hit.contact_point.z,
+                            ),
+                            strength,
+                        });
+                    }
+                }
+                ArenaEvent::CarHitCar(hit) if hit.is_demo => {
+                    self.events.push(SimEvent::Demolition {
+                        pos: pos_view(
+                            hit.contact_point.x,
+                            hit.contact_point.y,
+                            hit.contact_point.z,
+                        ),
+                    });
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Events from the most recent [`Sim::step`], in the viewer's frame.
+    pub fn events(&self) -> &[SimEvent] {
+        &self.events
+    }
+
     /// Reset the score and put the cars and ball back on their kickoff spots.
     pub fn reset(&mut self) {
         self.score = [0, 0];
@@ -329,6 +461,7 @@ impl Sim {
         self.arena.reset_to_random_kickoff(None);
         self.last_inputs.fill(Input::default());
         self.kickoff_until = self.arena.tick_count() + KICKOFF_TICKS;
+        self.events.clear();
     }
 
     /// Ticks simulated so far.
@@ -512,6 +645,24 @@ impl Sim {
             });
         }
         slices
+    }
+
+    /// Test-only helper: drop the ball from `height` metres at the centre.
+    /// Used to exercise [`SimEvent::BallBounce`] without needing a screenshot.
+    #[cfg(test)]
+    fn debug_drop_ball(&mut self, height: f32) {
+        self.debug_set_ball(Vec3::new(0.0, height, 0.0), Vec3::ZERO);
+    }
+
+    /// Test-only helper: put the ball at a viewer-space position and velocity.
+    #[cfg(test)]
+    fn debug_set_ball(&mut self, pos: Vec3, vel: Vec3) {
+        let mut ball = *self.arena.get_ball_state();
+        // Inverse of `pos_view`/`dir_view`: viewer = (-x, z, y).
+        ball.pos = rocketsim::Vec3A::new(-pos.x, pos.z, pos.y) * 100.0;
+        ball.vel = rocketsim::Vec3A::new(-vel.x, vel.z, vel.y) * 100.0;
+        ball.ang_vel = rocketsim::Vec3A::ZERO;
+        self.arena.set_ball_state(ball);
     }
 
     /// Debug-only helper for eyeballing wall detail: park the car flat on the
@@ -771,6 +922,68 @@ mod tests {
             rocketsim::Vec3A::Y,
         );
         assert!((rotator_from_mat(roll_right)[2] - std::f32::consts::FRAC_PI_2).abs() < 1e-5);
+    }
+
+    #[test]
+    fn a_falling_ball_reports_a_bounce() {
+        let mut sim = Sim::new();
+        sim.debug_drop_ball(3.0);
+
+        let mut bounce = None;
+        for _ in 0..240 {
+            sim.step(&[Input::default()]);
+            bounce = sim.events().iter().find_map(|event| match *event {
+                SimEvent::BallBounce { speed, .. } => Some(speed),
+                _ => None,
+            });
+            if bounce.is_some() {
+                break;
+            }
+        }
+
+        let speed = bounce.expect("a 3 m drop should hit the floor and bounce");
+        assert!(speed >= BALL_BOUNCE_MIN_SPEED);
+        assert!(speed < 20.0, "impact speed {speed} m/s is implausible");
+    }
+
+    #[test]
+    fn a_car_hitting_the_ball_reports_an_impact() {
+        let mut sim = Sim::new();
+        let car = sim.car();
+        // Put the ball on the floor in front of the car and drive it back into
+        // the car. A stationary car adds no hit impulse, so this also checks
+        // the ball-velocity-change fallback.
+        let pos = car.pos + car.forward * 2.5 + Vec3::Y * BALL_RADIUS;
+        sim.debug_set_ball(pos, -car.forward * 20.0);
+
+        let mut impact = None;
+        for _ in 0..90 {
+            sim.step(&[Input::default()]);
+            impact = sim.events().iter().find_map(|event| match *event {
+                SimEvent::CarHitBall { strength, .. } => Some(strength),
+                _ => None,
+            });
+            if impact.is_some() {
+                break;
+            }
+        }
+
+        let strength = impact.expect("a ball driven into the car should register a hit");
+        assert!(strength >= CAR_HIT_MIN_SPEED);
+    }
+
+    #[test]
+    fn a_resting_ball_stays_silent() {
+        let mut sim = Sim::new();
+        for _ in 0..240 {
+            sim.step(&[Input::default()]);
+            assert!(
+                !sim.events()
+                    .iter()
+                    .any(|event| matches!(event, SimEvent::BallBounce { .. })),
+                "a resting ball must not trigger bounce sounds"
+            );
+        }
     }
 
     #[test]
